@@ -266,14 +266,14 @@ func (m *TeammateManager) Spawn(name, role, prompt, supervisor string) string {
 			m.mu.Unlock()
 			return fmt.Sprintf("Error: %q is currently %s", name, status)
 		}
-		member.Status = teammateStatusWorking
+		member.Status = teammateStatusIdle
 		member.Role = role
 		member.Prompt = prompt
 	} else {
 		m.config.Members = append(m.config.Members, TeamMember{
 			Name:   name,
 			Role:   role,
-			Status: teammateStatusWorking,
+			Status: teammateStatusIdle,
 			Prompt: prompt,
 		})
 	}
@@ -281,15 +281,12 @@ func (m *TeammateManager) Spawn(name, role, prompt, supervisor string) string {
 		m.mu.Unlock()
 		return fmt.Sprintf("Error: save config failed: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.threads[name] = cancel
 	m.mu.Unlock()
 
-	go m.teammateLoop(ctx, name, role, prompt)
 	return fmt.Sprintf("Spawned %q (role: %s)", name, role)
 }
 
-func (m *TeammateManager) Wake(name, prompt string) string {
+func (m *TeammateManager) Wake(name string) string {
 	if m == nil {
 		return "Error: teammate manager not initialized"
 	}
@@ -327,7 +324,7 @@ func (m *TeammateManager) Wake(name, prompt string) string {
 
 func (m *TeammateManager) teammateLoop(ctx context.Context, name, role, prompt string) {
 	log.Printf("[TeammateManager] Teammate loop started: name=%s, role=%s", name, role)
-	agent := m.cloneAgent(name, role)
+	agent := m.cloneAgent(name, role, prompt)
 	runErr := m.runner(ctx, agent, prompt)
 	if runErr != nil {
 		log.Printf("[TeammateManager] Teammate loop ended with error: name=%s, err=%v", name, runErr)
@@ -373,7 +370,7 @@ func (m *TeammateManager) WaitUntilIdle(ctx context.Context) error {
 	}
 }
 
-func (m *TeammateManager) cloneAgent(name, role string) *Agent {
+func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 	base := m.baseAgent
 	if base == nil {
 		return nil
@@ -395,21 +392,10 @@ func (m *TeammateManager) cloneAgent(name, role string) *Agent {
 		}
 	}
 
-	systemPrompt := strings.TrimSpace(base.SystemPrompt)
-	if systemPrompt != "" {
-		systemPrompt += "\n\n"
-	}
-	systemPrompt += fmt.Sprintf(
-		"You are teammate %q with role %q at %s. Collaborate with the team. Use send_message to communicate. Complete your task.",
-		name,
-		role,
-		WORKDIR,
-	)
-
 	return &Agent{
 		Name:         name,
 		Description:  role,
-		SystemPrompt: systemPrompt,
+		SystemPrompt: prompt,
 		BaseUrl:      base.BaseUrl,
 		ApiKey:       base.ApiKey,
 		Model:        base.Model,
@@ -632,7 +618,7 @@ func sendMessageTool(ctx context.Context, args json.RawMessage, agent *Agent) (s
 	log.Printf("[SendMessageTool] agent=%s Sending message: from=%s, to=%s, content_size=%d", agentLogName(agent), agent.Name, params.To, len(params.Content))
 	result := agent.TeamManager.bus.Send(agent.Name, params.To, params.Content, "message", nil)
 	if !strings.HasPrefix(result, "Error:") {
-		wakeResult := agent.TeamManager.Wake(params.To, "You received a new direct message. Read your inbox and respond if needed.")
+		wakeResult := agent.TeamManager.Wake(params.To)
 		log.Printf("[SendMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), params.To, wakeResult)
 	}
 	log.Printf("[SendMessageTool] agent=%s Send completed: %s", agentLogName(agent), result)
@@ -674,7 +660,7 @@ func broadcastMessageTool(ctx context.Context, args json.RawMessage, agent *Agen
 		if name == "" || name == agent.Name {
 			continue
 		}
-		wakeResult := agent.TeamManager.Wake(name, "You received a new broadcast message. Read your inbox and act if needed.")
+		wakeResult := agent.TeamManager.Wake(name)
 		log.Printf("[BroadcastMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), name, wakeResult)
 	}
 	log.Printf("[BroadcastMessageTool] agent=%s Broadcast completed: %s", agentLogName(agent), result)

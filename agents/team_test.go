@@ -70,19 +70,9 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 	}
 
 	manager := NewTeammateManager(teamDir, base)
+	runnerCalled := make(chan struct{}, 1)
 	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
-		if agent == nil {
-			t.Fatalf("expected cloned agent")
-		}
-		if agent.Name != "worker-1" {
-			t.Fatalf("unexpected agent name: %s", agent.Name)
-		}
-		if !strings.Contains(agent.SystemPrompt, "role \"reviewer\"") {
-			t.Fatalf("system prompt missing teammate role: %s", agent.SystemPrompt)
-		}
-		if prompt != "inspect core changes" {
-			t.Fatalf("unexpected prompt: %s", prompt)
-		}
+		runnerCalled <- struct{}{}
 		return nil
 	}
 
@@ -91,12 +81,23 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
 
-	waitForCondition(t, func() bool {
-		manager.mu.Lock()
-		defer manager.mu.Unlock()
-		member := manager.findMemberLocked("worker-1")
-		return member != nil && member.Status == teammateStatusIdle
-	})
+	select {
+	case <-runnerCalled:
+		t.Fatal("spawn should not start teammate loop")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	manager.mu.Lock()
+	member := manager.findMemberLocked("worker-1")
+	if member == nil || member.Status != teammateStatusIdle {
+		manager.mu.Unlock()
+		t.Fatalf("expected spawned teammate to stay idle, got %+v", member)
+	}
+	if len(manager.threads) != 0 {
+		manager.mu.Unlock()
+		t.Fatalf("spawn should not register running thread, got %d", len(manager.threads))
+	}
+	manager.mu.Unlock()
 
 	raw, err := os.ReadFile(filepath.Join(teamDir, "config.json"))
 	if err != nil {
@@ -139,20 +140,11 @@ func TestTeammateManagerWakeReusesOriginalPrompt(t *testing.T) {
 
 	select {
 	case got := <-prompts:
-		if got != "inspect core changes" {
-			t.Fatalf("unexpected spawn prompt: %s", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("spawn prompt not received")
+		t.Fatalf("spawn should not run teammate loop, got prompt %s", got)
+	case <-time.After(50 * time.Millisecond):
 	}
 
-	waitForCondition(t, func() bool {
-		manager.mu.Lock()
-		defer manager.mu.Unlock()
-		return len(manager.threads) == 0
-	})
-
-	wakeResult := manager.Wake("worker-1", "You received a new direct message. Read your inbox and respond if needed.")
+	wakeResult := manager.Wake("worker-1")
 	if !strings.Contains(wakeResult, `Woke "worker-1"`) {
 		t.Fatalf("unexpected wake result: %s", wakeResult)
 	}
