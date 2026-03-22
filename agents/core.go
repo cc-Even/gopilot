@@ -64,6 +64,7 @@ type Agent struct {
 	SubAgents    map[string]*Agent
 	SkillLoader  *SkillLoader
 	TaskManager  *TaskManager
+	Background   *BackgroundManager
 
 	client openai.Client
 	tools  map[string]ToolDefinition
@@ -278,6 +279,7 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize task manager: %v\n", err)
 	}
+	backgroundManager := NewBackgroundManager()
 	order = registerRouteToSubagentTool(toolMap, order, subAgents)
 	order = registerCompactTool(toolMap, order)
 
@@ -291,6 +293,7 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		SubAgents:    subAgents,
 		SkillLoader:  skillLoader,
 		TaskManager:  taskManager,
+		Background:   backgroundManager,
 		client:       openai.NewClient(opts...),
 		tools:        toolMap,
 		order:        order,
@@ -312,6 +315,7 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 		if compactErr != nil {
 			return "", fmt.Errorf("auto compact failed (turn=%d): %w", turn, compactErr)
 		}
+		messages = a.appendBackgroundNotifications(messages)
 
 		resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 			Model:    a.Model,
@@ -385,6 +389,32 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 	}
 
 	return "", fmt.Errorf("max turns reached without final answer")
+}
+
+func (a *Agent) appendBackgroundNotifications(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+	if a == nil || a.Background == nil {
+		return messages
+	}
+
+	notifications := a.Background.DrainNotifications()
+	if len(notifications) == 0 {
+		return messages
+	}
+
+	lines := make([]string, 0, len(notifications)+2)
+	lines = append(lines, "<background_notifications>")
+	lines = append(lines, "Completed background tasks:")
+	for _, notification := range notifications {
+		lines = append(lines, fmt.Sprintf("- id=%s status=%s command=%q result=%q",
+			notification.TaskID,
+			notification.Status,
+			notification.Command,
+			notification.Result,
+		))
+	}
+	lines = append(lines, "</background_notifications>")
+
+	return append(messages, openai.UserMessage(strings.Join(lines, "\n")))
 }
 
 func parseCompactFocus(args json.RawMessage) (string, error) {

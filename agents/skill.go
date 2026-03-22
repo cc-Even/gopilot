@@ -175,6 +175,8 @@ func (l *SkillLoader) GetContent(name string) string {
 }
 
 type BashTool struct{}
+type BackgroundRunTool struct{}
+type BackgroundCheckTool struct{}
 type ReadFileTool struct{}
 type WriteFileTool struct{}
 type EditFileTool struct{}
@@ -201,6 +203,8 @@ func ObjectSchema(properties map[string]any, required ...string) map[string]any 
 // DefaultToolDefinitions returns the built-in tool list used by Agent.
 func DefaultToolDefinitions() []ToolDefinition {
 	bash := BashTool{}
+	backgroundRun := BackgroundRunTool{}
+	backgroundCheck := BackgroundCheckTool{}
 	read := ReadFileTool{}
 	write := WriteFileTool{}
 	edit := EditFileTool{}
@@ -212,6 +216,19 @@ func DefaultToolDefinitions() []ToolDefinition {
 			"command",
 			ObjectSchema(map[string]any{"command": StringParam()}, "command"),
 			bash.Call,
+		),
+		ToolFromStringArg(
+			backgroundRun.Name(),
+			backgroundRun.Description(),
+			"command",
+			ObjectSchema(map[string]any{"command": StringParam()}, "command"),
+			backgroundRun.Call,
+		),
+		ToolFromJSONString(
+			backgroundCheck.Name(),
+			backgroundCheck.Description(),
+			ObjectSchema(map[string]any{"task_id": StringParam()}),
+			backgroundCheck.Call,
 		),
 		ToolFromJSONString(
 			read.Name(),
@@ -387,6 +404,54 @@ func (c BashTool) Call(_ context.Context, input string, agent *Agent) (string, e
 	return result, nil
 }
 
+func (c BackgroundRunTool) Name() string {
+	return "background_run"
+}
+
+func (c BackgroundRunTool) Description() string {
+	return "Starts a bash command in the background and returns immediately with a task id. Completed results are queued and surfaced before the next LLM call."
+}
+
+func (c BackgroundRunTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
+	if agent == nil || agent.Background == nil {
+		return "", fmt.Errorf("background manager not initialized")
+	}
+
+	log.Printf("[BackgroundRunTool] Starting command: %s", input)
+	result := agent.Background.Run(input)
+	log.Printf("[BackgroundRunTool] Started: %s", result)
+	return result, nil
+}
+
+func (c BackgroundCheckTool) Name() string {
+	return "background_check"
+}
+
+func (c BackgroundCheckTool) Description() string {
+	return "Checks one background task by task_id, or lists all background tasks when task_id is omitted."
+}
+
+func (c BackgroundCheckTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
+	if agent == nil || agent.Background == nil {
+		return "", fmt.Errorf("background manager not initialized")
+	}
+
+	var params struct {
+		TaskID string `json:"task_id"`
+	}
+	if input != "" && input != "null" {
+		if err := json.Unmarshal([]byte(input), &params); err != nil {
+			log.Printf("[BackgroundCheckTool] Error parsing input: %v", err)
+			return "", fmt.Errorf("invalid input: %v", err)
+		}
+	}
+
+	log.Printf("[BackgroundCheckTool] Checking task: task_id=%s", params.TaskID)
+	result := agent.Background.Check(params.TaskID)
+	log.Printf("[BackgroundCheckTool] Check result (first 200 chars): %s", truncate(result, 200))
+	return result, nil
+}
+
 // ReadFileTool implementation
 func (r ReadFileTool) Name() string {
 	return "read_file"
@@ -516,7 +581,7 @@ func TaskUpdateTool(ctx context.Context, input string, agent *Agent) (string, er
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
 
-	log.Printf("[TaskUpdateTool] Updating task: task_id=%d, status=%s", params.TaskID, params.Status)
+	log.Printf("[TaskUpdateTool] Updating task: task_id=%d, params=%s", params.TaskID, input)
 	result, err := agent.TaskManager.Update(params.TaskID, params.Status, params.AddBlockedBy, params.AddBlocks)
 	if err != nil {
 		log.Printf("[TaskUpdateTool] Error: %v", err)

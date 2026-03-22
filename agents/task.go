@@ -1,13 +1,17 @@
 package agents
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Task represents a single task with dependencies
@@ -26,6 +30,162 @@ type TaskManager struct {
 	dir    string
 	nextID int
 	mu     sync.RWMutex
+}
+
+type BackgroundTask struct {
+	Status  string `json:"status"`
+	Result  string `json:"result"`
+	Command string `json:"command"`
+}
+
+type BackgroundNotification struct {
+	TaskID  string `json:"task_id"`
+	Status  string `json:"status"`
+	Command string `json:"command"`
+	Result  string `json:"result"`
+}
+
+type BackgroundManager struct {
+	mu                sync.RWMutex
+	tasks             map[string]*BackgroundTask
+	notificationQueue []BackgroundNotification
+}
+
+const (
+	backgroundCommandPreviewLimit = 80
+	backgroundResultLimit         = 50000
+	backgroundNotificationLimit   = 500
+	backgroundTimeout             = 300 * time.Second
+)
+
+func NewBackgroundManager() *BackgroundManager {
+	return &BackgroundManager{
+		tasks: make(map[string]*BackgroundTask),
+	}
+}
+
+func (bm *BackgroundManager) Run(command string) string {
+	if bm == nil {
+		return "Error: background manager not initialized"
+	}
+
+	taskID := newBackgroundTaskID()
+
+	bm.mu.Lock()
+	bm.tasks[taskID] = &BackgroundTask{
+		Status:  "running",
+		Command: command,
+	}
+	bm.mu.Unlock()
+
+	go bm.execute(taskID, command)
+
+	return fmt.Sprintf("Background task %s started: %s", taskID, truncateForDisplay(command, backgroundCommandPreviewLimit))
+}
+
+func (bm *BackgroundManager) execute(taskID, command string) {
+	status := "completed"
+	output := "(no output)"
+
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	cmd.Dir = WORKDIR
+	rawOutput, err := cmd.CombinedOutput()
+
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		status = "timeout"
+		output = fmt.Sprintf("Error: Timeout (%ds)", int(backgroundTimeout/time.Second))
+	case err != nil:
+		status = "error"
+		if len(rawOutput) > 0 {
+			output = string(rawOutput)
+		} else {
+			output = "Error: " + err.Error()
+		}
+	default:
+		if len(rawOutput) > 0 {
+			output = string(rawOutput)
+		}
+	}
+
+	output = truncateForDisplay(strings.TrimSpace(output), backgroundResultLimit)
+	if output == "" {
+		output = "(no output)"
+	}
+
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	task := bm.tasks[taskID]
+	if task == nil {
+		task = &BackgroundTask{Command: command}
+		bm.tasks[taskID] = task
+	}
+	task.Status = status
+	task.Result = output
+
+	bm.notificationQueue = append(bm.notificationQueue, BackgroundNotification{
+		TaskID:  taskID,
+		Status:  status,
+		Command: truncateForDisplay(command, backgroundCommandPreviewLimit),
+		Result:  truncateForDisplay(output, backgroundNotificationLimit),
+	})
+}
+
+func (bm *BackgroundManager) Check(taskID string) string {
+	if bm == nil {
+		return "Error: background manager not initialized"
+	}
+
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+
+	if taskID != "" {
+		task, ok := bm.tasks[taskID]
+		if !ok {
+			return fmt.Sprintf("Error: Unknown task %s", taskID)
+		}
+
+		result := task.Result
+		if result == "" {
+			result = "(running)"
+		}
+		return fmt.Sprintf("[%s] %s\n%s", task.Status, truncateForDisplay(task.Command, 60), result)
+	}
+
+	if len(bm.tasks) == 0 {
+		return "No background tasks."
+	}
+
+	ids := make([]string, 0, len(bm.tasks))
+	for id := range bm.tasks {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	lines := make([]string, 0, len(ids))
+	for _, id := range ids {
+		task := bm.tasks[id]
+		lines = append(lines, fmt.Sprintf("%s: [%s] %s", id, task.Status, truncateForDisplay(task.Command, 60)))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (bm *BackgroundManager) DrainNotifications() []BackgroundNotification {
+	if bm == nil {
+		return nil
+	}
+
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	notifications := append([]BackgroundNotification(nil), bm.notificationQueue...)
+	bm.notificationQueue = nil
+	return notifications
 }
 
 // NewTaskManager creates a new TaskManager with the specified directory
@@ -368,4 +528,19 @@ func uniqueIntSlice(slice []int) []int {
 	}
 	sort.Ints(result)
 	return result
+}
+
+func newBackgroundTaskID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%08x", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b[:])
+}
+
+func truncateForDisplay(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit]
 }

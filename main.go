@@ -29,15 +29,22 @@ func main() {
 		"local-agent",
 		sysPrompt,
 		os.Getenv("MODEL"),
+		agents.WithToolList(agents.DefaultToolDefinitions()),
 		//agents.WithSubAgents(map[string]*agents.Agent{
 		//	subAgent.Name: subAgent,
 		//}),
 	)
 
-	output, err := agent.Run(context.TODO(), "Load the agent-builder skill and follow its instructions")
-	if err != nil {
-		log.Fatal(err)
+	msgs := []string{
+		`Start 3 background tasks: "sleep 2", "sleep 4", "sleep 6". Check their status.`,
 	}
 
-	fmt.Printf("Final output: %s\n", output)
+	for _, msg := range msgs {
+		output, err := agent.Run(context.TODO(), msg)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Printf("Final output: %s\n", output)
+	}
 }

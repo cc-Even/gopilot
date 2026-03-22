@@ -3,7 +3,9 @@ package agents
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestTaskManager(t *testing.T) {
@@ -236,6 +238,56 @@ func TestTaskManagerHelpers(t *testing.T) {
 				t.Errorf("Expected %v, got %v", expected, result)
 				break
 			}
+		}
+	})
+}
+
+func TestBackgroundManager(t *testing.T) {
+	t.Run("RunCompletesAndQueuesNotification", func(t *testing.T) {
+		bm := NewBackgroundManager()
+
+		result := bm.Run("printf 'background-ok'")
+		if !strings.Contains(result, "Background task ") || !strings.Contains(result, "started:") {
+			t.Fatalf("unexpected run result: %s", result)
+		}
+
+		var notifications []BackgroundNotification
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			notifications = bm.DrainNotifications()
+			if len(notifications) > 0 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		if len(notifications) != 1 {
+			t.Fatalf("expected 1 notification, got %d", len(notifications))
+		}
+
+		notification := notifications[0]
+		if notification.Status != "completed" {
+			t.Fatalf("expected completed status, got %s", notification.Status)
+		}
+		if notification.Result != "background-ok" {
+			t.Fatalf("unexpected notification result: %q", notification.Result)
+		}
+
+		if secondDrain := bm.DrainNotifications(); len(secondDrain) != 0 {
+			t.Fatalf("expected queue to be empty after drain, got %d notifications", len(secondDrain))
+		}
+
+		checkAll := bm.Check("")
+		if !strings.Contains(checkAll, "[completed]") {
+			t.Fatalf("expected completed task in list, got %q", checkAll)
+		}
+		if !strings.Contains(checkAll, notification.TaskID) {
+			t.Fatalf("expected task id in list, got %q", checkAll)
+		}
+
+		checkOne := bm.Check(notification.TaskID)
+		if !strings.Contains(checkOne, "background-ok") {
+			t.Fatalf("expected task result in check output, got %q", checkOne)
 		}
 	})
 }
