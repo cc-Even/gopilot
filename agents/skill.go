@@ -78,14 +78,20 @@ func (l *SkillLoader) loadAll() {
 }
 
 func parseFrontmatter(text string) (map[string]string, string) {
-	frontmatterRe := regexp.MustCompile(`(?s)^---\n(.*?)\n---\n(.*)$`)
-	match := frontmatterRe.FindStringSubmatch(text)
-	if len(match) != 3 {
-		return map[string]string{}, text
+	normalized := strings.TrimPrefix(text, "\uFEFF")
+	normalized = strings.ReplaceAll(normalized, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+
+	frontmatterRe := regexp.MustCompile(`(?s)^---\n(.*?)\n---(?:\n(.*))?$`)
+	match := frontmatterRe.FindStringSubmatch(normalized)
+	if len(match) == 0 {
+		return map[string]string{}, strings.TrimSpace(normalized)
 	}
 
 	meta := make(map[string]string)
-	for _, line := range strings.Split(strings.TrimSpace(match[1]), "\n") {
+	lines := strings.Split(strings.TrimSpace(match[1]), "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimRight(lines[i], " \t")
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -97,11 +103,34 @@ func parseFrontmatter(text string) (map[string]string, string) {
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 		if key != "" {
+			if val == "|" || val == ">" {
+				block := make([]string, 0)
+				for j := i + 1; j < len(lines); j++ {
+					next := lines[j]
+					trimmed := strings.TrimSpace(next)
+					if trimmed == "" {
+						block = append(block, "")
+						i = j
+						continue
+					}
+					if strings.HasPrefix(next, " ") || strings.HasPrefix(next, "\t") {
+						block = append(block, strings.TrimLeft(next, " \t"))
+						i = j
+						continue
+					}
+					break
+				}
+				val = strings.TrimSpace(strings.Join(block, "\n"))
+			}
 			meta[key] = val
 		}
 	}
 
-	return meta, strings.TrimSpace(match[2])
+	body := ""
+	if len(match) >= 3 {
+		body = strings.TrimSpace(match[2])
+	}
+	return meta, body
 }
 
 func (l *SkillLoader) GetDescriptions() string {

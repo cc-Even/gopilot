@@ -16,21 +16,19 @@ func main() {
 	if err != nil {
 		log.Println("Warning: No .env file found, using system environment variables")
 	}
-
+	WORKDIR, _ := os.Getwd()
 	subAgent := agents.NewOpenAIAgent(
 		"file-agent",
 		"You are a file reader assistant, use the tools to read and list files.",
 		os.Getenv("MODEL"),
 		agents.WithDesc("a files reader and list agent"),
-		agents.WithApiKey(os.Getenv("OPENAI_API_KEY")),
 		agents.WithToolList(agents.DefaultToolDefinitions()),
 	)
-
+	sysPrompt := fmt.Sprintf(" You are a coding agent at  %s.", WORKDIR)
 	agent := agents.NewOpenAIAgent(
 		"local-agent",
-		"You are a helpful assistant, use the tools to solve the problem step by step.Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done. summerize the result in the end.",
+		sysPrompt,
 		os.Getenv("MODEL"),
-		agents.WithApiKey(os.Getenv("OPENAI_API_KEY")),
 		agents.WithSubAgents(map[string]*agents.OpenAIAgent{
 			subAgent.Name: subAgent,
 		}),

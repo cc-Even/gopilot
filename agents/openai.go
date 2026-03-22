@@ -58,6 +58,7 @@ type OpenAIAgent struct {
 	ApiKey       string
 	Model        string
 	SubAgents    map[string]*OpenAIAgent
+	SkillLoader  *SkillLoader
 
 	client openai.Client
 	tools  map[string]ToolDefinition
@@ -102,6 +103,79 @@ func WithSubAgents(SubAgents map[string]*OpenAIAgent) AgentOption {
 	return func(o *AgentOptions) {
 		o.SubAgents = SubAgents
 	}
+}
+
+func registerLoadSkillTool(toolMap map[string]ToolDefinition, order []string, skillLoader *SkillLoader) []string {
+	order = append(order, "load_skill")
+	toolMap["load_skill"] = ToolDefinition{
+		Name:        "load_skill",
+		Description: "Use this method to load a skill before answering. If the question involves a specific topic, try loading a related skill first. If you don't have enough information to decide which skill to load, you can ask the user for more details.",
+		Parameters: map[string]any{
+			"skill_name": map[string]any{
+				"type":        "string",
+				"description": "name of the skill to load, choose from the provided skill list",
+			},
+		},
+		Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
+			type paramsStruct struct {
+				SkillName string `json:"skill_name"`
+			}
+			params := paramsStruct{}
+			if err := json.Unmarshal(args, &params); err != nil {
+				return "", fmt.Errorf("invalid load_skill args: %w", err)
+			}
+			skillContent := skillLoader.GetContent(params.SkillName)
+			return skillContent, nil
+		},
+	}
+	return order
+}
+
+func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []string, subAgents map[string]*OpenAIAgent) []string {
+	if len(subAgents) == 0 {
+		return order
+	}
+
+	agentListDesc := make([]map[string]string, 0, len(subAgents))
+	for subName, subAgent := range subAgents {
+		agentDesc := make(map[string]string)
+		agentDesc["name"] = subName
+		agentDesc["description"] = subAgent.Description
+		agentListDesc = append(agentListDesc, agentDesc)
+	}
+
+	order = append(order, "route_to_subagent")
+	toolMap["route_to_subagent"] = ToolDefinition{
+		Name:        "route_to_subagent",
+		Description: fmt.Sprintf("Calling this method delegates the subtask to the sub-agent. sub-agent list: %v", agentListDesc),
+		Parameters: map[string]any{
+			"sub_agent_name": map[string]any{
+				"type":        "string",
+				"description": "selected sub-agent name"},
+			"input": map[string]any{
+				"type":        "string",
+				"description": "detailed description of the task you gave to the sub-agent",
+			},
+		},
+		Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
+			type paramsStruct struct {
+				SubAgentName string `json:"sub_agent_name"`
+				Input        string `json:"input"`
+			}
+			params := paramsStruct{}
+			if err := json.Unmarshal(args, &params); err != nil {
+				return "", fmt.Errorf("invalid route_to_subagent args: %w", err)
+			}
+			fmt.Println("Routing to sub-agent:", params.SubAgentName, "with input:", params.Input)
+			subAgent, ok := agent.SubAgents[params.SubAgentName]
+			if !ok {
+				return "", fmt.Errorf("unknown sub-agent: %s", params.SubAgentName)
+			}
+			result, err := subAgent.Run(ctx, params.Input)
+			return result, err
+		},
+	}
+	return order
 }
 
 func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption) *OpenAIAgent {
@@ -150,48 +224,14 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		order = append(order, t.Name)
 	}
 
-	sunAgents := agentOpts.SubAgents
+	skillLoader := NewSkillLoader("../skills")
+	order = registerLoadSkillTool(toolMap, order, skillLoader)
 
-	if len(sunAgents) > 0 {
-		agentListDesc := make([]map[string]string, 0, len(sunAgents))
-		for subName, subAgent := range sunAgents {
-			agentDesc := make(map[string]string)
-			agentDesc["name"] = subName
-			agentDesc["description"] = subAgent.Description
-			agentListDesc = append(agentListDesc, agentDesc)
-		}
-		order = append(order, "route_to_subagent")
-		toolMap["route_to_subagent"] = ToolDefinition{
-			Name:        "route_to_subagent",
-			Description: fmt.Sprintf("Calling this method delegates the subtask to the sub-agent. sub-agent list: %v", agentListDesc),
-			Parameters: map[string]any{
-				"sub_agent_name": map[string]any{
-					"type":        "string",
-					"description": "selected sub-agent name"},
-				"input": map[string]any{
-					"type":        "string",
-					"description": "detailed description of the task you gave to the sub-agent",
-				},
-			},
-			Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
-				type paramsStruct struct {
-					SubAgentName string `json:"sub_agent_name"`
-					Input        string `json:"input"`
-				}
-				params := paramsStruct{}
-				if err := json.Unmarshal(args, &params); err != nil {
-					return "", fmt.Errorf("invalid route_to_subagent args: %w", err)
-				}
-				fmt.Println("Routing to sub-agent:", params.SubAgentName, "with input:", params.Input)
-				subAgent, ok := agent.SubAgents[params.SubAgentName]
-				if !ok {
-					return "", fmt.Errorf("unknown sub-agent: %s", params.SubAgentName)
-				}
-				result, err := subAgent.Run(ctx, params.Input)
-				return result, err
-			},
-		}
-	}
+	systemPrompt += "\n Use load_skill to access specialized knowledge before tackling unfamiliar topics.\n\nSkills available:"
+	systemPrompt += skillLoader.GetDescriptions()
+
+	subAgents := agentOpts.SubAgents
+	order = registerRouteToSubagentTool(toolMap, order, subAgents)
 
 	return &OpenAIAgent{
 		Name:         name,
@@ -200,7 +240,8 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		BaseUrl:      baseURL,
 		ApiKey:       apiKey,
 		Model:        model,
-		SubAgents:    sunAgents,
+		SubAgents:    subAgents,
+		SkillLoader:  skillLoader,
 		client:       openai.NewClient(opts...),
 		tools:        toolMap,
 		order:        order,

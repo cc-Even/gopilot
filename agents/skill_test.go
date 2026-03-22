@@ -22,6 +22,29 @@ func TestParseFrontmatter(t *testing.T) {
 	}
 }
 
+func TestParseFrontmatterCRLF(t *testing.T) {
+	text := "---\r\nname: pdf\r\ndescription: Process PDF files\r\n---\r\n\r\nbody\r\n"
+	meta, body := parseFrontmatter(text)
+
+	if meta["name"] != "pdf" {
+		t.Fatalf("expected name=pdf, got %q", meta["name"])
+	}
+	if meta["description"] != "Process PDF files" {
+		t.Fatalf("expected description, got %q", meta["description"])
+	}
+	if body != "body" {
+		t.Fatalf("expected body, got %q", body)
+	}
+}
+
+func TestParseFrontmatterBlockDescription(t *testing.T) {
+	text := "---\nname: agent-builder\ndescription: |\n  line one\n  line two\n---\nbody"
+	meta, _ := parseFrontmatter(text)
+	if meta["description"] != "line one\nline two" {
+		t.Fatalf("unexpected block description: %q", meta["description"])
+	}
+}
+
 func TestSkillLoader(t *testing.T) {
 	root := t.TempDir()
 
