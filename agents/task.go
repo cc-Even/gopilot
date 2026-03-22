@@ -1,0 +1,371 @@
+package agents
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+)
+
+// Task represents a single task with dependencies
+type Task struct {
+	ID          int    `json:"id"`
+	Subject     string `json:"subject"`
+	Description string `json:"description"`
+	Status      string `json:"status"` // "pending", "in_progress", "completed"
+	BlockedBy   []int  `json:"blockedBy"`
+	Blocks      []int  `json:"blocks"`
+	Owner       string `json:"owner"`
+}
+
+// TaskManager handles CRUD operations and persistence of tasks with dependency graph
+type TaskManager struct {
+	dir    string
+	nextID int
+	mu     sync.RWMutex
+}
+
+// NewTaskManager creates a new TaskManager with the specified directory
+func NewTaskManager(tasksDir string) (*TaskManager, error) {
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(tasksDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create tasks directory: %w", err)
+	}
+
+	tm := &TaskManager{
+		dir:    tasksDir,
+		nextID: 0, // Will be updated below
+	}
+
+	// Initialize nextID based on existing tasks
+	maxID, err := tm.maxID()
+	if err != nil {
+		return nil, err
+	}
+	tm.nextID = maxID + 1
+
+	return tm, nil
+}
+
+// maxID returns the maximum task ID currently in use
+func (tm *TaskManager) maxID() (int, error) {
+	entries, err := os.ReadDir(tm.dir)
+	if err != nil {
+		return -1, fmt.Errorf("failed to read tasks directory: %w", err)
+	}
+
+	maxID := -1
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasPrefix(name, "task_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+
+		// Extract ID from filename: task_123.json
+		idStr := strings.TrimPrefix(name, "task_")
+		idStr = strings.TrimSuffix(idStr, ".json")
+
+		var id int
+		if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+			continue
+		}
+
+		if id > maxID {
+			maxID = id
+		}
+	}
+
+	return maxID, nil
+}
+
+// load reads a task from disk by ID
+func (tm *TaskManager) load(taskID int) (*Task, error) {
+	path := filepath.Join(tm.dir, fmt.Sprintf("task_%d.json", taskID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("task %d not found", taskID)
+		}
+		return nil, fmt.Errorf("failed to read task file: %w", err)
+	}
+
+	var task Task
+	if err := json.Unmarshal(data, &task); err != nil {
+		return nil, fmt.Errorf("failed to parse task: %w", err)
+	}
+
+	return &task, nil
+}
+
+// save writes a task to disk
+func (tm *TaskManager) save(task *Task) error {
+	data, err := json.MarshalIndent(task, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal task: %w", err)
+	}
+
+	path := filepath.Join(tm.dir, fmt.Sprintf("task_%d.json", task.ID))
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write task file: %w", err)
+	}
+
+	return nil
+}
+
+// Create creates a new task with the given subject and description
+func (tm *TaskManager) Create(subject, description string) (string, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	task := &Task{
+		ID:          tm.nextID,
+		Subject:     subject,
+		Description: description,
+		Status:      "pending",
+		BlockedBy:   []int{},
+		Blocks:      []int{},
+		Owner:       "",
+	}
+
+	if err := tm.save(task); err != nil {
+		return "", err
+	}
+
+	tm.nextID++
+
+	data, _ := json.MarshalIndent(task, "", "  ")
+	return string(data), nil
+}
+
+// Get retrieves a task by ID
+func (tm *TaskManager) Get(taskID int) (string, error) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	task, err := tm.load(taskID)
+	if err != nil {
+		return "", err
+	}
+
+	data, _ := json.MarshalIndent(task, "", "  ")
+	return string(data), nil
+}
+
+// Update updates a task's status and/or dependencies
+func (tm *TaskManager) Update(taskID int, status string, addBlockedBy, addBlocks []int) (string, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	task, err := tm.load(taskID)
+	if err != nil {
+		return "", err
+	}
+
+	// Update status
+	if status != "" {
+		validStatuses := map[string]bool{
+			"pending":     true,
+			"in_progress": true,
+			"completed":   true,
+		}
+		if !validStatuses[status] {
+			return "", fmt.Errorf("invalid status: %s", status)
+		}
+
+		task.Status = status
+
+		// When a task is completed, remove it from all other tasks' blockedBy
+		if status == "completed" {
+			tm.clearDependency(taskID)
+		}
+	}
+
+	// Add blockedBy dependencies
+	if len(addBlockedBy) > 0 {
+		task.BlockedBy = uniqueIntSlice(append(task.BlockedBy, addBlockedBy...))
+	}
+
+	// Add blocks dependencies (with bidirectional updates)
+	if len(addBlocks) > 0 {
+		task.Blocks = uniqueIntSlice(append(task.Blocks, addBlocks...))
+
+		// Update blocked tasks' blockedBy lists
+		for _, blockedID := range addBlocks {
+			if blockedTask, err := tm.load(blockedID); err == nil {
+				if !containsInt(blockedTask.BlockedBy, taskID) {
+					blockedTask.BlockedBy = append(blockedTask.BlockedBy, taskID)
+					tm.save(blockedTask)
+				}
+			}
+		}
+	}
+
+	if err := tm.save(task); err != nil {
+		return "", err
+	}
+
+	data, _ := json.MarshalIndent(task, "", "  ")
+	return string(data), nil
+}
+
+// clearDependency removes a completed task ID from all other tasks' blockedBy lists
+func (tm *TaskManager) clearDependency(completedID int) error {
+	entries, err := os.ReadDir(tm.dir)
+	if err != nil {
+		return fmt.Errorf("failed to read tasks directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasPrefix(name, "task_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+
+		task, err := tm.load(extractTaskID(name))
+		if err != nil {
+			continue
+		}
+
+		if containsInt(task.BlockedBy, completedID) {
+			task.BlockedBy = removeInt(task.BlockedBy, completedID)
+			tm.save(task)
+		}
+	}
+
+	return nil
+}
+
+// Delete removes a task by ID
+func (tm *TaskManager) Delete(taskID int) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	path := filepath.Join(tm.dir, fmt.Sprintf("task_%d.json", taskID))
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("task %d not found", taskID)
+		}
+		return fmt.Errorf("failed to delete task: %w", err)
+	}
+
+	return nil
+}
+
+// ListAll returns a formatted string of all tasks
+func (tm *TaskManager) ListAll() (string, error) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	entries, err := os.ReadDir(tm.dir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read tasks directory: %w", err)
+	}
+
+	if len(entries) == 0 {
+		return "No tasks.", nil
+	}
+
+	var tasks []*Task
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasPrefix(name, "task_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+
+		taskID := extractTaskID(name)
+		task, err := tm.load(taskID)
+		if err != nil {
+			continue
+		}
+
+		tasks = append(tasks, task)
+	}
+
+	// Sort tasks by ID
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].ID < tasks[j].ID
+	})
+
+	var lines []string
+	for _, task := range tasks {
+		marker := statusMarker(task.Status)
+		var blockedStr string
+		if len(task.BlockedBy) > 0 {
+			blockedStr = fmt.Sprintf(" (blocked by: %v)", task.BlockedBy)
+		}
+		line := fmt.Sprintf("%s #%d: %s%s", marker, task.ID, task.Subject, blockedStr)
+		lines = append(lines, line)
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+// Helper functions
+
+func extractTaskID(filename string) int {
+	idStr := strings.TrimPrefix(filename, "task_")
+	idStr = strings.TrimSuffix(idStr, ".json")
+	var id int
+	fmt.Sscanf(idStr, "%d", &id)
+	return id
+}
+
+func statusMarker(status string) string {
+	switch status {
+	case "pending":
+		return "[ ]"
+	case "in_progress":
+		return "[>]"
+	case "completed":
+		return "[x]"
+	default:
+		return "[?]"
+	}
+}
+
+func containsInt(slice []int, value int) bool {
+	for _, v := range slice {
+		if v == value {
+			return true
+		}
+	}
+	return false
+}
+
+func removeInt(slice []int, value int) []int {
+	var result []int
+	for _, v := range slice {
+		if v != value {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
+func uniqueIntSlice(slice []int) []int {
+	seen := make(map[int]bool)
+	var result []int
+	for _, v := range slice {
+		if !seen[v] {
+			seen[v] = true
+			result = append(result, v)
+		}
+	}
+	sort.Ints(result)
+	return result
+}

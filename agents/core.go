@@ -19,28 +19,28 @@ type ToolDefinition struct {
 	Name        string
 	Description string
 	Parameters  map[string]any
-	Handler     func(context.Context, json.RawMessage, *OpenAIAgent) (string, error)
+	Handler     func(context.Context, json.RawMessage, *Agent) (string, error)
 }
 
 // ToolFromJSONString wraps handlers that already accept JSON string input.
-func ToolFromJSONString(name, description string, parameters map[string]any, handler func(context.Context, string, *OpenAIAgent) (string, error)) ToolDefinition {
+func ToolFromJSONString(name, description string, parameters map[string]any, handler func(context.Context, string, *Agent) (string, error)) ToolDefinition {
 	return ToolDefinition{
 		Name:        name,
 		Description: description,
 		Parameters:  parameters,
-		Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
+		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			return handler(ctx, string(args), agent)
 		},
 	}
 }
 
 // ToolFromStringArg builds a tool that reads one string field from JSON args.
-func ToolFromStringArg(name, description, argName string, parameters map[string]any, handler func(context.Context, string, *OpenAIAgent) (string, error)) ToolDefinition {
+func ToolFromStringArg(name, description, argName string, parameters map[string]any, handler func(context.Context, string, *Agent) (string, error)) ToolDefinition {
 	return ToolDefinition{
 		Name:        name,
 		Description: description,
 		Parameters:  parameters,
-		Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
+		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			var params map[string]any
 			if err := json.Unmarshal(args, &params); err != nil {
 				return "", fmt.Errorf("invalid %s args: %w", name, err)
@@ -54,15 +54,16 @@ func ToolFromStringArg(name, description, argName string, parameters map[string]
 	}
 }
 
-type OpenAIAgent struct {
+type Agent struct {
 	Name         string
 	Description  string
 	SystemPrompt string
 	BaseUrl      string
 	ApiKey       string
 	Model        string
-	SubAgents    map[string]*OpenAIAgent
+	SubAgents    map[string]*Agent
 	SkillLoader  *SkillLoader
+	TaskManager  *TaskManager
 
 	client openai.Client
 	tools  map[string]ToolDefinition
@@ -76,7 +77,7 @@ type AgentOptions struct {
 	ToolList  []ToolDefinition
 	BaseUrl   string
 	ApiKey    string
-	SubAgents map[string]*OpenAIAgent
+	SubAgents map[string]*Agent
 }
 
 type AgentOption func(*AgentOptions)
@@ -111,7 +112,7 @@ func WithApiKey(apiKey string) AgentOption {
 	}
 }
 
-func WithSubAgents(SubAgents map[string]*OpenAIAgent) AgentOption {
+func WithSubAgents(SubAgents map[string]*Agent) AgentOption {
 	return func(o *AgentOptions) {
 		o.SubAgents = SubAgents
 	}
@@ -128,7 +129,7 @@ func registerLoadSkillTool(toolMap map[string]ToolDefinition, order []string, sk
 				"description": "name of the skill to load, choose from the provided skill list",
 			},
 		},
-		Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
+		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			type paramsStruct struct {
 				SkillName string `json:"skill_name"`
 			}
@@ -143,7 +144,7 @@ func registerLoadSkillTool(toolMap map[string]ToolDefinition, order []string, sk
 	return order
 }
 
-func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []string, subAgents map[string]*OpenAIAgent) []string {
+func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []string, subAgents map[string]*Agent) []string {
 	if len(subAgents) == 0 {
 		return order
 	}
@@ -169,7 +170,7 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 				"description": "detailed description of the task you gave to the sub-agent",
 			},
 		},
-		Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
+		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			type paramsStruct struct {
 				SubAgentName string `json:"sub_agent_name"`
 				Input        string `json:"input"`
@@ -204,7 +205,7 @@ func registerCompactTool(toolMap map[string]ToolDefinition, order []string) []st
 				},
 			},
 		},
-		Handler: func(ctx context.Context, args json.RawMessage, agent *OpenAIAgent) (string, error) {
+		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			type paramsStruct struct {
 				Focus string `json:"focus"`
 			}
@@ -220,7 +221,7 @@ func registerCompactTool(toolMap map[string]ToolDefinition, order []string) []st
 	return order
 }
 
-func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption) *OpenAIAgent {
+func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption) *Agent {
 	// 初始化选项
 	agentOpts := &AgentOptions{}
 	for _, opt := range createOpts {
@@ -265,7 +266,7 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		toolMap[t.Name] = t
 		order = append(order, t.Name)
 	}
-	WORKDIR, _ := os.Getwd()
+
 	skillLoader := NewSkillLoader(filepath.Join(WORKDIR, "skills"))
 	order = registerLoadSkillTool(toolMap, order, skillLoader)
 
@@ -273,10 +274,14 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 	systemPrompt += skillLoader.GetDescriptions()
 
 	subAgents := agentOpts.SubAgents
+	taskManager, err := NewTaskManager(filepath.Join(WORKDIR, ".tasks"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize task manager: %v\n", err)
+	}
 	order = registerRouteToSubagentTool(toolMap, order, subAgents)
 	order = registerCompactTool(toolMap, order)
 
-	return &OpenAIAgent{
+	return &Agent{
 		Name:         name,
 		SystemPrompt: systemPrompt,
 		Description:  agentOpts.Desc,
@@ -285,13 +290,14 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		Model:        model,
 		SubAgents:    subAgents,
 		SkillLoader:  skillLoader,
+		TaskManager:  taskManager,
 		client:       openai.NewClient(opts...),
 		tools:        toolMap,
 		order:        order,
 	}
 }
 
-func (a *OpenAIAgent) Run(ctx context.Context, userInput string) (string, error) {
+func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage(a.SystemPrompt),
 		openai.UserMessage(userInput),
@@ -395,7 +401,7 @@ func parseCompactFocus(args json.RawMessage) (string, error) {
 	return params.Focus, nil
 }
 
-func (a *OpenAIAgent) maybeAutoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) ([]openai.ChatCompletionMessageParamUnion, error) {
+func (a *Agent) maybeAutoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) ([]openai.ChatCompletionMessageParamUnion, error) {
 	conversationText, err := marshalConversation(messages)
 	if err != nil {
 		return nil, err
@@ -406,7 +412,7 @@ func (a *OpenAIAgent) maybeAutoCompact(ctx context.Context, messages []openai.Ch
 	return a.autoCompact(ctx, messages, conversationText, "")
 }
 
-func (a *OpenAIAgent) forceAutoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
+func (a *Agent) forceAutoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
 	conversationText, err := marshalConversation(messages)
 	if err != nil {
 		return nil, err
@@ -414,7 +420,7 @@ func (a *OpenAIAgent) forceAutoCompact(ctx context.Context, messages []openai.Ch
 	return a.autoCompact(ctx, messages, conversationText, focus)
 }
 
-func (a *OpenAIAgent) autoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, conversationText, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
+func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, conversationText, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
 	workdir, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("get working directory failed: %w", err)
@@ -461,7 +467,7 @@ func (a *OpenAIAgent) autoCompact(ctx context.Context, messages []openai.ChatCom
 	}, nil
 }
 
-func (a *OpenAIAgent) summarizeForAutoCompact(ctx context.Context, prompt string) (string, error) {
+func (a *Agent) summarizeForAutoCompact(ctx context.Context, prompt string) (string, error) {
 	if a.autoCompactSummarizer != nil {
 		return a.autoCompactSummarizer(ctx, prompt)
 	}
@@ -600,7 +606,7 @@ func toolResultCompact(output, toolName string) string {
 	return output
 }
 
-func (a *OpenAIAgent) executeTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {
+func (a *Agent) executeTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {
 	t, ok := a.tools[name]
 	if !ok {
 		return "", fmt.Errorf("unknown tool: %s", name)
@@ -608,7 +614,7 @@ func (a *OpenAIAgent) executeTool(ctx context.Context, name string, rawArgs json
 	return t.Handler(ctx, rawArgs, a)
 }
 
-func (a *OpenAIAgent) openAITools() []openai.ChatCompletionToolUnionParam {
+func (a *Agent) openAITools() []openai.ChatCompletionToolUnionParam {
 	if len(a.order) == 0 {
 		return nil
 	}

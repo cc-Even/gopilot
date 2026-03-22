@@ -13,7 +13,7 @@ type TodoItems struct {
 	Status string `json:"status,omitempty" validate:"oneof=pending in_progress completed" default:"pending"`
 }
 
-func UpdateTodoTool(_ context.Context, input string, agent *OpenAIAgent) (string, error) {
+func UpdateTodoTool(_ context.Context, input string, agent *Agent) (string, error) {
 	items, err := parseTodoItems(input)
 	if err != nil {
 		return "input format error", err

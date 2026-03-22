@@ -117,7 +117,7 @@ func TestMaybeAutoCompact_WithMockSummary(t *testing.T) {
 	})
 
 	mockSummary := "mock summary: state preserved"
-	agent := &OpenAIAgent{
+	agent := &Agent{
 		Model: "gpt-4o-mini",
 		autoCompactSummarizer: func(ctx context.Context, prompt string) (string, error) {
 			if !strings.Contains(prompt, "Summarize this conversation for continuity.") {

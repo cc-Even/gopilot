@@ -29,7 +29,7 @@ func main() {
 		"local-agent",
 		sysPrompt,
 		os.Getenv("MODEL"),
-		//agents.WithSubAgents(map[string]*agents.OpenAIAgent{
+		//agents.WithSubAgents(map[string]*agents.Agent{
 		//	subAgent.Name: subAgent,
 		//}),
 	)
