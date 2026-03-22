@@ -65,6 +65,7 @@ type Agent struct {
 	SkillLoader  *SkillLoader
 	TaskManager  *TaskManager
 	Background   *BackgroundManager
+	TeamManager  *TeammateManager
 
 	client openai.Client
 	tools  map[string]ToolDefinition
@@ -268,14 +269,14 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		order = append(order, t.Name)
 	}
 
-	skillLoader := NewSkillLoader(filepath.Join(WORKDIR, "skills"))
+	skillLoader := NewSkillLoader(SKILL_DIR)
 	order = registerLoadSkillTool(toolMap, order, skillLoader)
 
 	systemPrompt += "\n Use load_skill to access specialized knowledge before tackling unfamiliar topics.\n\nSkills available:"
 	systemPrompt += skillLoader.GetDescriptions()
 
 	subAgents := agentOpts.SubAgents
-	taskManager, err := NewTaskManager(filepath.Join(WORKDIR, ".tasks"))
+	taskManager, err := NewTaskManager(TASK_DIR)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize task manager: %v\n", err)
 	}
@@ -283,7 +284,7 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 	order = registerRouteToSubagentTool(toolMap, order, subAgents)
 	order = registerCompactTool(toolMap, order)
 
-	return &Agent{
+	agent := &Agent{
 		Name:         name,
 		SystemPrompt: systemPrompt,
 		Description:  agentOpts.Desc,
@@ -298,6 +299,11 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		tools:        toolMap,
 		order:        order,
 	}
+
+	agent.TeamManager = NewTeammateManager(TEAM_DIR, agent)
+	agent.order = registerTeamTools(agent.tools, agent.order)
+
+	return agent
 }
 
 func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {

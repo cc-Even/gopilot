@@ -26,7 +26,7 @@ func main() {
 	//)
 	sysPrompt := fmt.Sprintf(" You are a coding agent at  %s.", WORKDIR)
 	agent := agents.NewOpenAIAgent(
-		"local-agent",
+		"supervisor",
 		sysPrompt,
 		os.Getenv("MODEL"),
 		agents.WithToolList(agents.DefaultToolDefinitions()),
@@ -36,12 +36,18 @@ func main() {
 	)
 
 	msgs := []string{
-		`Start 3 background tasks: "sleep 2", "sleep 4", "sleep 6". Check their status.`,
+		"Spawn Alice (coder) and Bob (tester). Send Alice a message:  `tell Bob to report his role to me`, send Alice the exact words.",
+		"Broadcast \"status update: phase 1 complete\" to all teammates",
+		"Check the lead inbox for any messages",
 	}
 
 	for _, msg := range msgs {
+		fmt.Println("Input message: ", msg)
 		output, err := agent.Run(context.TODO(), msg)
 		if err != nil {
+			log.Fatal(err)
+		}
+		if err := agent.TeamManager.WaitUntilIdle(context.TODO()); err != nil {
 			log.Fatal(err)
 		}
 

@@ -398,9 +398,9 @@ func (c BashTool) Description() string {
 }
 
 func (c BashTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
-	log.Printf("[BashTool] Executing command: %s", input)
+	log.Printf("[BashTool] agent=%s Executing command: %s", agentLogName(agent), input)
 	result := RunBash(input)
-	log.Printf("[BashTool] Command output (first 200 chars): %s", truncate(result, 200))
+	log.Printf("[BashTool] agent=%s Command output (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
 	return result, nil
 }
 
@@ -417,9 +417,9 @@ func (c BackgroundRunTool) Call(_ context.Context, input string, agent *Agent) (
 		return "", fmt.Errorf("background manager not initialized")
 	}
 
-	log.Printf("[BackgroundRunTool] Starting command: %s", input)
+	log.Printf("[BackgroundRunTool] agent=%s Starting command: %s", agentLogName(agent), input)
 	result := agent.Background.Run(input)
-	log.Printf("[BackgroundRunTool] Started: %s", result)
+	log.Printf("[BackgroundRunTool] agent=%s Started: %s", agentLogName(agent), result)
 	return result, nil
 }
 
@@ -441,14 +441,14 @@ func (c BackgroundCheckTool) Call(_ context.Context, input string, agent *Agent)
 	}
 	if input != "" && input != "null" {
 		if err := json.Unmarshal([]byte(input), &params); err != nil {
-			log.Printf("[BackgroundCheckTool] Error parsing input: %v", err)
+			log.Printf("[BackgroundCheckTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 			return "", fmt.Errorf("invalid input: %v", err)
 		}
 	}
 
-	log.Printf("[BackgroundCheckTool] Checking task: task_id=%s", params.TaskID)
+	log.Printf("[BackgroundCheckTool] agent=%s Checking task: task_id=%s", agentLogName(agent), params.TaskID)
 	result := agent.Background.Check(params.TaskID)
-	log.Printf("[BackgroundCheckTool] Check result (first 200 chars): %s", truncate(result, 200))
+	log.Printf("[BackgroundCheckTool] agent=%s Check result (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
 	return result, nil
 }
 
@@ -467,12 +467,12 @@ func (r ReadFileTool) Call(_ context.Context, input string, agent *Agent) (strin
 		Limit int    `json:"limit"`
 	}
 	if err := json.Unmarshal([]byte(input), &params); err != nil {
-		log.Printf("[ReadFileTool] Error parsing input: %v", err)
+		log.Printf("[ReadFileTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
-	log.Printf("[ReadFileTool] Reading file: path=%s, limit=%d", params.Path, params.Limit)
+	log.Printf("[ReadFileTool] agent=%s Reading file: path=%s, limit=%d", agentLogName(agent), params.Path, params.Limit)
 	result := RunRead(params.Path, params.Limit)
-	log.Printf("[ReadFileTool] File read completed (first 200 chars): %s", truncate(result, 200))
+	log.Printf("[ReadFileTool] agent=%s File read completed (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
 	return result, nil
 }
 
@@ -491,12 +491,12 @@ func (w WriteFileTool) Call(_ context.Context, input string, agent *Agent) (stri
 		Content string `json:"content"`
 	}
 	if err := json.Unmarshal([]byte(input), &params); err != nil {
-		log.Printf("[WriteFileTool] Error parsing input: %v", err)
+		log.Printf("[WriteFileTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
-	log.Printf("[WriteFileTool] Writing file: path=%s, content_size=%d bytes", params.Path, len(params.Content))
+	log.Printf("[WriteFileTool] agent=%s Writing file: path=%s, content_size=%d bytes", agentLogName(agent), params.Path, len(params.Content))
 	result := RunWrite(params.Path, params.Content)
-	log.Printf("[WriteFileTool] File write completed: %s", result)
+	log.Printf("[WriteFileTool] agent=%s File write completed: %s", agentLogName(agent), result)
 	return result, nil
 }
 
@@ -516,12 +516,12 @@ func (e EditFileTool) Call(_ context.Context, input string, agent *Agent) (strin
 		NewText string `json:"new_text"`
 	}
 	if err := json.Unmarshal([]byte(input), &params); err != nil {
-		log.Printf("[EditFileTool] Error parsing input: %v", err)
+		log.Printf("[EditFileTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
-	log.Printf("[EditFileTool] Editing file: path=%s, old_text_size=%d, new_text_size=%d", params.Path, len(params.OldText), len(params.NewText))
+	log.Printf("[EditFileTool] agent=%s Editing file: path=%s, old_text_size=%d, new_text_size=%d", agentLogName(agent), params.Path, len(params.OldText), len(params.NewText))
 	result := RunEdit(params.Path, params.OldText, params.NewText)
-	log.Printf("[EditFileTool] File edit completed: %s", result)
+	log.Printf("[EditFileTool] agent=%s File edit completed: %s", agentLogName(agent), result)
 	return result, nil
 }
 
@@ -531,6 +531,13 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func agentLogName(agent *Agent) string {
+	if agent == nil || strings.TrimSpace(agent.Name) == "" {
+		return "unknown"
+	}
+	return agent.Name
 }
 
 // Task Management Tool Handlers
@@ -546,7 +553,7 @@ func TaskCreateTool(ctx context.Context, input string, agent *Agent) (string, er
 		Description string `json:"description"`
 	}
 	if err := json.Unmarshal([]byte(input), &params); err != nil {
-		log.Printf("[TaskCreateTool] Error parsing input: %v", err)
+		log.Printf("[TaskCreateTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
 
@@ -554,13 +561,13 @@ func TaskCreateTool(ctx context.Context, input string, agent *Agent) (string, er
 		return "", fmt.Errorf("subject is required")
 	}
 
-	log.Printf("[TaskCreateTool] Creating task: subject=%s", params.Subject)
+	log.Printf("[TaskCreateTool] agent=%s Creating task: subject=%s", agentLogName(agent), params.Subject)
 	result, err := agent.TaskManager.Create(params.Subject, params.Description)
 	if err != nil {
-		log.Printf("[TaskCreateTool] Error: %v", err)
+		log.Printf("[TaskCreateTool] agent=%s Error: %v", agentLogName(agent), err)
 		return "", err
 	}
-	log.Printf("[TaskCreateTool] Task created successfully")
+	log.Printf("[TaskCreateTool] agent=%s Task created successfully", agentLogName(agent))
 	return result, nil
 }
 
@@ -577,17 +584,17 @@ func TaskUpdateTool(ctx context.Context, input string, agent *Agent) (string, er
 		AddBlocks    []int  `json:"addBlocks"`
 	}
 	if err := json.Unmarshal([]byte(input), &params); err != nil {
-		log.Printf("[TaskUpdateTool] Error parsing input: %v", err)
+		log.Printf("[TaskUpdateTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
 
-	log.Printf("[TaskUpdateTool] Updating task: task_id=%d, params=%s", params.TaskID, input)
+	log.Printf("[TaskUpdateTool] agent=%s Updating task: task_id=%d, params=%s", agentLogName(agent), params.TaskID, input)
 	result, err := agent.TaskManager.Update(params.TaskID, params.Status, params.AddBlockedBy, params.AddBlocks)
 	if err != nil {
-		log.Printf("[TaskUpdateTool] Error: %v", err)
+		log.Printf("[TaskUpdateTool] agent=%s Error: %v", agentLogName(agent), err)
 		return "", err
 	}
-	log.Printf("[TaskUpdateTool] Task updated successfully")
+	log.Printf("[TaskUpdateTool] agent=%s Task updated successfully", agentLogName(agent))
 	return result, nil
 }
 
@@ -597,13 +604,13 @@ func TaskListTool(ctx context.Context, input string, agent *Agent) (string, erro
 		return "", fmt.Errorf("task manager not initialized")
 	}
 
-	log.Printf("[TaskListTool] Listing all tasks")
+	log.Printf("[TaskListTool] agent=%s Listing all tasks", agentLogName(agent))
 	result, err := agent.TaskManager.ListAll()
 	if err != nil {
-		log.Printf("[TaskListTool] Error: %v", err)
+		log.Printf("[TaskListTool] agent=%s Error: %v", agentLogName(agent), err)
 		return "", err
 	}
-	log.Printf("[TaskListTool] Task list retrieved successfully")
+	log.Printf("[TaskListTool] agent=%s Task list retrieved successfully", agentLogName(agent))
 	return result, nil
 }
 
@@ -617,16 +624,16 @@ func TaskGetTool(ctx context.Context, input string, agent *Agent) (string, error
 		TaskID int `json:"task_id"`
 	}
 	if err := json.Unmarshal([]byte(input), &params); err != nil {
-		log.Printf("[TaskGetTool] Error parsing input: %v", err)
+		log.Printf("[TaskGetTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
 
-	log.Printf("[TaskGetTool] Getting task: task_id=%d", params.TaskID)
+	log.Printf("[TaskGetTool] agent=%s Getting task: task_id=%d", agentLogName(agent), params.TaskID)
 	result, err := agent.TaskManager.Get(params.TaskID)
 	if err != nil {
-		log.Printf("[TaskGetTool] Error: %v", err)
+		log.Printf("[TaskGetTool] agent=%s Error: %v", agentLogName(agent), err)
 		return "", err
 	}
-	log.Printf("[TaskGetTool] Task retrieved successfully")
+	log.Printf("[TaskGetTool] agent=%s Task retrieved successfully", agentLogName(agent))
 	return result, nil
 }
