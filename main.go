@@ -17,12 +17,17 @@ func main() {
 		log.Println("Warning: No .env file found, using system environment variables")
 	}
 	WORKDIR, _ := os.Getwd()
-	sysPrompt := fmt.Sprintf(" You are a coding agent at  %s. When you are free, check your message", WORKDIR)
+	skillLoader := agents.NewSkillLoader(agents.SKILL_DIR)
+	sysPrompt := fmt.Sprintf(" You are a coding agent at %s. Use tools to solve tasks. ", WORKDIR) +
+		"Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists." +
+		fmt.Sprintf("Use task for subagent delegation. Skills: %s", skillLoader.GetDescriptions())
+
 	agent := agents.NewOpenAIAgent(
 		"supervisor",
 		sysPrompt,
 		os.Getenv("MODEL"),
 		agents.WithToolList(agents.DefaultToolDefinitions()),
+		agents.WithSkillLoader(skillLoader),
 	)
 
 	msgs := []string{

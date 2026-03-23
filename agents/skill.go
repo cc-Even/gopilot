@@ -254,7 +254,7 @@ func DefaultToolDefinitions() []ToolDefinition {
 		),
 		ToolFromJSONString(
 			"todo",
-			"Update todo items. input should be a JSON array of objects with fields: id, text, status (pending, in_progress, completed).",
+			"Update todo items.You need enter the complete todo list. input should be a JSON array of objects with fields: id, text, status (pending, in_progress, completed).",
 			ObjectSchema(map[string]any{"id": IntegerParam(), "text": StringParam(), "status": StringParam()}),
 			UpdateTodoTool,
 		),
@@ -782,7 +782,7 @@ func WorktreeRemoveTool(ctx context.Context, input string, agent *Agent) (string
 func idleToolDefinition() ToolDefinition {
 	return ToolDefinition{
 		Name:        "idle",
-		Description: "Yield the current work loop and wait for inbox messages or an unclaimed task board item.",
+		Description: "Signal no more work.",
 		Parameters:  ObjectSchema(map[string]any{}),
 		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			return "entering idle", nil

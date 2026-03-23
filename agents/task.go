@@ -441,19 +441,58 @@ func (tm *TaskManager) ClaimNextAvailable(owner string) (*Task, error) {
 		if err != nil {
 			continue
 		}
-		if task.Status != "pending" || task.Owner != "" || len(task.BlockedBy) > 0 {
+		if !claimableTask(task) {
 			continue
 		}
-
-		task.Owner = owner
-		task.Status = "in_progress"
-		if err := tm.save(task); err != nil {
-			return nil, err
-		}
-		return task, nil
+		return tm.claimLocked(task, owner)
 	}
 
 	return nil, nil
+}
+
+func (tm *TaskManager) Claim(taskID int, owner string) (*Task, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if strings.TrimSpace(owner) == "" {
+		return nil, fmt.Errorf("owner is required")
+	}
+
+	task, err := tm.load(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if task.Status != "pending" {
+		return nil, fmt.Errorf("task %d is not pending", taskID)
+	}
+	if task.Owner != "" {
+		return nil, fmt.Errorf("task %d is already owned by %s", taskID, task.Owner)
+	}
+	if len(task.BlockedBy) > 0 {
+		return nil, fmt.Errorf("task %d is blocked by %v", taskID, task.BlockedBy)
+	}
+
+	return tm.claimLocked(task, owner)
+}
+
+func (tm *TaskManager) claimLocked(task *Task, owner string) (*Task, error) {
+	if task == nil {
+		return nil, nil
+	}
+
+	task.Owner = owner
+	task.Status = "in_progress"
+	if err := tm.save(task); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func claimableTask(task *Task) bool {
+	if task == nil {
+		return false
+	}
+	return task.Status == "pending" && task.Owner == "" && len(task.BlockedBy) == 0
 }
 
 func (tm *TaskManager) BindWorktree(taskID int, worktree string) (*Task, error) {

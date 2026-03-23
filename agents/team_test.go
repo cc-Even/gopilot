@@ -82,17 +82,11 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
 
-	select {
-	case <-runnerCalled:
-		t.Fatal("spawn should not start teammate loop")
-	case <-time.After(50 * time.Millisecond):
-	}
-
 	manager.mu.Lock()
 	member := manager.findMemberLocked("worker-1")
-	if member == nil || member.Status != teammateStatusIdle {
+	if member == nil || member.Status == teammateStatusIdle {
 		manager.mu.Unlock()
-		t.Fatalf("expected spawned teammate to stay idle, got %+v", member)
+		t.Fatalf("expected spawned teammate to stay working, got %+v", member)
 	}
 	if len(manager.threads) != 0 {
 		manager.mu.Unlock()
@@ -107,11 +101,8 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 	if !strings.Contains(string(raw), `"name": "worker-1"`) {
 		t.Fatalf("config missing teammate entry: %s", string(raw))
 	}
-	if !strings.Contains(string(raw), `"status": "idle"`) {
-		t.Fatalf("config missing idle status: %s", string(raw))
-	}
-	if !strings.Contains(string(raw), `"prompt": "inspect core changes"`) {
-		t.Fatalf("config missing original prompt: %s", string(raw))
+	if !strings.Contains(string(raw), `"status": "working"`) {
+		t.Fatalf("config missing working status: %s", string(raw))
 	}
 }
 
@@ -137,12 +128,6 @@ func TestTeammateManagerWakeReusesOriginalPrompt(t *testing.T) {
 	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "")
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
-	}
-
-	select {
-	case got := <-prompts:
-		t.Fatalf("spawn should not run teammate loop, got prompt %s", got)
-	case <-time.After(50 * time.Millisecond):
 	}
 
 	wakeResult := manager.Wake("worker-1")
@@ -248,6 +233,147 @@ func TestTeammateManagerNextIdleEventClaimsTask(t *testing.T) {
 	}
 	if task.Owner != "worker-1" || task.Status != "in_progress" {
 		t.Fatalf("expected claimed task persisted, got %+v", task)
+	}
+}
+
+func TestClaimTaskToolClaimsTaskEvenWithInboxMessages(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+	taskDir := filepath.Join(tempDir, ".tasks")
+
+	taskManager, err := NewTaskManager(taskDir)
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("claim me", "ready"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		TaskManager:  taskManager,
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+	manager.bus.Send("lead", "worker-1", "please read later", "message", nil)
+
+	result, err := claimTaskTool(context.Background(), json.RawMessage(`{}`), agent)
+	if err != nil {
+		t.Fatalf("claimTaskTool failed: %v", err)
+	}
+	if !strings.Contains(result, "<task_claim>") || !strings.Contains(result, `"owner": "worker-1"`) {
+		t.Fatalf("expected claimed task payload, got %q", result)
+	}
+
+	messages := manager.bus.ReadInbox("worker-1")
+	if len(messages) != 1 || messages[0].Content != "please read later" {
+		t.Fatalf("claim_task should not drain inbox, got %+v", messages)
+	}
+}
+
+func TestClaimTaskToolClaimsSpecificTaskID(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+	taskDir := filepath.Join(tempDir, ".tasks")
+
+	taskManager, err := NewTaskManager(taskDir)
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("first", "blocked task"); err != nil {
+		t.Fatalf("create task 0 failed: %v", err)
+	}
+	if _, err := taskManager.Create("second", "claim this one"); err != nil {
+		t.Fatalf("create task 1 failed: %v", err)
+	}
+	if _, err := taskManager.Update(1, "", []int{0}, nil); err != nil {
+		t.Fatalf("block task 1 failed: %v", err)
+	}
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		TaskManager:  taskManager,
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+
+	result, err := claimTaskTool(context.Background(), json.RawMessage(`{"task_id":0}`), agent)
+	if err != nil {
+		t.Fatalf("claimTaskTool failed: %v", err)
+	}
+	if !strings.Contains(result, "<task_claim>") || !strings.Contains(result, `"id": 0`) {
+		t.Fatalf("expected claimed task 0 payload, got %q", result)
+	}
+
+	task0JSON, err := taskManager.Get(0)
+	if err != nil {
+		t.Fatalf("get task 0 failed: %v", err)
+	}
+	var task0 Task
+	if err := json.Unmarshal([]byte(task0JSON), &task0); err != nil {
+		t.Fatalf("parse task 0 failed: %v", err)
+	}
+	if task0.Owner != "worker-1" || task0.Status != "in_progress" {
+		t.Fatalf("expected task 0 claimed, got %+v", task0)
+	}
+
+	task1JSON, err := taskManager.Get(1)
+	if err != nil {
+		t.Fatalf("get task 1 failed: %v", err)
+	}
+	var task1 Task
+	if err := json.Unmarshal([]byte(task1JSON), &task1); err != nil {
+		t.Fatalf("parse task 1 failed: %v", err)
+	}
+	if task1.Owner != "" || task1.Status != "pending" {
+		t.Fatalf("expected task 1 untouched, got %+v", task1)
+	}
+}
+
+func TestClaimTaskToolRejectsBlockedSpecificTaskID(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+	taskDir := filepath.Join(tempDir, ".tasks")
+
+	taskManager, err := NewTaskManager(taskDir)
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("dependency", "must finish first"); err != nil {
+		t.Fatalf("create task 0 failed: %v", err)
+	}
+	if _, err := taskManager.Create("blocked", "cannot claim yet"); err != nil {
+		t.Fatalf("create task 1 failed: %v", err)
+	}
+	if _, err := taskManager.Update(1, "", []int{0}, nil); err != nil {
+		t.Fatalf("block task 1 failed: %v", err)
+	}
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		TaskManager:  taskManager,
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+
+	_, err = claimTaskTool(context.Background(), json.RawMessage(`{"task_id":1}`), agent)
+	if err == nil {
+		t.Fatal("expected blocked task claim to fail")
+	}
+	if !strings.Contains(err.Error(), "blocked") {
+		t.Fatalf("expected blocked error, got %v", err)
 	}
 }
 

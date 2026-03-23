@@ -77,11 +77,12 @@ type Agent struct {
 }
 
 type AgentOptions struct {
-	Desc      string
-	ToolList  []ToolDefinition
-	BaseUrl   string
-	ApiKey    string
-	SubAgents map[string]*Agent
+	Desc        string
+	ToolList    []ToolDefinition
+	BaseUrl     string
+	ApiKey      string
+	SubAgents   map[string]*Agent
+	SkillLoader *SkillLoader
 }
 
 type AgentOption func(*AgentOptions)
@@ -119,6 +120,12 @@ func WithApiKey(apiKey string) AgentOption {
 func WithSubAgents(SubAgents map[string]*Agent) AgentOption {
 	return func(o *AgentOptions) {
 		o.SubAgents = SubAgents
+	}
+}
+
+func WithSkillLoader(skillLoader *SkillLoader) AgentOption {
+	return func(o *AgentOptions) {
+		o.SkillLoader = skillLoader
 	}
 }
 
@@ -271,11 +278,10 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		order = append(order, t.Name)
 	}
 
-	skillLoader := NewSkillLoader(SKILL_DIR)
-	order = registerLoadSkillTool(toolMap, order, skillLoader)
-
-	systemPrompt += "\n Use load_skill to access specialized knowledge before tackling unfamiliar topics.\n\nSkills available:"
-	systemPrompt += skillLoader.GetDescriptions()
+	skillLoader := agentOpts.SkillLoader
+	if skillLoader != nil {
+		order = registerLoadSkillTool(toolMap, order, skillLoader)
+	}
 
 	subAgents := agentOpts.SubAgents
 	taskManager, err := NewTaskManager(TASK_DIR)

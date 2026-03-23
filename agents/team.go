@@ -175,7 +175,6 @@ type TeamMember struct {
 	Name   string `json:"name"`
 	Role   string `json:"role"`
 	Status string `json:"status"`
-	Prompt string `json:"prompt,omitempty"`
 }
 
 type TeamConfig struct {
@@ -252,18 +251,15 @@ func (m *TeammateManager) findMemberLocked(name string) *TeamMember {
 	return nil
 }
 
-func (m *TeammateManager) Spawn(name, role, prompt, supervisor string) string {
+func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) string {
 	if m == nil {
 		return "Error: teammate manager not initialized"
 	}
 	if strings.TrimSpace(name) == "" {
 		return "Error: teammate name is required"
 	}
-	if strings.TrimSpace(prompt) == "" {
+	if strings.TrimSpace(taskPrompt) == "" {
 		return "Error: teammate prompt is required"
-	}
-	if len(supervisor) > 0 {
-		prompt += "your supervisor is `" + supervisor + "`. "
 	}
 
 	m.mu.Lock()
@@ -274,15 +270,13 @@ func (m *TeammateManager) Spawn(name, role, prompt, supervisor string) string {
 			m.mu.Unlock()
 			return fmt.Sprintf("Error: %q is currently %s", name, status)
 		}
-		member.Status = teammateStatusIdle
+		member.Status = teammateStatusWorking
 		member.Role = role
-		member.Prompt = prompt
 	} else {
 		m.config.Members = append(m.config.Members, TeamMember{
 			Name:   name,
 			Role:   role,
-			Status: teammateStatusIdle,
-			Prompt: prompt,
+			Status: teammateStatusWorking,
 		})
 	}
 	if err := m.saveConfigLocked(); err != nil {
@@ -291,6 +285,7 @@ func (m *TeammateManager) Spawn(name, role, prompt, supervisor string) string {
 	}
 	m.mu.Unlock()
 
+	go m.teammateLoop(context.Background(), name, role, taskPrompt)
 	return fmt.Sprintf("Spawned %q (role: %s)", name, role)
 }
 
@@ -320,20 +315,20 @@ func (m *TeammateManager) Wake(name string) string {
 	}
 
 	role := member.Role
-	originalPrompt := member.Prompt
+	taskPrompt := "you have received a new message, use read_inbox"
 	ctx, cancel := context.WithCancel(context.Background())
 	m.threads[name] = cancel
 	m.mu.Unlock()
 
-	log.Printf("[TeammateManager] Waking teammate: name=%s, role=%s, original_prompt_size=%d", name, role, len(originalPrompt))
-	go m.teammateLoop(ctx, name, role, originalPrompt)
+	log.Printf("[TeammateManager] Waking teammate: name=%s, role=%s, task_prompt_size=%d", name, role, len(taskPrompt))
+	go m.teammateLoop(ctx, name, role, taskPrompt)
 	return fmt.Sprintf("Woke %q", name)
 }
 
-func (m *TeammateManager) teammateLoop(ctx context.Context, name, role, prompt string) {
+func (m *TeammateManager) teammateLoop(ctx context.Context, name, role, taskPrompt string) {
 	log.Printf("[TeammateManager] Teammate loop started: name=%s, role=%s", name, role)
-	agent := m.cloneAgent(name, role, prompt)
-	runErr := m.runner(ctx, agent, prompt)
+	agent := m.cloneAgent(name, role, taskPrompt)
+	runErr := m.runner(ctx, agent, taskPrompt)
 	if runErr != nil {
 		log.Printf("[TeammateManager] Teammate loop ended with error: name=%s, err=%v", name, runErr)
 	} else {
@@ -385,6 +380,7 @@ func (m *TeammateManager) WaitUntilIdle(ctx context.Context) error {
 }
 
 func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
+	sysPrompt := fmt.Sprintf("You are %s', role: %s, team: %s, at %s.Use idle when done with current work. You may auto-claim tasks.", name, role, m.config.TeamName, m.dir)
 	base := m.baseAgent
 	if base == nil {
 		return nil
@@ -407,7 +403,7 @@ func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 	agent := &Agent{
 		Name:            name,
 		Description:     role,
-		SystemPrompt:    prompt,
+		SystemPrompt:    sysPrompt,
 		BaseUrl:         base.BaseUrl,
 		ApiKey:          base.ApiKey,
 		Model:           base.Model,
@@ -566,7 +562,26 @@ func (m *TeammateManager) nextIdleEvent(agent *Agent) (string, error) {
 		return "", nil
 	}
 
-	task, err := agent.TaskManager.ClaimNextAvailable(agent.Name)
+	return m.claimNextTask(agent, nil)
+}
+
+func (m *TeammateManager) claimNextTask(agent *Agent, taskID *int) (string, error) {
+	if agent == nil {
+		return "", fmt.Errorf("agent not initialized")
+	}
+	if agent.TaskManager == nil {
+		return "", nil
+	}
+
+	var (
+		task *Task
+		err  error
+	)
+	if taskID != nil {
+		task, err = agent.TaskManager.Claim(*taskID, agent.Name)
+	} else {
+		task, err = agent.TaskManager.ClaimNextAvailable(agent.Name)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -695,11 +710,19 @@ func registerTeamTools(toolMap map[string]ToolDefinition, order []string) []stri
 			Name:        "spawn_teammate",
 			Description: "Spawn or restart a persistent teammate agent. The teammate continues in the background.",
 			Parameters: ObjectSchema(map[string]any{
-				"name":   StringParam(),
-				"role":   StringParam(),
-				"prompt": StringParam(),
-			}, "name", "role", "prompt"),
+				"name":        StringParam(),
+				"role":        StringParam(),
+				"task_prompt": StringParam(),
+			}, "name", "role", "task_prompt"),
 			Handler: spawnTeammateTool,
+		},
+		{
+			Name:        "claim_task",
+			Description: "Actively claim a runnable task from the task board. Optionally provide task_id to claim a specific task.",
+			Parameters: ObjectSchema(map[string]any{
+				"task_id": IntegerParam(),
+			}),
+			Handler: claimTaskTool,
 		},
 		{
 			Name:        "send_message",
@@ -748,16 +771,16 @@ func spawnTeammateTool(ctx context.Context, args json.RawMessage, agent *Agent) 
 	}
 
 	var params struct {
-		Name   string `json:"name"`
-		Role   string `json:"role"`
-		Prompt string `json:"prompt"`
+		Name       string `json:"name"`
+		Role       string `json:"role"`
+		TaskPrompt string `json:"task_prompt"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		log.Printf("[SpawnTeammateTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid spawn_teammate args: %w", err)
 	}
-	log.Printf("[SpawnTeammateTool] agent=%s Spawning teammate: name=%s, role=%s, prompt_size=%d", agentLogName(agent), params.Name, params.Role, len(params.Prompt))
-	result := agent.TeamManager.Spawn(params.Name, params.Role, params.Prompt, agent.Name)
+	log.Printf("[SpawnTeammateTool] agent=%s Spawning teammate: name=%s, role=%s, prompt_size=%d", agentLogName(agent), params.Name, params.Role, len(params.TaskPrompt))
+	result := agent.TeamManager.Spawn(params.Name, params.Role, params.TaskPrompt, agent.Name)
 	log.Printf("[SpawnTeammateTool] agent=%s Spawn completed: %s", agentLogName(agent), result)
 	return result, nil
 }
@@ -782,6 +805,38 @@ func sendMessageTool(ctx context.Context, args json.RawMessage, agent *Agent) (s
 		log.Printf("[SendMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), params.To, wakeResult)
 	}
 	log.Printf("[SendMessageTool] agent=%s Send completed: %s", agentLogName(agent), result)
+	return result, nil
+}
+
+func claimTaskTool(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
+	if agent == nil || agent.TeamManager == nil {
+		return "", fmt.Errorf("teammate manager not initialized")
+	}
+
+	var params struct {
+		TaskID *int `json:"task_id"`
+	}
+	if len(args) > 0 && string(args) != "null" {
+		if err := json.Unmarshal(args, &params); err != nil {
+			return "", fmt.Errorf("invalid claim_task args: %w", err)
+		}
+	}
+
+	if params.TaskID != nil {
+		log.Printf("[ClaimTaskTool] agent=%s Claiming task_id=%d", agentLogName(agent), *params.TaskID)
+	} else {
+		log.Printf("[ClaimTaskTool] agent=%s Claiming next task", agentLogName(agent))
+	}
+
+	result, err := agent.TeamManager.claimNextTask(agent, params.TaskID)
+	if err != nil {
+		log.Printf("[ClaimTaskTool] agent=%s Error: %v", agentLogName(agent), err)
+		return "", err
+	}
+	if result == "" {
+		result = "No claimable task."
+	}
+	log.Printf("[ClaimTaskTool] agent=%s Claim result (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
 	return result, nil
 }
 
