@@ -189,6 +189,10 @@ func IntegerParam() map[string]any {
 	return map[string]any{"type": "integer"}
 }
 
+func BoolParam() map[string]any {
+	return map[string]any{"type": "boolean"}
+}
+
 func ObjectSchema(properties map[string]any, required ...string) map[string]any {
 	schema := map[string]any{
 		"type":       "object",
@@ -284,28 +288,73 @@ func DefaultToolDefinitions() []ToolDefinition {
 			ObjectSchema(map[string]any{"task_id": IntegerParam()}, "task_id"),
 			TaskGetTool,
 		),
+		ToolFromJSONString(
+			"worktree_create",
+			"Create a git worktree and optionally bind it to a task.",
+			ObjectSchema(map[string]any{
+				"name":    StringParam(),
+				"task_id": IntegerParam(),
+			}, "name"),
+			WorktreeCreateTool,
+		),
+		ToolFromJSONString(
+			"worktree_list",
+			"List known worktrees from the registry.",
+			ObjectSchema(map[string]any{}),
+			WorktreeListTool,
+		),
+		ToolFromJSONString(
+			"worktree_keep",
+			"Mark a worktree as kept so the directory remains available.",
+			ObjectSchema(map[string]any{"name": StringParam()}, "name"),
+			WorktreeKeepTool,
+		),
+		ToolFromJSONString(
+			"worktree_remove",
+			"Remove a worktree directory. Optionally complete and unbind its task in the same call.",
+			ObjectSchema(map[string]any{
+				"name":          StringParam(),
+				"force":         BoolParam(),
+				"complete_task": BoolParam(),
+			}, "name"),
+			WorktreeRemoveTool,
+		),
 	}
 }
 
-// safePath ensures the path is within WORKDIR
-func safePath(p string) (string, error) {
-	absPath := filepath.Join(WORKDIR, p)
+func agentWorkspaceDir(agent *Agent) string {
+	if agent != nil && strings.TrimSpace(agent.WorkDir) != "" {
+		return agent.WorkDir
+	}
+	return WORKDIR
+}
+
+// safePath ensures the path is within the current workspace directory.
+func safePath(baseDir, p string) (string, error) {
+	absPath := p
+	if !filepath.IsAbs(p) {
+		absPath = filepath.Join(baseDir, p)
+	}
 	resolved, err := filepath.Abs(absPath)
 	if err != nil {
 		return "", err
 	}
-	workdirAbs, err := filepath.Abs(WORKDIR)
+	workdirAbs, err := filepath.Abs(baseDir)
 	if err != nil {
 		return "", err
 	}
-	if len(resolved) < len(workdirAbs) || resolved[:len(workdirAbs)] != workdirAbs {
+	relative, err := filepath.Rel(workdirAbs, resolved)
+	if err != nil {
+		return "", err
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
 		return "", errors.New("Path escapes workspace: " + p)
 	}
 	return resolved, nil
 }
 
 // RunBash executes a shell command safely
-func RunBash(command string) string {
+func RunBash(command, dir string) string {
 	dangerous := []string{"rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"}
 	for _, d := range dangerous {
 		if strings.Contains(command, d) {
@@ -313,7 +362,7 @@ func RunBash(command string) string {
 		}
 	}
 	cmd := exec.Command("bash", "-c", command)
-	cmd.Dir = WORKDIR
+	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(output)
@@ -329,8 +378,8 @@ func RunBash(command string) string {
 }
 
 // RunRead reads a file safely, with optional line limit
-func RunRead(path string, limit int) string {
-	resolved, err := safePath(path)
+func RunRead(baseDir, path string, limit int) string {
+	resolved, err := safePath(baseDir, path)
 	if err != nil {
 		return "Error: " + err.Error()
 	}
@@ -350,8 +399,8 @@ func RunRead(path string, limit int) string {
 }
 
 // RunWrite writes content to a file safely
-func RunWrite(path, content string) string {
-	resolved, err := safePath(path)
+func RunWrite(baseDir, path, content string) string {
+	resolved, err := safePath(baseDir, path)
 	if err != nil {
 		return "Error: " + err.Error()
 	}
@@ -368,8 +417,8 @@ func RunWrite(path, content string) string {
 }
 
 // RunEdit replaces oldText with newText in a file safely
-func RunEdit(path, oldText, newText string) string {
-	resolved, err := safePath(path)
+func RunEdit(baseDir, path, oldText, newText string) string {
+	resolved, err := safePath(baseDir, path)
 	if err != nil {
 		return "Error: " + err.Error()
 	}
@@ -399,7 +448,7 @@ func (c BashTool) Description() string {
 
 func (c BashTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
 	log.Printf("[BashTool] agent=%s Executing command: %s", agentLogName(agent), input)
-	result := RunBash(input)
+	result := RunBash(input, agentWorkspaceDir(agent))
 	log.Printf("[BashTool] agent=%s Command output (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
 	return result, nil
 }
@@ -471,7 +520,7 @@ func (r ReadFileTool) Call(_ context.Context, input string, agent *Agent) (strin
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
 	log.Printf("[ReadFileTool] agent=%s Reading file: path=%s, limit=%d", agentLogName(agent), params.Path, params.Limit)
-	result := RunRead(params.Path, params.Limit)
+	result := RunRead(agentWorkspaceDir(agent), params.Path, params.Limit)
 	log.Printf("[ReadFileTool] agent=%s File read completed (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
 	return result, nil
 }
@@ -495,7 +544,7 @@ func (w WriteFileTool) Call(_ context.Context, input string, agent *Agent) (stri
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
 	log.Printf("[WriteFileTool] agent=%s Writing file: path=%s, content_size=%d bytes", agentLogName(agent), params.Path, len(params.Content))
-	result := RunWrite(params.Path, params.Content)
+	result := RunWrite(agentWorkspaceDir(agent), params.Path, params.Content)
 	log.Printf("[WriteFileTool] agent=%s File write completed: %s", agentLogName(agent), result)
 	return result, nil
 }
@@ -520,7 +569,7 @@ func (e EditFileTool) Call(_ context.Context, input string, agent *Agent) (strin
 		return "", fmt.Errorf("invalid input: %v", err)
 	}
 	log.Printf("[EditFileTool] agent=%s Editing file: path=%s, old_text_size=%d, new_text_size=%d", agentLogName(agent), params.Path, len(params.OldText), len(params.NewText))
-	result := RunEdit(params.Path, params.OldText, params.NewText)
+	result := RunEdit(agentWorkspaceDir(agent), params.Path, params.OldText, params.NewText)
 	log.Printf("[EditFileTool] agent=%s File edit completed: %s", agentLogName(agent), result)
 	return result, nil
 }
@@ -636,6 +685,98 @@ func TaskGetTool(ctx context.Context, input string, agent *Agent) (string, error
 	}
 	log.Printf("[TaskGetTool] agent=%s Task retrieved successfully", agentLogName(agent))
 	return result, nil
+}
+
+func WorktreeCreateTool(ctx context.Context, input string, agent *Agent) (string, error) {
+	if agent == nil || agent.WorktreeManager == nil {
+		return "", fmt.Errorf("worktree manager not initialized")
+	}
+
+	var params struct {
+		Name   string `json:"name"`
+		TaskID *int   `json:"task_id"`
+	}
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return "", fmt.Errorf("invalid input: %v", err)
+	}
+
+	record, err := agent.WorktreeManager.Create(params.Name, params.TaskID)
+	if err != nil {
+		return "", err
+	}
+	if record == nil {
+		return "", fmt.Errorf("worktree create returned no result")
+	}
+
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func WorktreeListTool(ctx context.Context, input string, agent *Agent) (string, error) {
+	if agent == nil || agent.WorktreeManager == nil {
+		return "", fmt.Errorf("worktree manager not initialized")
+	}
+
+	records, err := agent.WorktreeManager.List()
+	if err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func WorktreeKeepTool(ctx context.Context, input string, agent *Agent) (string, error) {
+	if agent == nil || agent.WorktreeManager == nil {
+		return "", fmt.Errorf("worktree manager not initialized")
+	}
+
+	var params struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return "", fmt.Errorf("invalid input: %v", err)
+	}
+
+	record, err := agent.WorktreeManager.Keep(params.Name)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func WorktreeRemoveTool(ctx context.Context, input string, agent *Agent) (string, error) {
+	if agent == nil || agent.WorktreeManager == nil {
+		return "", fmt.Errorf("worktree manager not initialized")
+	}
+
+	var params struct {
+		Name         string `json:"name"`
+		Force        bool   `json:"force"`
+		CompleteTask bool   `json:"complete_task"`
+	}
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return "", fmt.Errorf("invalid input: %v", err)
+	}
+
+	record, err := agent.WorktreeManager.Remove(params.Name, params.Force, params.CompleteTask)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func idleToolDefinition() ToolDefinition {

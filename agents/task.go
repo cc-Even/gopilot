@@ -23,6 +23,7 @@ type Task struct {
 	BlockedBy   []int  `json:"blockedBy"`
 	Blocks      []int  `json:"blocks"`
 	Owner       string `json:"owner"`
+	Worktree    string `json:"worktree"`
 }
 
 // TaskManager handles CRUD operations and persistence of tasks with dependency graph
@@ -49,6 +50,7 @@ type BackgroundManager struct {
 	mu                sync.RWMutex
 	tasks             map[string]*BackgroundTask
 	notificationQueue []BackgroundNotification
+	dir               string
 }
 
 const (
@@ -61,7 +63,37 @@ const (
 func NewBackgroundManager() *BackgroundManager {
 	return &BackgroundManager{
 		tasks: make(map[string]*BackgroundTask),
+		dir:   WORKDIR,
 	}
+}
+
+func (bm *BackgroundManager) SetDir(dir string) {
+	if bm == nil {
+		return
+	}
+
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	if strings.TrimSpace(dir) == "" {
+		bm.dir = WORKDIR
+		return
+	}
+	bm.dir = dir
+}
+
+func (bm *BackgroundManager) workDir() string {
+	if bm == nil {
+		return WORKDIR
+	}
+
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+
+	if strings.TrimSpace(bm.dir) == "" {
+		return WORKDIR
+	}
+	return bm.dir
 }
 
 func (bm *BackgroundManager) Run(command string) string {
@@ -91,7 +123,7 @@ func (bm *BackgroundManager) execute(taskID, command string) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	cmd.Dir = WORKDIR
+	cmd.Dir = bm.workDir()
 	rawOutput, err := cmd.CombinedOutput()
 
 	switch {
@@ -292,6 +324,7 @@ func (tm *TaskManager) Create(subject, description string) (string, error) {
 		BlockedBy:   []int{},
 		Blocks:      []int{},
 		Owner:       "",
+		Worktree:    "",
 	}
 
 	if err := tm.save(task); err != nil {
@@ -423,6 +456,102 @@ func (tm *TaskManager) ClaimNextAvailable(owner string) (*Task, error) {
 	return nil, nil
 }
 
+func (tm *TaskManager) BindWorktree(taskID int, worktree string) (*Task, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	task, err := tm.load(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	task.Worktree = worktree
+	if task.Status == "pending" {
+		task.Status = "in_progress"
+	}
+
+	if err := tm.save(task); err != nil {
+		return nil, err
+	}
+
+	return task, nil
+}
+
+func (tm *TaskManager) UnbindWorktree(taskID int) (*Task, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	task, err := tm.load(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	task.Worktree = ""
+	if err := tm.save(task); err != nil {
+		return nil, err
+	}
+
+	return task, nil
+}
+
+func (tm *TaskManager) ResetClaim(taskID int) (*Task, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	task, err := tm.load(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	task.Owner = ""
+	if task.Status == "in_progress" {
+		task.Status = "pending"
+	}
+
+	if err := tm.save(task); err != nil {
+		return nil, err
+	}
+
+	return task, nil
+}
+
+func (tm *TaskManager) Snapshot() ([]*Task, error) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	return tm.snapshotLocked()
+}
+
+func (tm *TaskManager) snapshotLocked() ([]*Task, error) {
+	entries, err := os.ReadDir(tm.dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tasks directory: %w", err)
+	}
+
+	tasks := make([]*Task, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasPrefix(name, "task_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+
+		task, err := tm.load(extractTaskID(name))
+		if err != nil {
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].ID < tasks[j].ID
+	})
+	return tasks, nil
+}
+
 // clearDependency removes a completed task ID from all other tasks' blockedBy lists
 func (tm *TaskManager) clearDependency(completedID int) error {
 	entries, err := os.ReadDir(tm.dir)
@@ -484,30 +613,10 @@ func (tm *TaskManager) ListAll() (string, error) {
 		return "No tasks.", nil
 	}
 
-	var tasks []*Task
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-		if !strings.HasPrefix(name, "task_") || !strings.HasSuffix(name, ".json") {
-			continue
-		}
-
-		taskID := extractTaskID(name)
-		task, err := tm.load(taskID)
-		if err != nil {
-			continue
-		}
-
-		tasks = append(tasks, task)
+	tasks, err := tm.snapshotLocked()
+	if err != nil {
+		return "", err
 	}
-
-	// Sort tasks by ID
-	sort.Slice(tasks, func(i, j int) bool {
-		return tasks[i].ID < tasks[j].ID
-	})
 
 	var lines []string
 	for _, task := range tasks {

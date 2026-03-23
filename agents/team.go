@@ -397,31 +397,32 @@ func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 		}
 	}
 
-	toolIdx := 0
-	clonedOrder := make([]string, len(TEAM_AGENTS_TOOLS))
+	clonedOrder := make([]string, 0, len(TEAM_AGENTS_TOOLS))
 	for _, toolName := range base.order {
 		if _, ok := TEAM_AGENTS_TOOLS[toolName]; ok {
-			clonedOrder[toolIdx] = toolName
-			toolIdx++
+			clonedOrder = append(clonedOrder, toolName)
 		}
 	}
 
 	agent := &Agent{
-		Name:         name,
-		Description:  role,
-		SystemPrompt: prompt,
-		BaseUrl:      base.BaseUrl,
-		ApiKey:       base.ApiKey,
-		Model:        base.Model,
-		SubAgents:    base.SubAgents,
-		SkillLoader:  base.SkillLoader,
-		TaskManager:  base.TaskManager,
-		Background:   NewBackgroundManager(),
-		TeamManager:  m,
-		client:       base.client,
-		tools:        clonedTools,
-		order:        clonedOrder,
+		Name:            name,
+		Description:     role,
+		SystemPrompt:    prompt,
+		BaseUrl:         base.BaseUrl,
+		ApiKey:          base.ApiKey,
+		Model:           base.Model,
+		WorkDir:         base.WorkDir,
+		SubAgents:       base.SubAgents,
+		SkillLoader:     base.SkillLoader,
+		TaskManager:     base.TaskManager,
+		WorktreeManager: base.WorktreeManager,
+		Background:      NewBackgroundManager(),
+		TeamManager:     m,
+		client:          base.client,
+		tools:           clonedTools,
+		order:           clonedOrder,
 	}
+	agent.Background.SetDir(agent.WorkDir)
 	if _, exists := agent.tools["idle"]; !exists {
 		agent.tools["idle"] = idleToolDefinition()
 		agent.order = append(agent.order, "idle")
@@ -573,7 +574,23 @@ func (m *TeammateManager) nextIdleEvent(agent *Agent) (string, error) {
 		return "", nil
 	}
 
-	return formatClaimedTask(task), nil
+	var worktree *Worktree
+	if agent.WorktreeManager != nil {
+		worktree, err = agent.WorktreeManager.EnsureForTask(task)
+		if err != nil {
+			_, _ = agent.TaskManager.ResetClaim(task.ID)
+			return "", err
+		}
+		agent.WorkDir = worktree.Path
+		if agent.Background != nil {
+			agent.Background.SetDir(worktree.Path)
+		}
+		if refreshed, loadErr := agent.TaskManager.load(task.ID); loadErr == nil {
+			task = refreshed
+		}
+	}
+
+	return formatClaimedTask(task, worktree), nil
 }
 
 func (m *TeammateManager) setMemberStatus(name, status string) error {
@@ -636,15 +653,26 @@ func formatInboxMessages(messages []TeamMessage) string {
 	return strings.Join(lines, "\n")
 }
 
-func formatClaimedTask(task *Task) string {
+func formatClaimedTask(task *Task, worktree *Worktree) string {
 	if task == nil {
 		return ""
 	}
 
+	payload := map[string]any{
+		"task": task,
+	}
+	if worktree != nil {
+		payload["worktree"] = worktree
+		payload["cwd"] = worktree.Path
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		data = []byte(fmt.Sprintf(`{"task_id": %d}`, task.ID))
+	}
+
 	return strings.Join([]string{
 		"<task_claim>",
-		fmt.Sprintf("Task #%d: %s", task.ID, task.Subject),
-		task.Description,
+		string(data),
 		"</task_claim>",
 	}, "\n")
 }

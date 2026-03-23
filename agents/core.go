@@ -55,17 +55,19 @@ func ToolFromStringArg(name, description, argName string, parameters map[string]
 }
 
 type Agent struct {
-	Name         string
-	Description  string
-	SystemPrompt string
-	BaseUrl      string
-	ApiKey       string
-	Model        string
-	SubAgents    map[string]*Agent
-	SkillLoader  *SkillLoader
-	TaskManager  *TaskManager
-	Background   *BackgroundManager
-	TeamManager  *TeammateManager
+	Name            string
+	Description     string
+	SystemPrompt    string
+	BaseUrl         string
+	ApiKey          string
+	Model           string
+	WorkDir         string
+	SubAgents       map[string]*Agent
+	SkillLoader     *SkillLoader
+	TaskManager     *TaskManager
+	WorktreeManager *WorktreeManager
+	Background      *BackgroundManager
+	TeamManager     *TeammateManager
 
 	client openai.Client
 	tools  map[string]ToolDefinition
@@ -280,24 +282,30 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize task manager: %v\n", err)
 	}
+	worktreeManager, err := NewWorktreeManager(WORKTREE_DIR, taskManager)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize worktree manager: %v\n", err)
+	}
 	backgroundManager := NewBackgroundManager()
 	order = registerRouteToSubagentTool(toolMap, order, subAgents)
 	order = registerCompactTool(toolMap, order)
 
 	agent := &Agent{
-		Name:         name,
-		SystemPrompt: systemPrompt,
-		Description:  agentOpts.Desc,
-		BaseUrl:      baseURL,
-		ApiKey:       apiKey,
-		Model:        model,
-		SubAgents:    subAgents,
-		SkillLoader:  skillLoader,
-		TaskManager:  taskManager,
-		Background:   backgroundManager,
-		client:       openai.NewClient(opts...),
-		tools:        toolMap,
-		order:        order,
+		Name:            name,
+		SystemPrompt:    systemPrompt,
+		Description:     agentOpts.Desc,
+		BaseUrl:         baseURL,
+		ApiKey:          apiKey,
+		Model:           model,
+		WorkDir:         WORKDIR,
+		SubAgents:       subAgents,
+		SkillLoader:     skillLoader,
+		TaskManager:     taskManager,
+		WorktreeManager: worktreeManager,
+		Background:      backgroundManager,
+		client:          openai.NewClient(opts...),
+		tools:           toolMap,
+		order:           order,
 	}
 
 	agent.TeamManager = NewTeammateManager(TEAM_DIR, agent)
