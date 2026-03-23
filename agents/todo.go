@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -18,7 +19,7 @@ func UpdateTodoTool(_ context.Context, input string, agent *Agent) (string, erro
 	if err != nil {
 		return "input format error", err
 	}
-	return UpdateTodo(items), nil
+	return UpdateTodo(items)
 }
 
 func parseTodoItems(input string) ([]TodoItems, error) {
@@ -30,23 +31,30 @@ func parseTodoItems(input string) ([]TodoItems, error) {
 	return items, nil
 }
 
-func UpdateTodo(items []TodoItems) string {
+func UpdateTodo(items []TodoItems) (string, error) {
 	var validated []TodoItems
 	inProgressCount := 0
 
 	for _, item := range items {
 		status := item.Status
-		if status == "in_progress" {
+		if status == "" {
+			status = taskStatusPending
+			item.Status = status
+		}
+		if !isValidTaskStatus(status) {
+			return "", fmt.Errorf("invalid todo status: %s", status)
+		}
+		if status == taskStatusInProgress {
 			inProgressCount += 1
 		}
 		validated = append(validated, item)
 	}
 	if inProgressCount > 1 {
-		panic("Only one task can be in_progress")
+		return "", fmt.Errorf("only one task can be in_progress")
 	}
 
 	if len(validated) == 0 {
-		return "No todos."
+		return "No todos.", nil
 	}
 
 	lines := make([]string, 0, len(validated))
@@ -54,22 +62,22 @@ func UpdateTodo(items []TodoItems) string {
 	for _, item := range validated {
 		var marker string
 		switch item.Status {
-		case "pending":
+		case taskStatusPending:
 			marker = "[ ]"
-		case "in_progress":
+		case taskStatusInProgress:
 			marker = "[>]"
-		case "completed":
+		case taskStatusCompleted:
 			marker = "[x]"
 		default:
 			marker = "[?]"
 		}
 		lines = append(lines, marker+" #"+itoa(item.ID)+": "+item.Text)
-		if item.Status == "completed" {
+		if item.Status == taskStatusCompleted {
 			done++
 		}
 	}
 	lines = append(lines, "\n("+itoa(done)+"/"+itoa(len(validated))+" completed)")
-	return joinLines(lines)
+	return joinLines(lines), nil
 }
 
 func itoa(i int) string {

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/openai/openai-go/v3"
 )
 
 func TestMessageBusSendReadAndBroadcast(t *testing.T) {
@@ -71,15 +73,27 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 	}
 
 	manager := NewTeammateManager(teamDir, base)
+	release := make(chan struct{})
 	runnerCalled := make(chan struct{}, 1)
 	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
 		runnerCalled <- struct{}{}
-		return nil
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return nil
+		}
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "")
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	select {
+	case <-runnerCalled:
+	case <-time.After(time.Second):
+		t.Fatal("runner was not called")
 	}
 
 	manager.mu.Lock()
@@ -88,9 +102,17 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 		manager.mu.Unlock()
 		t.Fatalf("expected spawned teammate to stay working, got %+v", member)
 	}
-	if len(manager.threads) != 0 {
+	if member.Prompt != "inspect core changes" {
 		manager.mu.Unlock()
-		t.Fatalf("spawn should not register running thread, got %d", len(manager.threads))
+		t.Fatalf("expected prompt persisted on member, got %+v", member)
+	}
+	if member.Supervisor != "lead" {
+		manager.mu.Unlock()
+		t.Fatalf("expected supervisor persisted on member, got %+v", member)
+	}
+	if len(manager.threads) != 1 {
+		manager.mu.Unlock()
+		t.Fatalf("spawn should register running thread, got %d", len(manager.threads))
 	}
 	manager.mu.Unlock()
 
@@ -104,9 +126,23 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 	if !strings.Contains(string(raw), `"status": "working"`) {
 		t.Fatalf("config missing working status: %s", string(raw))
 	}
+	if !strings.Contains(string(raw), `"prompt": "inspect core changes"`) {
+		t.Fatalf("config missing saved prompt: %s", string(raw))
+	}
+	if !strings.Contains(string(raw), `"supervisor": "lead"`) {
+		t.Fatalf("config missing saved supervisor: %s", string(raw))
+	}
+
+	close(release)
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		member := manager.findMemberLocked("worker-1")
+		return len(manager.threads) == 0 && member != nil && member.Status == teammateStatusIdle
+	})
 }
 
-func TestTeammateManagerWakeReusesOriginalPrompt(t *testing.T) {
+func TestTeammateManagerWakeStartsInboxDrivenLoop(t *testing.T) {
 	tempDir := t.TempDir()
 	teamDir := filepath.Join(tempDir, ".teams")
 
@@ -120,15 +156,39 @@ func TestTeammateManagerWakeReusesOriginalPrompt(t *testing.T) {
 	manager := NewTeammateManager(teamDir, base)
 
 	prompts := make(chan string, 2)
+	releases := make(chan chan struct{}, 2)
 	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
 		prompts <- prompt
-		return nil
+		release := make(chan struct{})
+		releases <- release
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return nil
+		}
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "")
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
+
+	select {
+	case got := <-prompts:
+		if got != "inspect core changes" {
+			t.Fatalf("spawn should use original prompt, got %s", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("spawn prompt not received")
+	}
+
+	close(<-releases)
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
 
 	wakeResult := manager.Wake("worker-1")
 	if !strings.Contains(wakeResult, `Woke "worker-1"`) {
@@ -137,12 +197,111 @@ func TestTeammateManagerWakeReusesOriginalPrompt(t *testing.T) {
 
 	select {
 	case got := <-prompts:
-		if got != "inspect core changes" {
-			t.Fatalf("wake should reuse original prompt, got %s", got)
+		if !strings.Contains(got, "Read your inbox") {
+			t.Fatalf("wake should provide inbox-driven prompt, got %s", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("wake prompt not received")
 	}
+
+	close(<-releases)
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+}
+
+func TestSendMessageToolRejectsUnknownRecipient(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	base.TeamManager = manager
+
+	_, err := sendMessageTool(context.Background(), json.RawMessage(`{"to":"ghost","content":"hello"}`), base)
+	if err == nil {
+		t.Fatal("expected unknown recipient to be rejected")
+	}
+	if !strings.Contains(err.Error(), `unknown team participant "ghost"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSendMessageToolAllowsSupervisorAndLeadReadsInbox(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 1
+	})
+
+	worker := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+	sendResult, err := sendMessageTool(context.Background(), json.RawMessage(`{"to":"lead","content":"task complete"}`), worker)
+	if err != nil {
+		t.Fatalf("sendMessageTool failed: %v", err)
+	}
+	if !strings.Contains(sendResult, "Sent message to lead") {
+		t.Fatalf("unexpected send result: %s", sendResult)
+	}
+
+	messages := []openai.ChatCompletionMessageParamUnion{openai.UserMessage("continue")}
+	updated := base.appendTeamInboxMessages(messages)
+	if len(updated) != len(messages)+1 {
+		t.Fatalf("expected appended inbox message, got %d messages", len(updated))
+	}
+	role, content, err := messageRoleAndContent(updated[len(updated)-1])
+	if err != nil {
+		t.Fatalf("read appended inbox message failed: %v", err)
+	}
+	if role != "user" || !strings.Contains(content, "<inbox>") || !strings.Contains(content, "task complete") {
+		t.Fatalf("unexpected appended inbox payload: role=%s content=%q", role, content)
+	}
+
+	drained := base.appendTeamInboxMessages(updated)
+	if len(drained) != len(updated) {
+		t.Fatalf("expected inbox to be drained after append, got %d messages", len(drained))
+	}
+
+	manager.mu.Lock()
+	stopRunner := manager.threads["worker-1"]
+	manager.mu.Unlock()
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
 }
 
 func TestTeammateManagerNextIdleEventPrefersInbox(t *testing.T) {
@@ -389,19 +548,32 @@ func TestTeammateManagerWaitUntilIdleReturnsForIdleThreads(t *testing.T) {
 	}
 
 	manager := NewTeammateManager(teamDir, base)
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
 	manager.Spawn("worker-1", "reviewer", "inspect core changes", "")
 
 	manager.mu.Lock()
-	manager.threads["worker-1"] = func() {}
+	stopRunner := manager.threads["worker-1"]
 	member := manager.findMemberLocked("worker-1")
 	member.Status = teammateStatusIdle
 	manager.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
+	ctx, cancelWait := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancelWait()
 	if err := manager.WaitUntilIdle(ctx); err != nil {
 		t.Fatalf("WaitUntilIdle should return for idle teammate, got %v", err)
 	}
+
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
 }
 
 func waitForCondition(t *testing.T, fn func() bool) {

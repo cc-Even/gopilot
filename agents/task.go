@@ -19,7 +19,7 @@ type Task struct {
 	ID          int    `json:"id"`
 	Subject     string `json:"subject"`
 	Description string `json:"description"`
-	Status      string `json:"status"` // "pending", "in_progress", "completed"
+	Status      string `json:"status"`
 	BlockedBy   []int  `json:"blockedBy"`
 	Blocks      []int  `json:"blocks"`
 	Owner       string `json:"owner"`
@@ -58,7 +58,17 @@ const (
 	backgroundResultLimit         = 50000
 	backgroundNotificationLimit   = 500
 	backgroundTimeout             = 300 * time.Second
+
+	taskStatusPending    = "pending"
+	taskStatusInProgress = "in_progress"
+	taskStatusCompleted  = "completed"
 )
+
+var validTaskStatuses = map[string]struct{}{
+	taskStatusPending:    {},
+	taskStatusInProgress: {},
+	taskStatusCompleted:  {},
+}
 
 func NewBackgroundManager() *BackgroundManager {
 	return &BackgroundManager{
@@ -320,7 +330,7 @@ func (tm *TaskManager) Create(subject, description string) (string, error) {
 		ID:          tm.nextID,
 		Subject:     subject,
 		Description: description,
-		Status:      "pending",
+		Status:      taskStatusPending,
 		BlockedBy:   []int{},
 		Blocks:      []int{},
 		Owner:       "",
@@ -363,40 +373,31 @@ func (tm *TaskManager) Update(taskID int, status string, addBlockedBy, addBlocks
 
 	// Update status
 	if status != "" {
-		validStatuses := map[string]bool{
-			"pending":     true,
-			"in_progress": true,
-			"completed":   true,
-		}
-		if !validStatuses[status] {
+		if !isValidTaskStatus(status) {
 			return "", fmt.Errorf("invalid status: %s", status)
 		}
 
 		task.Status = status
 
 		// When a task is completed, remove it from all other tasks' blockedBy
-		if status == "completed" {
-			tm.clearDependency(taskID)
+		if status == taskStatusCompleted {
+			if err := tm.clearDependency(taskID); err != nil {
+				return "", err
+			}
 		}
 	}
 
 	// Add blockedBy dependencies
 	if len(addBlockedBy) > 0 {
-		task.BlockedBy = uniqueIntSlice(append(task.BlockedBy, addBlockedBy...))
+		if err := tm.addBlockedByLocked(task, addBlockedBy); err != nil {
+			return "", err
+		}
 	}
 
 	// Add blocks dependencies (with bidirectional updates)
 	if len(addBlocks) > 0 {
-		task.Blocks = uniqueIntSlice(append(task.Blocks, addBlocks...))
-
-		// Update blocked tasks' blockedBy lists
-		for _, blockedID := range addBlocks {
-			if blockedTask, err := tm.load(blockedID); err == nil {
-				if !containsInt(blockedTask.BlockedBy, taskID) {
-					blockedTask.BlockedBy = append(blockedTask.BlockedBy, taskID)
-					tm.save(blockedTask)
-				}
-			}
+		if err := tm.addBlocksLocked(task, addBlocks); err != nil {
+			return "", err
 		}
 	}
 
@@ -462,7 +463,7 @@ func (tm *TaskManager) Claim(taskID int, owner string) (*Task, error) {
 	if err != nil {
 		return nil, err
 	}
-	if task.Status != "pending" {
+	if task.Status != taskStatusPending {
 		return nil, fmt.Errorf("task %d is not pending", taskID)
 	}
 	if task.Owner != "" {
@@ -481,7 +482,7 @@ func (tm *TaskManager) claimLocked(task *Task, owner string) (*Task, error) {
 	}
 
 	task.Owner = owner
-	task.Status = "in_progress"
+	task.Status = taskStatusInProgress
 	if err := tm.save(task); err != nil {
 		return nil, err
 	}
@@ -492,7 +493,7 @@ func claimableTask(task *Task) bool {
 	if task == nil {
 		return false
 	}
-	return task.Status == "pending" && task.Owner == "" && len(task.BlockedBy) == 0
+	return task.Status == taskStatusPending && task.Owner == "" && len(task.BlockedBy) == 0
 }
 
 func (tm *TaskManager) BindWorktree(taskID int, worktree string) (*Task, error) {
@@ -505,8 +506,8 @@ func (tm *TaskManager) BindWorktree(taskID int, worktree string) (*Task, error) 
 	}
 
 	task.Worktree = worktree
-	if task.Status == "pending" {
-		task.Status = "in_progress"
+	if task.Status == taskStatusPending {
+		task.Status = taskStatusInProgress
 	}
 
 	if err := tm.save(task); err != nil {
@@ -543,8 +544,8 @@ func (tm *TaskManager) ResetClaim(taskID int) (*Task, error) {
 	}
 
 	task.Owner = ""
-	if task.Status == "in_progress" {
-		task.Status = "pending"
+	if task.Status == taskStatusInProgress {
+		task.Status = taskStatusPending
 	}
 
 	if err := tm.save(task); err != nil {
@@ -615,7 +616,9 @@ func (tm *TaskManager) clearDependency(completedID int) error {
 
 		if containsInt(task.BlockedBy, completedID) {
 			task.BlockedBy = removeInt(task.BlockedBy, completedID)
-			tm.save(task)
+			if err := tm.save(task); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -633,6 +636,10 @@ func (tm *TaskManager) Delete(taskID int) error {
 			return fmt.Errorf("task %d not found", taskID)
 		}
 		return fmt.Errorf("failed to delete task: %w", err)
+	}
+
+	if err := tm.removeTaskReferencesLocked(taskID); err != nil {
+		return err
 	}
 
 	return nil
@@ -683,11 +690,11 @@ func extractTaskID(filename string) int {
 
 func statusMarker(status string) string {
 	switch status {
-	case "pending":
+	case taskStatusPending:
 		return "[ ]"
-	case "in_progress":
+	case taskStatusInProgress:
 		return "[>]"
-	case "completed":
+	case taskStatusCompleted:
 		return "[x]"
 	default:
 		return "[?]"
@@ -724,6 +731,97 @@ func uniqueIntSlice(slice []int) []int {
 	}
 	sort.Ints(result)
 	return result
+}
+
+func isValidTaskStatus(status string) bool {
+	_, ok := validTaskStatuses[status]
+	return ok
+}
+
+func (tm *TaskManager) addBlockedByLocked(task *Task, blockerIDs []int) error {
+	relations, err := tm.validateDependencyIDs(task.ID, blockerIDs)
+	if err != nil {
+		return err
+	}
+
+	task.BlockedBy = uniqueIntSlice(append(task.BlockedBy, blockerIDs...))
+	for _, blocker := range relations {
+		if containsInt(blocker.Blocks, task.ID) {
+			continue
+		}
+		blocker.Blocks = uniqueIntSlice(append(blocker.Blocks, task.ID))
+		if err := tm.save(blocker); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (tm *TaskManager) addBlocksLocked(task *Task, blockedIDs []int) error {
+	relations, err := tm.validateDependencyIDs(task.ID, blockedIDs)
+	if err != nil {
+		return err
+	}
+
+	task.Blocks = uniqueIntSlice(append(task.Blocks, blockedIDs...))
+	for _, blocked := range relations {
+		if containsInt(blocked.BlockedBy, task.ID) {
+			continue
+		}
+		blocked.BlockedBy = uniqueIntSlice(append(blocked.BlockedBy, task.ID))
+		if err := tm.save(blocked); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (tm *TaskManager) validateDependencyIDs(taskID int, dependencyIDs []int) ([]*Task, error) {
+	uniqueIDs := uniqueIntSlice(dependencyIDs)
+	relations := make([]*Task, 0, len(uniqueIDs))
+
+	for _, dependencyID := range uniqueIDs {
+		if dependencyID == taskID {
+			return nil, fmt.Errorf("task %d cannot depend on itself", taskID)
+		}
+
+		dependency, err := tm.load(dependencyID)
+		if err != nil {
+			return nil, err
+		}
+		relations = append(relations, dependency)
+	}
+
+	return relations, nil
+}
+
+func (tm *TaskManager) removeTaskReferencesLocked(taskID int) error {
+	tasks, err := tm.snapshotLocked()
+	if err != nil {
+		return err
+	}
+
+	for _, task := range tasks {
+		updated := false
+		if containsInt(task.BlockedBy, taskID) {
+			task.BlockedBy = removeInt(task.BlockedBy, taskID)
+			updated = true
+		}
+		if containsInt(task.Blocks, taskID) {
+			task.Blocks = removeInt(task.Blocks, taskID)
+			updated = true
+		}
+		if !updated {
+			continue
+		}
+		if err := tm.save(task); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func newBackgroundTaskID() string {

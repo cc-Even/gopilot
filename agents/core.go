@@ -335,6 +335,7 @@ func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessage
 			return "", fmt.Errorf("auto compact failed (turn=%d): %w", turn, compactErr)
 		}
 		messages = a.appendBackgroundNotifications(messages)
+		messages = a.appendTeamInboxMessages(messages)
 
 		resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 			Model:    a.Model,
@@ -434,6 +435,18 @@ func (a *Agent) appendBackgroundNotifications(messages []openai.ChatCompletionMe
 	lines = append(lines, "</background_notifications>")
 
 	return append(messages, openai.UserMessage(strings.Join(lines, "\n")))
+}
+
+func (a *Agent) appendTeamInboxMessages(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+	if a == nil || a.TeamManager == nil || a.TeamManager.bus == nil || strings.TrimSpace(a.Name) == "" {
+		return messages
+	}
+
+	inbox := a.TeamManager.bus.ReadInbox(a.Name)
+	if len(inbox) == 0 {
+		return messages
+	}
+	return append(messages, openai.UserMessage(formatInboxMessages(inbox)))
 }
 
 func parseCompactFocus(args json.RawMessage) (string, error) {

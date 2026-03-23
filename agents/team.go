@@ -172,9 +172,11 @@ func (b *MessageBus) Broadcast(sender, content string, teammates []string) strin
 }
 
 type TeamMember struct {
-	Name   string `json:"name"`
-	Role   string `json:"role"`
-	Status string `json:"status"`
+	Name       string `json:"name"`
+	Role       string `json:"role"`
+	Status     string `json:"status"`
+	Prompt     string `json:"prompt,omitempty"`
+	Supervisor string `json:"supervisor,omitempty"`
 }
 
 type TeamConfig struct {
@@ -231,6 +233,11 @@ func (m *TeammateManager) loadConfig() TeamConfig {
 	if cfg.Members == nil {
 		cfg.Members = []TeamMember{}
 	}
+	for i := range cfg.Members {
+		if strings.TrimSpace(cfg.Members[i].Status) == "" {
+			cfg.Members[i].Status = teammateStatusIdle
+		}
+	}
 	return cfg
 }
 
@@ -263,6 +270,10 @@ func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) strin
 	}
 
 	m.mu.Lock()
+	if _, running := m.threads[name]; running {
+		m.mu.Unlock()
+		return fmt.Sprintf("Error: %q is already running", name)
+	}
 	member := m.findMemberLocked(name)
 	if member != nil {
 		if member.Status != teammateStatusIdle && member.Status != teammateStatusShutdown {
@@ -272,20 +283,25 @@ func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) strin
 		}
 		member.Status = teammateStatusWorking
 		member.Role = role
+		member.Prompt = taskPrompt
+		member.Supervisor = supervisor
 	} else {
 		m.config.Members = append(m.config.Members, TeamMember{
-			Name:   name,
-			Role:   role,
-			Status: teammateStatusWorking,
+			Name:       name,
+			Role:       role,
+			Status:     teammateStatusWorking,
+			Prompt:     taskPrompt,
+			Supervisor: supervisor,
 		})
 	}
 	if err := m.saveConfigLocked(); err != nil {
 		m.mu.Unlock()
 		return fmt.Sprintf("Error: save config failed: %v", err)
 	}
+	m.startThreadLocked(name, role, taskPrompt)
 	m.mu.Unlock()
 
-	go m.teammateLoop(context.Background(), name, role, taskPrompt)
+	_ = supervisor
 	return fmt.Sprintf("Spawned %q (role: %s)", name, role)
 }
 
@@ -309,20 +325,24 @@ func (m *TeammateManager) Wake(name string) string {
 	}
 
 	member.Status = teammateStatusWorking
+	taskPrompt := "You have new inbox activity. Read your inbox, follow the latest instructions, and use send_message if you need context or need to report results."
 	if err := m.saveConfigLocked(); err != nil {
 		m.mu.Unlock()
 		return fmt.Sprintf("Error: save config failed: %v", err)
 	}
 
 	role := member.Role
-	taskPrompt := "you have received a new message, use read_inbox"
-	ctx, cancel := context.WithCancel(context.Background())
-	m.threads[name] = cancel
+	m.startThreadLocked(name, role, taskPrompt)
 	m.mu.Unlock()
 
 	log.Printf("[TeammateManager] Waking teammate: name=%s, role=%s, task_prompt_size=%d", name, role, len(taskPrompt))
-	go m.teammateLoop(ctx, name, role, taskPrompt)
 	return fmt.Sprintf("Woke %q", name)
+}
+
+func (m *TeammateManager) startThreadLocked(name, role, taskPrompt string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.threads[name] = cancel
+	go m.teammateLoop(ctx, name, role, taskPrompt)
 }
 
 func (m *TeammateManager) teammateLoop(ctx context.Context, name, role, taskPrompt string) {
@@ -380,11 +400,33 @@ func (m *TeammateManager) WaitUntilIdle(ctx context.Context) error {
 }
 
 func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
-	sysPrompt := fmt.Sprintf("You are %s', role: %s, team: %s, at %s.Use idle when done with current work. You may auto-claim tasks.", name, role, m.config.TeamName, m.dir)
 	base := m.baseAgent
 	if base == nil {
 		return nil
 	}
+	_ = prompt
+
+	m.mu.Lock()
+	teamName := m.config.TeamName
+	supervisor := ""
+	if member := m.findMemberLocked(name); member != nil {
+		supervisor = strings.TrimSpace(member.Supervisor)
+	}
+	m.mu.Unlock()
+
+	sysLines := []string{
+		fmt.Sprintf("You are %s.", name),
+		fmt.Sprintf("Role: %s.", role),
+		fmt.Sprintf("Team: %s.", teamName),
+		"Use idle when done with current work.",
+		"You may auto-claim tasks.",
+		"When you are woken up, inspect inbox messages and act on them.",
+	}
+	if supervisor != "" {
+		sysLines = append(sysLines, fmt.Sprintf("Supervisor: %s.", supervisor))
+		sysLines = append(sysLines, "Use send_message to report results, blockers, and questions back to your supervisor.")
+	}
+	sysPrompt := strings.Join(sysLines, " ")
 
 	clonedTools := make(map[string]ToolDefinition, len(TEAM_AGENTS_TOOLS))
 	for k, v := range base.tools {
@@ -487,9 +529,7 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 	}
 	messages = agent.injectIdentityBlockIfCompacted(messages)
 	messages = agent.appendBackgroundNotifications(messages)
-	if inbox := m.bus.ReadInbox(agent.Name); len(inbox) > 0 {
-		messages = append(messages, openai.UserMessage(formatInboxMessages(inbox)))
-	}
+	messages = agent.appendTeamInboxMessages(messages)
 
 	resp, err := agent.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 		Model:    agent.Model,
@@ -622,6 +662,30 @@ func (m *TeammateManager) setMemberStatus(name, status string) error {
 	}
 	member.Status = status
 	return m.saveConfigLocked()
+}
+
+func (m *TeammateManager) isManagedTeammate(name string) bool {
+	if m == nil || strings.TrimSpace(name) == "" {
+		return false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.findMemberLocked(name) != nil
+}
+
+func (m *TeammateManager) knowsParticipant(name string) bool {
+	if m == nil || strings.TrimSpace(name) == "" {
+		return false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.baseAgent != nil && strings.TrimSpace(m.baseAgent.Name) == name {
+		return true
+	}
+	return m.findMemberLocked(name) != nil
 }
 
 func (m *TeammateManager) ListAll() string {
@@ -798,9 +862,12 @@ func sendMessageTool(ctx context.Context, args json.RawMessage, agent *Agent) (s
 		log.Printf("[SendMessageTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
 		return "", fmt.Errorf("invalid send_message args: %w", err)
 	}
+	if !agent.TeamManager.knowsParticipant(params.To) {
+		return "", fmt.Errorf("unknown team participant %q", params.To)
+	}
 	log.Printf("[SendMessageTool] agent=%s Sending message: from=%s, to=%s, content_size=%d", agentLogName(agent), agent.Name, params.To, len(params.Content))
 	result := agent.TeamManager.bus.Send(agent.Name, params.To, params.Content, "message", nil)
-	if !strings.HasPrefix(result, "Error:") {
+	if !strings.HasPrefix(result, "Error:") && agent.TeamManager.isManagedTeammate(params.To) {
 		wakeResult := agent.TeamManager.Wake(params.To)
 		log.Printf("[SendMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), params.To, wakeResult)
 	}

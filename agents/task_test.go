@@ -247,6 +247,62 @@ func TestTaskManagerClaimNextAvailable(t *testing.T) {
 	}
 }
 
+func TestTaskManagerUpdateBlockedByKeepsReverseLinks(t *testing.T) {
+	tempDir := t.TempDir()
+	tm, err := NewTaskManager(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to create TaskManager: %v", err)
+	}
+
+	if _, err := tm.Create("dependency", "finish this first"); err != nil {
+		t.Fatalf("create task 0 failed: %v", err)
+	}
+	if _, err := tm.Create("blocked", "waits on task 0"); err != nil {
+		t.Fatalf("create task 1 failed: %v", err)
+	}
+
+	if _, err := tm.Update(1, "", []int{0}, nil); err != nil {
+		t.Fatalf("update blockedBy failed: %v", err)
+	}
+
+	task0 := mustTaskFromJSON(t, tm, 0)
+	if len(task0.Blocks) != 1 || task0.Blocks[0] != 1 {
+		t.Fatalf("expected reverse blocks link on task 0, got %+v", task0)
+	}
+
+	task1 := mustTaskFromJSON(t, tm, 1)
+	if len(task1.BlockedBy) != 1 || task1.BlockedBy[0] != 0 {
+		t.Fatalf("expected blockedBy link on task 1, got %+v", task1)
+	}
+}
+
+func TestTaskManagerDeleteRemovesDependencyReferences(t *testing.T) {
+	tempDir := t.TempDir()
+	tm, err := NewTaskManager(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to create TaskManager: %v", err)
+	}
+
+	if _, err := tm.Create("dependency", "finish this first"); err != nil {
+		t.Fatalf("create task 0 failed: %v", err)
+	}
+	if _, err := tm.Create("blocked", "waits on task 0"); err != nil {
+		t.Fatalf("create task 1 failed: %v", err)
+	}
+	if _, err := tm.Update(0, "", nil, []int{1}); err != nil {
+		t.Fatalf("add dependency failed: %v", err)
+	}
+
+	if err := tm.Delete(0); err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+
+	task1 := mustTaskFromJSON(t, tm, 1)
+	if len(task1.BlockedBy) != 0 {
+		t.Fatalf("expected blockedBy references cleared, got %+v", task1)
+	}
+}
+
 func TestTaskManagerHelpers(t *testing.T) {
 	t.Run("extractTaskID", func(t *testing.T) {
 		id := extractTaskID("task_123.json")
@@ -311,6 +367,22 @@ func TestTaskManagerHelpers(t *testing.T) {
 			}
 		}
 	})
+}
+
+func mustTaskFromJSON(t *testing.T, tm *TaskManager, taskID int) *Task {
+	t.Helper()
+
+	raw, err := tm.Get(taskID)
+	if err != nil {
+		t.Fatalf("get task %d failed: %v", taskID, err)
+	}
+
+	var task Task
+	if err := json.Unmarshal([]byte(raw), &task); err != nil {
+		t.Fatalf("parse task %d failed: %v", taskID, err)
+	}
+
+	return &task
 }
 
 func TestBackgroundManager(t *testing.T) {
