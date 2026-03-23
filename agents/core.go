@@ -195,7 +195,10 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 			if !ok {
 				return "", fmt.Errorf("unknown sub-agent: %s", params.SubAgentName)
 			}
-			result, err := subAgent.Run(ctx, params.Input)
+			result, err := subAgent.Run(ctx, []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage(subAgent.SystemPrompt),
+				openai.UserMessage(params.Input),
+			})
 			return result, err
 		},
 	}
@@ -320,13 +323,9 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 	return agent
 }
 
-func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
-	messages := []openai.ChatCompletionMessageParamUnion{
-		openai.SystemMessage(a.SystemPrompt),
-		openai.UserMessage(userInput),
-	}
+func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
 
-	const maxTurns = 20
+	const maxTurns = 40
 	roundsSinceTodo := 0
 	for turn := 0; turn < maxTurns; turn++ {
 		messages = compactToolMessages(messages)
