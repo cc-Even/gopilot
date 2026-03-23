@@ -3,6 +3,7 @@ package agents
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,10 +32,12 @@ var validMessageTypes = map[string]struct{}{
 }
 
 type TeamMessage struct {
-	Type      string  `json:"type"`
-	From      string  `json:"from"`
-	Content   string  `json:"content"`
-	Timestamp float64 `json:"timestamp"`
+	ID        string         `json:"id,omitempty"`
+	Type      string         `json:"type"`
+	From      string         `json:"from"`
+	Content   string         `json:"content"`
+	Timestamp float64        `json:"timestamp"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
 }
 
 type MessageBus struct {
@@ -110,14 +113,15 @@ func (b *MessageBus) Send(sender, to, content, msgType string, extra map[string]
 	if _, ok := validMessageTypes[msgType]; !ok {
 		return fmt.Sprintf("Error: Invalid type %q. Valid: %s", msgType, strings.Join(validMessageTypeList(), ", "))
 	}
-	_ = extra
-
 	now := time.Now()
+	metadata := cloneTeamMetadata(extra)
 	msg := TeamMessage{
+		ID:        newTeamMessageID(),
 		Type:      msgType,
 		From:      sender,
 		Content:   content,
 		Timestamp: float64(now.UnixNano()) / float64(time.Second),
+		Metadata:  metadata,
 	}
 
 	b.mu.Lock()
@@ -164,9 +168,14 @@ func (b *MessageBus) appendTalkLog(ts time.Time, sender, receiver, content strin
 	return err
 }
 
-func (b *MessageBus) ReadInbox(name string) []TeamMessage {
+type inboxRecord struct {
+	Key     string
+	Message TeamMessage
+}
+
+func (b *MessageBus) PeekInbox(name string) ([]TeamMessage, []string, error) {
 	if b == nil {
-		return nil
+		return nil, nil, nil
 	}
 
 	b.mu.Lock()
@@ -176,12 +185,12 @@ func (b *MessageBus) ReadInbox(name string) []TeamMessage {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		log.Printf("[MessageBus] failed to read inbox %q: %v", name, err)
-		return nil
+		return nil, nil, err
 	}
 	defer file.Close()
 	if err := lockFile(file); err != nil {
 		log.Printf("[MessageBus] failed to lock inbox %q: %v", name, err)
-		return nil
+		return nil, nil, err
 	}
 	defer func() {
 		if err := unlockFile(file); err != nil {
@@ -189,20 +198,101 @@ func (b *MessageBus) ReadInbox(name string) []TeamMessage {
 		}
 	}()
 
+	records, err := b.readInboxRecordsLocked(file, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil, nil
+	}
+
+	messages := make([]TeamMessage, 0, len(records))
+	keys := make([]string, 0, len(records))
+	for _, record := range records {
+		messages = append(messages, record.Message)
+		keys = append(keys, record.Key)
+	}
+	return messages, keys, nil
+}
+
+func (b *MessageBus) AckInbox(name string, keys []string) error {
+	if b == nil || len(keys) == 0 {
+		return nil
+	}
+
+	keySet := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		keySet[key] = struct{}{}
+	}
+	if len(keySet) == 0 {
+		return nil
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	path := b.inboxPath(name)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := lockFile(file); err != nil {
+		return err
+	}
+	defer func() {
+		if err := unlockFile(file); err != nil {
+			log.Printf("[MessageBus] failed to unlock inbox %q: %v", name, err)
+		}
+	}()
+
+	records, err := b.readInboxRecordsLocked(file, name)
+	if err != nil {
+		return err
+	}
+	kept := make([]TeamMessage, 0, len(records))
+	for _, record := range records {
+		if _, ok := keySet[record.Key]; ok {
+			continue
+		}
+		kept = append(kept, record.Message)
+	}
+	return b.rewriteInboxLocked(file, kept)
+}
+
+func (b *MessageBus) ReadInbox(name string) []TeamMessage {
+	messages, keys, err := b.PeekInbox(name)
+	if err != nil {
+		return nil
+	}
+	if len(keys) == 0 {
+		return messages
+	}
+	if err := b.AckInbox(name, keys); err != nil {
+		log.Printf("[MessageBus] failed to ack inbox %q: %v", name, err)
+		return nil
+	}
+	return messages
+}
+
+func (b *MessageBus) readInboxRecordsLocked(file *os.File, name string) ([]inboxRecord, error) {
 	if _, err := file.Seek(0, 0); err != nil {
 		log.Printf("[MessageBus] failed to rewind inbox %q before read: %v", name, err)
-		return nil
+		return nil, err
 	}
 	raw, err := io.ReadAll(file)
 	if err != nil {
 		log.Printf("[MessageBus] failed to read inbox %q: %v", name, err)
-		return nil
+		return nil, err
 	}
 	if len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	messages := make([]TeamMessage, 0)
+	records := make([]inboxRecord, 0)
 	scanner := bufio.NewScanner(strings.NewReader(string(raw)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -214,24 +304,40 @@ func (b *MessageBus) ReadInbox(name string) []TeamMessage {
 			log.Printf("[MessageBus] failed to decode inbox message for %q: %v", name, err)
 			continue
 		}
-		messages = append(messages, msg)
+		key := msg.ID
+		if key == "" {
+			sum := sha1.Sum([]byte(line))
+			key = fmt.Sprintf("%x", sum[:])
+		}
+		records = append(records, inboxRecord{
+			Key:     key,
+			Message: msg,
+		})
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("[MessageBus] failed to scan inbox %q: %v", name, err)
-		return nil
+		return nil, err
 	}
+	return records, nil
+}
+
+func (b *MessageBus) rewriteInboxLocked(file *os.File, messages []TeamMessage) error {
 	if err := file.Truncate(0); err != nil {
-		log.Printf("[MessageBus] failed to truncate inbox %q: %v", name, err)
-		return nil
+		return err
 	}
 	if _, err := file.Seek(0, 0); err != nil {
-		log.Printf("[MessageBus] failed to rewind inbox %q: %v", name, err)
-		return nil
+		return err
 	}
-	if len(messages) == 0 {
-		return nil
+	for _, msg := range messages {
+		encoded, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(append(encoded, '\n')); err != nil {
+			return err
+		}
 	}
-	return messages
+	return nil
 }
 
 func (b *MessageBus) Broadcast(sender, content string, teammates []string) string {
@@ -257,6 +363,7 @@ type TeamMember struct {
 	Status     string `json:"status"`
 	Prompt     string `json:"prompt,omitempty"`
 	Supervisor string `json:"supervisor,omitempty"`
+	RunID      string `json:"run_id,omitempty"`
 }
 
 type TeamConfig struct {
@@ -264,7 +371,33 @@ type TeamConfig struct {
 	Members  []TeamMember `json:"members"`
 }
 
+const (
+	teammateRunStatusRunning   = "running"
+	teammateRunStatusCompleted = "completed"
+	teammateRunStatusFailed    = "failed"
+)
+
+type TeammateRun struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Role        string  `json:"role"`
+	Supervisor  string  `json:"supervisor,omitempty"`
+	Prompt      string  `json:"prompt"`
+	Status      string  `json:"status"`
+	Result      string  `json:"result,omitempty"`
+	Error       string  `json:"error,omitempty"`
+	StartedAt   float64 `json:"started_at"`
+	CompletedAt float64 `json:"completed_at,omitempty"`
+}
+
 type teammateRunner func(context.Context, *Agent, string) error
+
+type idleEvent struct {
+	Message    string
+	ShouldStop bool
+	commit     func() error
+	rollback   func() error
+}
 
 type TeammateManager struct {
 	dir        string
@@ -279,6 +412,8 @@ type TeammateManager struct {
 	mu      sync.Mutex
 	config  TeamConfig
 	threads map[string]context.CancelFunc
+	runs    map[string]*TeammateRun
+	signals map[string]chan struct{}
 }
 
 func NewTeammateManager(teamDir string, baseAgent *Agent) *TeammateManager {
@@ -289,6 +424,8 @@ func NewTeammateManager(teamDir string, baseAgent *Agent) *TeammateManager {
 		baseAgent:        baseAgent,
 		bus:              NewMessageBus(filepath.Join(filepath.Dir(teamDir), "talk.txt")),
 		threads:          make(map[string]context.CancelFunc),
+		runs:             make(map[string]*TeammateRun),
+		signals:          make(map[string]chan struct{}),
 		idlePollInterval: teammateIdlePollInterval,
 		idleTimeout:      teammateIdleTimeout,
 	}
@@ -373,8 +510,15 @@ func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) strin
 			Prompt:     taskPrompt,
 			Supervisor: supervisor,
 		})
+		member = &m.config.Members[len(m.config.Members)-1]
 	}
+	run := m.startRunLocked(member, role, taskPrompt, supervisor)
 	if err := m.saveConfigLocked(); err != nil {
+		delete(m.runs, run.ID)
+		delete(m.signals, run.ID)
+		if member != nil {
+			member.RunID = ""
+		}
 		m.mu.Unlock()
 		return fmt.Sprintf("Error: save config failed: %v", err)
 	}
@@ -382,7 +526,7 @@ func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) strin
 	m.mu.Unlock()
 
 	_ = supervisor
-	return fmt.Sprintf("Spawned %q (role: %s)", name, role)
+	return fmt.Sprintf("Spawned %q (role: %s, run_id: %s)", name, role, run.ID)
 }
 
 func (m *TeammateManager) Wake(name string) string {
@@ -442,9 +586,18 @@ func (m *TeammateManager) teammateLoop(ctx context.Context, name, role, taskProm
 	member := m.findMemberLocked(name)
 	if member != nil && member.Status != teammateStatusShutdown {
 		member.Status = teammateStatusIdle
-		if runErr != nil {
-			member.Status = teammateStatusIdle
+		runID := member.RunID
+		if runID != "" {
+			run := m.runs[runID]
+			if run != nil && run.Status == teammateRunStatusRunning {
+				errMsg := "teammate stopped without explicit completion report"
+				if runErr != nil {
+					errMsg = runErr.Error()
+				}
+				m.completeRunLocked(runID, teammateRunStatusFailed, "", errMsg)
+			}
 		}
+		member.RunID = ""
 	}
 	_ = m.saveConfigLocked()
 }
@@ -479,6 +632,141 @@ func (m *TeammateManager) WaitUntilIdle(ctx context.Context) error {
 	}
 }
 
+func (m *TeammateManager) WaitForRun(ctx context.Context, runID string, timeout time.Duration) (*TeammateRun, error) {
+	if m == nil {
+		return nil, fmt.Errorf("teammate manager not initialized")
+	}
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, fmt.Errorf("run_id is required")
+	}
+
+	m.mu.Lock()
+	run, ok := m.runs[runID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("unknown run_id %q", runID)
+	}
+	if run.Status != teammateRunStatusRunning {
+		snapshot := cloneTeammateRun(run)
+		m.mu.Unlock()
+		return snapshot, nil
+	}
+	signal := m.signals[runID]
+	m.mu.Unlock()
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		timer = time.After(timeout)
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer:
+		return nil, fmt.Errorf("wait for run %q timed out after %s", runID, timeout)
+	case <-signal:
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		run = m.runs[runID]
+		if run == nil {
+			return nil, fmt.Errorf("run %q disappeared", runID)
+		}
+		return cloneTeammateRun(run), nil
+	}
+}
+
+func (m *TeammateManager) startRunLocked(member *TeamMember, role, prompt, supervisor string) *TeammateRun {
+	runID := newTeammateRunID()
+	now := float64(time.Now().UnixNano()) / float64(time.Second)
+	run := &TeammateRun{
+		ID:         runID,
+		Name:       member.Name,
+		Role:       role,
+		Supervisor: supervisor,
+		Prompt:     prompt,
+		Status:     teammateRunStatusRunning,
+		StartedAt:  now,
+	}
+	member.RunID = runID
+	m.runs[runID] = run
+	m.signals[runID] = make(chan struct{})
+	return run
+}
+
+func (m *TeammateManager) activeRunIDLocked(name string) string {
+	member := m.findMemberLocked(name)
+	if member == nil {
+		return ""
+	}
+	return strings.TrimSpace(member.RunID)
+}
+
+func (m *TeammateManager) resolveRunIDForSender(sender, explicitRunID string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("teammate manager not initialized")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	runID := strings.TrimSpace(explicitRunID)
+	if runID == "" {
+		runID = m.activeRunIDLocked(sender)
+	}
+	if runID == "" {
+		return "", nil
+	}
+	run := m.runs[runID]
+	if run == nil {
+		return "", fmt.Errorf("unknown run_id %q", runID)
+	}
+	if run.Name != sender {
+		return "", fmt.Errorf("run %q does not belong to %q", runID, sender)
+	}
+	return runID, nil
+}
+
+func (m *TeammateManager) ReportRun(runID, status, result string) error {
+	if m == nil {
+		return fmt.Errorf("teammate manager not initialized")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !validTeammateRunTerminalStatus(status) {
+		return fmt.Errorf("invalid run status %q", status)
+	}
+	if !m.completeRunLocked(runID, status, result, "") {
+		return fmt.Errorf("unknown run_id %q", runID)
+	}
+	return nil
+}
+
+func (m *TeammateManager) completeRunLocked(runID, status, result, errMsg string) bool {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return false
+	}
+	run := m.runs[runID]
+	if run == nil {
+		return false
+	}
+	if run.Status != teammateRunStatusRunning {
+		return true
+	}
+	run.Status = status
+	run.Result = result
+	run.Error = errMsg
+	run.CompletedAt = float64(time.Now().UnixNano()) / float64(time.Second)
+	if signal := m.signals[runID]; signal != nil {
+		close(signal)
+		delete(m.signals, runID)
+	}
+	return true
+}
+
 func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 	base := m.baseAgent
 	if base == nil {
@@ -498,13 +786,17 @@ func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 		fmt.Sprintf("You are %s.", name),
 		fmt.Sprintf("Role: %s.", role),
 		fmt.Sprintf("Team: %s.", teamName),
-		"Use idle when done with current work.",
+		"When you finish a work item, do not silently stop. Use complete_task_and_report when you finish a claimed task, then use idle.",
+		"Use idle only after you have finished the current work item or are blocked waiting for new instructions.",
 		"You may auto-claim tasks.",
 		"When you are woken up, inspect inbox messages and act on them.",
 	}
 	if supervisor != "" {
 		sysLines = append(sysLines, fmt.Sprintf("Supervisor: %s.", supervisor))
-		sysLines = append(sysLines, "Use send_message to report results, blockers, and questions back to your supervisor.")
+		sysLines = append(sysLines, "Use send_message to report intermediate results, blockers, and questions back to your supervisor.")
+		sysLines = append(sysLines, "When your assigned task is done, prefer complete_task_and_report instead of manually chaining send_message, task_update, and worktree_remove.")
+		sysLines = append(sysLines, "complete_task_and_report removes the worktree by default. Set keep_worktree=true only when the workspace must remain available after completion.")
+		sysLines = append(sysLines, "Do not treat a plain assistant final answer as sufficient task or run completion reporting.")
 	}
 	sysPrompt := strings.Join(sysLines, " ")
 
@@ -559,10 +851,20 @@ func (m *TeammateManager) defaultRunner(ctx context.Context, agent *Agent, promp
 	}
 
 	const maxTurns = 50
+	var pendingIdleEvent *idleEvent
 	for turn := 0; turn < maxTurns; {
 		nextMessages, enterIdle, err := m.runWorkPhase(ctx, agent, messages, turn)
 		if err != nil {
+			if pendingIdleEvent != nil {
+				_ = pendingIdleEvent.Rollback()
+			}
 			return err
+		}
+		if pendingIdleEvent != nil {
+			if err := pendingIdleEvent.Commit(); err != nil {
+				return err
+			}
+			pendingIdleEvent = nil
 		}
 		messages = nextMessages
 		turn++
@@ -574,18 +876,22 @@ func (m *TeammateManager) defaultRunner(ctx context.Context, agent *Agent, promp
 			log.Printf("[TeammateManager] Failed to mark teammate idle: name=%s err=%v", agent.Name, err)
 		}
 
-		idleMessage, shouldShutdown, err := m.waitForIdleEvent(ctx, agent)
+		idleEvent, err := m.waitForIdleEvent(ctx, agent)
 		if err != nil {
 			return err
 		}
-		if shouldShutdown {
+		if idleEvent == nil {
+			return fmt.Errorf("idle event missing")
+		}
+		if idleEvent.ShouldStop {
 			if err := m.setMemberStatus(agent.Name, teammateStatusShutdown); err != nil {
 				log.Printf("[TeammateManager] Failed to mark teammate shutdown: name=%s err=%v", agent.Name, err)
 			}
 			return nil
 		}
 
-		messages = append(messages, openai.UserMessage(idleMessage))
+		messages = append(messages, openai.UserMessage(idleEvent.Message))
+		pendingIdleEvent = idleEvent
 		if err := m.setMemberStatus(agent.Name, teammateStatusWorking); err != nil {
 			log.Printf("[TeammateManager] Failed to mark teammate working: name=%s err=%v", agent.Name, err)
 		}
@@ -608,8 +914,13 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 		return nil, false, fmt.Errorf("auto compact failed (turn=%d): %w", turn, err)
 	}
 	messages = agent.injectIdentityBlockIfCompacted(messages)
-	messages = agent.appendBackgroundNotifications(messages)
-	messages = agent.appendTeamInboxMessages(messages)
+	turnAcks := &turnEventAcks{}
+	messages = agent.stageBackgroundNotifications(messages, turnAcks)
+	messages, err = agent.stageTeamInboxMessages(messages, turnAcks)
+	if err != nil {
+		_ = turnAcks.Rollback()
+		return nil, false, fmt.Errorf("stage turn events failed (turn=%d): %w", turn, err)
+	}
 
 	resp, err := agent.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 		Model:    agent.Model,
@@ -617,7 +928,11 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 		Tools:    agent.openAITools(),
 	})
 	if err != nil {
+		_ = turnAcks.Rollback()
 		return nil, false, fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
+	}
+	if err := turnAcks.Commit(); err != nil {
+		return nil, false, fmt.Errorf("ack turn events failed (turn=%d): %w", turn, err)
 	}
 	if len(resp.Choices) == 0 {
 		return nil, false, fmt.Errorf("empty choices from model")
@@ -647,50 +962,85 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 	}
 }
 
-func (m *TeammateManager) waitForIdleEvent(ctx context.Context, agent *Agent) (string, bool, error) {
+func (m *TeammateManager) waitForIdleEvent(ctx context.Context, agent *Agent) (*idleEvent, error) {
 	deadline := time.Now().Add(m.idleTimeout)
 	for {
-		message, err := m.nextIdleEvent(agent)
+		event, err := m.nextIdleEventControlled(agent)
 		if err != nil {
-			return "", false, err
+			return nil, err
 		}
-		if message != "" {
-			return message, false, nil
+		if event != nil {
+			return event, nil
 		}
 		if time.Now().After(deadline) {
-			return "", true, nil
+			return &idleEvent{ShouldStop: true}, nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return "", false, ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(m.idlePollInterval):
 		}
 	}
 }
 
 func (m *TeammateManager) nextIdleEvent(agent *Agent) (string, error) {
+	event, err := m.nextIdleEventControlled(agent)
+	if err != nil {
+		return "", err
+	}
+	if event == nil {
+		return "", nil
+	}
+	if err := event.Commit(); err != nil {
+		return "", err
+	}
+	return event.Message, nil
+}
+
+func (m *TeammateManager) nextIdleEventControlled(agent *Agent) (*idleEvent, error) {
 	if agent == nil {
-		return "", fmt.Errorf("agent not initialized")
+		return nil, fmt.Errorf("agent not initialized")
 	}
 
-	if inbox := m.bus.ReadInbox(agent.Name); len(inbox) > 0 {
-		return formatInboxMessages(inbox), nil
+	if inbox, keys, err := m.bus.PeekInbox(agent.Name); err != nil {
+		return nil, err
+	} else if len(inbox) > 0 {
+		return &idleEvent{
+			Message: formatInboxMessages(inbox),
+			commit: func() error {
+				return m.bus.AckInbox(agent.Name, keys)
+			},
+		}, nil
 	}
 
 	if agent.TaskManager == nil {
-		return "", nil
+		return nil, nil
 	}
 
-	return m.claimNextTask(agent, nil)
+	return m.claimNextTaskEvent(agent, nil)
 }
 
 func (m *TeammateManager) claimNextTask(agent *Agent, taskID *int) (string, error) {
+	event, err := m.claimNextTaskEvent(agent, taskID)
+	if err != nil {
+		return "", err
+	}
+	if event == nil {
+		return "", nil
+	}
+	if err := event.Commit(); err != nil {
+		return "", err
+	}
+	return event.Message, nil
+}
+
+func (m *TeammateManager) claimNextTaskEvent(agent *Agent, taskID *int) (*idleEvent, error) {
 	if agent == nil {
-		return "", fmt.Errorf("agent not initialized")
+		return nil, fmt.Errorf("agent not initialized")
 	}
 	if agent.TaskManager == nil {
-		return "", nil
+		return nil, nil
 	}
 
 	var (
@@ -703,10 +1053,10 @@ func (m *TeammateManager) claimNextTask(agent *Agent, taskID *int) (string, erro
 		task, err = agent.TaskManager.ClaimNextAvailable(agent.Name)
 	}
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if task == nil {
-		return "", nil
+		return nil, nil
 	}
 
 	var worktree *Worktree
@@ -714,7 +1064,7 @@ func (m *TeammateManager) claimNextTask(agent *Agent, taskID *int) (string, erro
 		worktree, err = agent.WorktreeManager.EnsureForTask(task)
 		if err != nil {
 			_, _ = agent.TaskManager.ResetClaim(task.ID)
-			return "", err
+			return nil, err
 		}
 		agent.WorkDir = worktree.Path
 		if agent.Background != nil {
@@ -725,7 +1075,13 @@ func (m *TeammateManager) claimNextTask(agent *Agent, taskID *int) (string, erro
 		}
 	}
 
-	return formatClaimedTask(task, worktree), nil
+	return &idleEvent{
+		Message: formatClaimedTask(task, worktree),
+		rollback: func() error {
+			_, err := agent.TaskManager.ResetClaim(task.ID)
+			return err
+		},
+	}, nil
 }
 
 func (m *TeammateManager) setMemberStatus(name, status string) error {
@@ -768,6 +1124,21 @@ func (m *TeammateManager) knowsParticipant(name string) bool {
 	return m.findMemberLocked(name) != nil
 }
 
+func (m *TeammateManager) supervisorFor(name string) string {
+	if m == nil || strings.TrimSpace(name) == "" {
+		return ""
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	member := m.findMemberLocked(name)
+	if member == nil {
+		return ""
+	}
+	return strings.TrimSpace(member.Supervisor)
+}
+
 func (m *TeammateManager) ListAll() string {
 	if m == nil {
 		return "No teammates."
@@ -782,7 +1153,11 @@ func (m *TeammateManager) ListAll() string {
 
 	lines := []string{fmt.Sprintf("Team: %s", m.config.TeamName)}
 	for _, member := range m.config.Members {
-		lines = append(lines, fmt.Sprintf("  %s (%s): %s", member.Name, member.Role, member.Status))
+		runInfo := ""
+		if strings.TrimSpace(member.RunID) != "" {
+			runInfo = fmt.Sprintf(", run_id=%s", member.RunID)
+		}
+		lines = append(lines, fmt.Sprintf("  %s (%s): %s%s", member.Name, member.Role, member.Status, runInfo))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -806,10 +1181,134 @@ func formatInboxMessages(messages []TeamMessage) string {
 	lines := []string{"<inbox>"}
 	for _, msg := range messages {
 		lines = append(lines, fmt.Sprintf("[%s] from=%s at=%s", msg.Type, msg.From, time.Unix(int64(msg.Timestamp), 0).Format(time.RFC3339)))
+		if metadata := formatTeamMessageMetadata(msg.Metadata); metadata != "" {
+			lines = append(lines, metadata)
+		}
 		lines = append(lines, msg.Content)
 	}
 	lines = append(lines, "</inbox>")
 	return strings.Join(lines, "\n")
+}
+
+func newTeamMessageID() string {
+	return fmt.Sprintf("msg_%d", time.Now().UnixNano())
+}
+
+func newTeammateRunID() string {
+	return fmt.Sprintf("run_%d", time.Now().UnixNano())
+}
+
+func cloneTeamMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for k, v := range metadata {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func cloneTeammateRun(run *TeammateRun) *TeammateRun {
+	if run == nil {
+		return nil
+	}
+	cloned := *run
+	return &cloned
+}
+
+func validTeammateRunTerminalStatus(status string) bool {
+	switch status {
+	case teammateRunStatusCompleted, teammateRunStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func formatTeamMessageMetadata(metadata map[string]any) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, 2)
+	if runID, _ := metadata["run_id"].(string); strings.TrimSpace(runID) != "" {
+		parts = append(parts, "run_id="+runID)
+	}
+	if status, _ := metadata["status"].(string); strings.TrimSpace(status) != "" {
+		parts = append(parts, "status="+status)
+	}
+	if taskID, ok := metadata["task_id"]; ok {
+		parts = append(parts, fmt.Sprintf("task_id=%v", taskID))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "metadata: " + strings.Join(parts, " ")
+}
+
+func resolveTaskForCompletion(agent *Agent, taskID *int) (*Task, error) {
+	if agent == nil || agent.TaskManager == nil {
+		return nil, fmt.Errorf("task manager not initialized")
+	}
+
+	if taskID != nil {
+		task, err := agent.TaskManager.load(*taskID)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(agent.Name) != "" && task.Owner != "" && task.Owner != agent.Name {
+			return nil, fmt.Errorf("task %d is owned by %s, not %s", task.ID, task.Owner, agent.Name)
+		}
+		return task, nil
+	}
+
+	tasks, err := agent.TaskManager.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+
+	candidates := make([]*Task, 0)
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		if task.Owner != agent.Name || task.Status != taskStatusInProgress {
+			continue
+		}
+		candidates = append(candidates, task)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no in_progress task owned by %s", agent.Name)
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+
+	for _, task := range candidates {
+		if taskMatchesAgentWorkdir(agent, task) {
+			return task, nil
+		}
+	}
+	return nil, fmt.Errorf("multiple in_progress tasks owned by %s; provide task_id", agent.Name)
+}
+
+func taskMatchesAgentWorkdir(agent *Agent, task *Task) bool {
+	if agent == nil || task == nil {
+		return false
+	}
+	wd := filepath.Clean(strings.TrimSpace(agent.WorkDir))
+	if wd == "." || wd == "" || strings.TrimSpace(task.Worktree) == "" {
+		return false
+	}
+	if filepath.Base(wd) == task.Worktree {
+		return true
+	}
+	if agent.WorktreeManager == nil {
+		return false
+	}
+	expected := filepath.Clean(filepath.Join(agent.WorktreeManager.rootDir, task.Worktree))
+	return expected == wd
 }
 
 func formatClaimedTask(task *Task, worktree *Worktree) string {
@@ -852,13 +1351,22 @@ func registerTeamTools(toolMap map[string]ToolDefinition, order []string) []stri
 	teamTools := []ToolDefinition{
 		{
 			Name:        "spawn_teammate",
-			Description: "Spawn or restart a persistent teammate agent. The teammate continues in the background.",
+			Description: "Spawn or restart a persistent teammate agent. Returns a run_id in the tool result. If you need that teammate's output before continuing, call wait_teammate with the returned run_id.",
 			Parameters: ObjectSchema(map[string]any{
 				"name":        StringParam(),
 				"role":        StringParam(),
 				"task_prompt": StringParam(),
 			}, "name", "role", "task_prompt"),
 			Handler: spawnTeammateTool,
+		},
+		{
+			Name:        "wait_teammate",
+			Description: "Block until the specified teammate run_id reports completed or failed. Use this after spawn_teammate when your next step depends on that run's result.",
+			Parameters: ObjectSchema(map[string]any{
+				"run_id":          StringParam(),
+				"timeout_seconds": IntegerParam(),
+			}, "run_id"),
+			Handler: waitTeammateTool,
 		},
 		{
 			Name:        "claim_task",
@@ -869,17 +1377,32 @@ func registerTeamTools(toolMap map[string]ToolDefinition, order []string) []stri
 			Handler: claimTaskTool,
 		},
 		{
+			Name:        "complete_task_and_report",
+			Description: "Atomically finish a claimed task: send the final report, mark the task completed, and by default remove its worktree. Set keep_worktree=true only when the workspace should remain available after completion.",
+			Parameters: ObjectSchema(map[string]any{
+				"content":          StringParam(),
+				"to":               StringParam(),
+				"task_id":          IntegerParam(),
+				"keep_worktree":    BoolParam(),
+				"cleanup_worktree": BoolParam(),
+				"force":            BoolParam(),
+			}, "content"),
+			Handler: completeTaskAndReportTool,
+		},
+		{
 			Name:        "send_message",
-			Description: "Send a direct message to a teammate inbox.",
+			Description: "Send a direct message to a teammate inbox. When a teammate reports final run outcome to its supervisor, include status=completed or failed. run_id may be omitted if the sender has exactly one active assigned run.",
 			Parameters: ObjectSchema(map[string]any{
 				"to":      StringParam(),
 				"content": StringParam(),
+				"run_id":  StringParam(),
+				"status":  StringParam(),
 			}, "to", "content"),
 			Handler: sendMessageTool,
 		},
 		{
 			Name:        "read_inbox",
-			Description: "Read and drain your inbox.",
+			Description: "Read and drain your inbox. Use this to inspect detailed teammate reports after send_message or after wait_teammate if you need the full message text.",
 			Parameters:  ObjectSchema(map[string]any{}),
 			Handler:     readInboxTool,
 		},
@@ -929,6 +1452,145 @@ func spawnTeammateTool(ctx context.Context, args json.RawMessage, agent *Agent) 
 	return result, nil
 }
 
+func waitTeammateTool(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
+	if agent == nil || agent.TeamManager == nil {
+		return "", fmt.Errorf("teammate manager not initialized")
+	}
+
+	var params struct {
+		RunID          string `json:"run_id"`
+		TimeoutSeconds int    `json:"timeout_seconds"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "", fmt.Errorf("invalid wait_teammate args: %w", err)
+	}
+
+	timeout := 2 * time.Minute
+	if params.TimeoutSeconds > 0 {
+		timeout = time.Duration(params.TimeoutSeconds) * time.Second
+	}
+
+	run, err := agent.TeamManager.WaitForRun(ctx, params.RunID, timeout)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(run, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func completeTaskAndReportTool(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
+	if agent == nil || agent.TeamManager == nil || agent.TeamManager.bus == nil {
+		return "", fmt.Errorf("message bus not initialized")
+	}
+	if agent.TaskManager == nil {
+		return "", fmt.Errorf("task manager not initialized")
+	}
+
+	var params struct {
+		Content         string `json:"content"`
+		To              string `json:"to"`
+		TaskID          *int   `json:"task_id"`
+		KeepWorktree    *bool  `json:"keep_worktree"`
+		CleanupWorktree *bool  `json:"cleanup_worktree"`
+		Force           bool   `json:"force"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "", fmt.Errorf("invalid complete_task_and_report args: %w", err)
+	}
+	if strings.TrimSpace(params.Content) == "" {
+		return "", fmt.Errorf("complete_task_and_report content is required")
+	}
+
+	keepWorktree := false
+	if params.KeepWorktree != nil {
+		keepWorktree = *params.KeepWorktree
+	} else if params.CleanupWorktree != nil {
+		keepWorktree = !*params.CleanupWorktree
+	}
+
+	task, err := resolveTaskForCompletion(agent, params.TaskID)
+	if err != nil {
+		return "", err
+	}
+
+	var worktreeRecord *Worktree
+	if !keepWorktree && strings.TrimSpace(task.Worktree) != "" {
+		if agent.WorktreeManager == nil {
+			return "", fmt.Errorf("worktree manager not initialized")
+		}
+		worktreeRecord, err = agent.WorktreeManager.Remove(task.Worktree, params.Force, true)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		if _, err := agent.TaskManager.Update(task.ID, taskStatusCompleted, nil, nil); err != nil {
+			return "", err
+		}
+	}
+
+	finalTask, err := agent.TaskManager.load(task.ID)
+	if err != nil {
+		return "", err
+	}
+
+	to := strings.TrimSpace(params.To)
+	if to == "" {
+		to = agent.TeamManager.supervisorFor(agent.Name)
+	}
+	if to == "" {
+		return "", fmt.Errorf("complete_task_and_report requires a recipient")
+	}
+	if !agent.TeamManager.knowsParticipant(to) {
+		return "", fmt.Errorf("unknown team participant %q", to)
+	}
+
+	metadata := map[string]any{
+		"status":  teammateRunStatusCompleted,
+		"task_id": finalTask.ID,
+	}
+	runID, err := agent.TeamManager.resolveRunIDForSender(agent.Name, "")
+	if err != nil {
+		return "", err
+	}
+	if runID != "" {
+		metadata["run_id"] = runID
+	}
+
+	log.Printf("[CompleteTaskAndReportTool] agent=%s Completing task_id=%d keep_worktree=%t", agentLogName(agent), finalTask.ID, keepWorktree)
+	sendResult := agent.TeamManager.bus.Send(agent.Name, to, params.Content, "message", metadata)
+	if strings.HasPrefix(sendResult, "Error:") {
+		return "", fmt.Errorf("%s", sendResult)
+	}
+	if runID != "" {
+		if err := agent.TeamManager.ReportRun(runID, teammateRunStatusCompleted, params.Content); err != nil {
+			return "", err
+		}
+	}
+	if agent.TeamManager.isManagedTeammate(to) {
+		wakeResult := agent.TeamManager.Wake(to)
+		log.Printf("[CompleteTaskAndReportTool] agent=%s Wake result for %s: %s", agentLogName(agent), to, wakeResult)
+	}
+
+	result := map[string]any{
+		"message": sendResult,
+		"task":    finalTask,
+	}
+	if runID != "" {
+		result["run_id"] = runID
+	}
+	if worktreeRecord != nil {
+		result["worktree"] = worktreeRecord
+	}
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
 func sendMessageTool(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 	if agent == nil || agent.TeamManager == nil || agent.TeamManager.bus == nil {
 		return "", fmt.Errorf("message bus not initialized")
@@ -937,6 +1599,8 @@ func sendMessageTool(ctx context.Context, args json.RawMessage, agent *Agent) (s
 	var params struct {
 		To      string `json:"to"`
 		Content string `json:"content"`
+		RunID   string `json:"run_id"`
+		Status  string `json:"status"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		log.Printf("[SendMessageTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
@@ -945,8 +1609,36 @@ func sendMessageTool(ctx context.Context, args json.RawMessage, agent *Agent) (s
 	if !agent.TeamManager.knowsParticipant(params.To) {
 		return "", fmt.Errorf("unknown team participant %q", params.To)
 	}
+
+	metadata := map[string]any{}
+	runID, err := agent.TeamManager.resolveRunIDForSender(agent.Name, params.RunID)
+	if err != nil {
+		return "", err
+	}
+	if runID != "" {
+		metadata["run_id"] = runID
+	}
+	status := strings.TrimSpace(params.Status)
+	if status != "" {
+		if !validTeammateRunTerminalStatus(status) {
+			return "", fmt.Errorf("invalid send_message status %q", status)
+		}
+		if runID == "" {
+			return "", fmt.Errorf("send_message status requires an active run_id")
+		}
+		metadata["status"] = status
+	}
+	if len(metadata) == 0 {
+		metadata = nil
+	}
+
 	log.Printf("[SendMessageTool] agent=%s Sending message: from=%s, to=%s, content_size=%d", agentLogName(agent), agent.Name, params.To, len(params.Content))
-	result := agent.TeamManager.bus.Send(agent.Name, params.To, params.Content, "message", nil)
+	result := agent.TeamManager.bus.Send(agent.Name, params.To, params.Content, "message", metadata)
+	if !strings.HasPrefix(result, "Error:") && status != "" {
+		if err := agent.TeamManager.ReportRun(runID, status, params.Content); err != nil {
+			return "", err
+		}
+	}
 	if !strings.HasPrefix(result, "Error:") && agent.TeamManager.isManagedTeammate(params.To) {
 		wakeResult := agent.TeamManager.Wake(params.To)
 		log.Printf("[SendMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), params.To, wakeResult)
@@ -983,7 +1675,7 @@ func claimTaskTool(ctx context.Context, args json.RawMessage, agent *Agent) (str
 	if result == "" {
 		result = "No claimable task."
 	}
-	log.Printf("[ClaimTaskTool] agent=%s Claim result (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
+	log.Printf("[ClaimTaskTool] agent=%s Claim result (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
 }
 
@@ -999,7 +1691,7 @@ func readInboxTool(ctx context.Context, args json.RawMessage, agent *Agent) (str
 		return "", err
 	}
 	result := string(raw)
-	log.Printf("[ReadInboxTool] agent=%s Inbox read completed (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
+	log.Printf("[ReadInboxTool] agent=%s Inbox read completed (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
 }
 
@@ -1035,6 +1727,20 @@ func listTeamTool(ctx context.Context, args json.RawMessage, agent *Agent) (stri
 	}
 	log.Printf("[ListTeamTool] agent=%s Listing team", agentLogName(agent))
 	result := agent.TeamManager.ListAll()
-	log.Printf("[ListTeamTool] agent=%s Team list completed (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
+	log.Printf("[ListTeamTool] agent=%s Team list completed (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
+}
+
+func (e *idleEvent) Commit() error {
+	if e == nil || e.commit == nil {
+		return nil
+	}
+	return e.commit()
+}
+
+func (e *idleEvent) Rollback() error {
+	if e == nil || e.rollback == nil {
+		return nil
+	}
+	return e.rollback()
 }

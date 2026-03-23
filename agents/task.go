@@ -217,6 +217,47 @@ func (bm *BackgroundManager) Check(taskID string) string {
 	return strings.Join(lines, "\n")
 }
 
+func (bm *BackgroundManager) PeekNotifications() []BackgroundNotification {
+	if bm == nil {
+		return nil
+	}
+
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+
+	return append([]BackgroundNotification(nil), bm.notificationQueue...)
+}
+
+func (bm *BackgroundManager) AckNotifications(taskIDs []string) error {
+	if bm == nil || len(taskIDs) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(taskIDs))
+	for _, taskID := range taskIDs {
+		if strings.TrimSpace(taskID) == "" {
+			continue
+		}
+		seen[taskID] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	kept := bm.notificationQueue[:0]
+	for _, notification := range bm.notificationQueue {
+		if _, ok := seen[notification.TaskID]; ok {
+			continue
+		}
+		kept = append(kept, notification)
+	}
+	bm.notificationQueue = append([]BackgroundNotification(nil), kept...)
+	return nil
+}
+
 func (bm *BackgroundManager) DrainNotifications() []BackgroundNotification {
 	if bm == nil {
 		return nil
@@ -527,6 +568,10 @@ func (tm *TaskManager) UnbindWorktree(taskID int) (*Task, error) {
 	}
 
 	task.Worktree = ""
+	if task.Status != taskStatusCompleted {
+		task.Owner = ""
+		task.Status = taskStatusPending
+	}
 	if err := tm.save(task); err != nil {
 		return nil, err
 	}

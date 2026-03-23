@@ -13,9 +13,12 @@ import (
 )
 
 const (
-	worktreeStatusActive  = "active"
-	worktreeStatusRemoved = "removed"
-	worktreeStatusKept    = "kept"
+	worktreeStatusCreating = "creating"
+	worktreeStatusActive   = "active"
+	worktreeStatusRemoving = "removing"
+	worktreeStatusRemoved  = "removed"
+	worktreeStatusKept     = "kept"
+	worktreeStatusError    = "error"
 )
 
 type Worktree struct {
@@ -117,15 +120,16 @@ func (wm *WorktreeManager) createLocked(name string, taskID *int) (*Worktree, er
 		return nil, err
 	}
 	if existing := index.find(normalized); existing != nil && existing.Status != worktreeStatusRemoved {
-		return nil, fmt.Errorf("worktree %q already exists", normalized)
-	}
-
-	var task *Task
-	if taskID != nil && wm.tasks != nil {
-		task, err = wm.tasks.load(*taskID)
-		if err != nil {
-			return nil, err
+		if reusable, changed := wm.reusableMissingWorktreeLocked(existing, taskID); reusable != nil {
+			if changed {
+				index.upsert(reusable)
+				if err := wm.saveIndexLocked(index); err != nil {
+					return nil, err
+				}
+			}
+			return wm.createOrRecreateLocked(index, reusable, taskID)
 		}
+		return nil, fmt.Errorf("worktree %q already exists", normalized)
 	}
 
 	branch := fmt.Sprintf("wt/%s", normalized)
@@ -134,17 +138,47 @@ func (wm *WorktreeManager) createLocked(name string, taskID *int) (*Worktree, er
 		Name:   normalized,
 		Path:   path,
 		Branch: branch,
-		Status: worktreeStatusActive,
+		Status: worktreeStatusCreating,
 		TaskID: taskID,
 	}
+	return wm.createOrRecreateLocked(index, before, taskID)
+}
+
+func (wm *WorktreeManager) createOrRecreateLocked(index *worktreeIndex, before *Worktree, taskID *int) (*Worktree, error) {
+	if wm == nil {
+		return nil, fmt.Errorf("worktree manager not initialized")
+	}
+	if before == nil {
+		return nil, fmt.Errorf("worktree record is required")
+	}
+	normalized := before.Name
+	path := before.Path
+	branch := before.Branch
+
+	var err error
+	var task *Task
+	if taskID != nil && wm.tasks != nil {
+		task, err = wm.tasks.load(*taskID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	_ = wm.appendEventLocked(worktreeEvent{
 		Event:    "worktree.create.before",
 		Task:     eventTask(task),
 		Worktree: eventWorktree(before),
 		TS:       time.Now().Unix(),
 	})
+	index.upsert(cloneWorktree(before))
+	if err := wm.saveIndexLocked(index); err != nil {
+		return nil, err
+	}
 
 	if err := wm.addWorktreeLocked(branch, path); err != nil {
+		before.Status = worktreeStatusError
+		index.upsert(cloneWorktree(before))
+		_ = wm.saveIndexLocked(index)
 		_ = wm.appendEventLocked(worktreeEvent{
 			Event:    "worktree.create.failed",
 			Task:     eventTask(task),
@@ -159,6 +193,9 @@ func (wm *WorktreeManager) createLocked(name string, taskID *int) (*Worktree, er
 		task, err = wm.tasks.BindWorktree(*taskID, normalized)
 		if err != nil {
 			_ = wm.runGitLocked("worktree", "remove", "--force", path)
+			before.Status = worktreeStatusError
+			index.upsert(cloneWorktree(before))
+			_ = wm.saveIndexLocked(index)
 			_ = wm.appendEventLocked(worktreeEvent{
 				Event:    "worktree.create.failed",
 				Task:     &worktreeEventTask{ID: *taskID},
@@ -213,10 +250,25 @@ func (wm *WorktreeManager) EnsureForTask(task *Task) (*Worktree, error) {
 	if task.Worktree != "" {
 		name := normalizeWorktreeName(task.Worktree)
 		if existing := index.find(name); existing != nil && existing.Status != worktreeStatusRemoved {
-			return cloneWorktree(existing), nil
+			record, changed, err := wm.reconcileTaskWorktreeLocked(existing, task)
+			if err != nil {
+				return nil, err
+			}
+			if changed {
+				index.upsert(record)
+				if err := wm.saveIndexLocked(index); err != nil {
+					return nil, err
+				}
+			}
+			return cloneWorktree(record), nil
 		}
 
 		record := inferWorktreeRecord(wm.rootDir, name, task.ID)
+		record.Status = worktreeStatusError
+		record, _, err = wm.reconcileTaskWorktreeLocked(record, task)
+		if err != nil {
+			return nil, err
+		}
 		index.upsert(record)
 		if err := wm.saveIndexLocked(index); err != nil {
 			return nil, err
@@ -293,6 +345,11 @@ func (wm *WorktreeManager) Remove(name string, force bool, completeTask bool) (*
 	}); err != nil {
 		return nil, err
 	}
+	record.Status = worktreeStatusRemoving
+	index.upsert(record)
+	if err := wm.saveIndexLocked(index); err != nil {
+		return nil, err
+	}
 
 	args := []string{"worktree", "remove"}
 	if force {
@@ -300,6 +357,9 @@ func (wm *WorktreeManager) Remove(name string, force bool, completeTask bool) (*
 	}
 	args = append(args, record.Path)
 	if err := wm.runGitLocked(args...); err != nil {
+		record.Status = worktreeStatusError
+		index.upsert(record)
+		_ = wm.saveIndexLocked(index)
 		_ = wm.appendEventLocked(worktreeEvent{
 			Event:    "worktree.remove.failed",
 			Task:     eventTask(task),
@@ -314,6 +374,9 @@ func (wm *WorktreeManager) Remove(name string, force bool, completeTask bool) (*
 		if completeTask {
 			taskJSON, updateErr := wm.tasks.Update(*record.TaskID, "completed", nil, nil)
 			if updateErr != nil {
+				record.Status = worktreeStatusError
+				index.upsert(record)
+				_ = wm.saveIndexLocked(index)
 				return nil, updateErr
 			}
 			var completedTask Task
@@ -332,6 +395,9 @@ func (wm *WorktreeManager) Remove(name string, force bool, completeTask bool) (*
 
 		task, err = wm.tasks.UnbindWorktree(*record.TaskID)
 		if err != nil {
+			record.Status = worktreeStatusError
+			index.upsert(record)
+			_ = wm.saveIndexLocked(index)
 			return nil, err
 		}
 	}
@@ -398,6 +464,7 @@ func (wm *WorktreeManager) rebuildIndexLocked() error {
 		record := index.find(name)
 		if record == nil {
 			record = inferWorktreeRecord(wm.rootDir, name, task.ID)
+			record.Status = worktreeStatusError
 		} else {
 			record.Name = name
 			if record.Path == "" {
@@ -406,11 +473,22 @@ func (wm *WorktreeManager) rebuildIndexLocked() error {
 			if record.Branch == "" {
 				record.Branch = inferBranch(record.Path, name)
 			}
-			if record.Status == "" || record.Status == worktreeStatusRemoved {
-				record.Status = worktreeStatusActive
+			if record.Status == "" {
+				record.Status = worktreeStatusError
 			}
 			record.TaskID = intPtr(task.ID)
 		}
+		if record.Status == worktreeStatusRemoved && !pathExists(record.Path) {
+			if _, err := wm.tasks.UnbindWorktree(task.ID); err != nil {
+				return err
+			}
+			continue
+		}
+		reconciled, _, err := wm.reconcileTaskWorktreeLocked(record, task)
+		if err != nil {
+			return err
+		}
+		record = reconciled
 		index.upsert(record)
 	}
 
@@ -424,7 +502,20 @@ func (wm *WorktreeManager) addWorktreeLocked(branch, path string) error {
 	} else {
 		args = append(args, "-b", branch, path, "HEAD")
 	}
-	return wm.runGitLocked(args...)
+	if err := wm.runGitLocked(args...); err != nil {
+		if wm.isMissingButRegisteredWorktreeErr(err) {
+			if pruneErr := wm.runGitLocked("worktree", "prune"); pruneErr != nil {
+				return err
+			}
+			if retryErr := wm.runGitLocked(args...); retryErr == nil {
+				return nil
+			} else {
+				err = retryErr
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func (wm *WorktreeManager) branchExistsLocked(branch string) bool {
@@ -657,4 +748,82 @@ func gitRepoRoot(dir string) (string, error) {
 
 func intPtr(v int) *int {
 	return &v
+}
+
+func (wm *WorktreeManager) reconcileTaskWorktreeLocked(record *Worktree, task *Task) (*Worktree, bool, error) {
+	if record == nil || task == nil {
+		return record, false, nil
+	}
+
+	changed := false
+	record = cloneWorktree(record)
+	record.TaskID = intPtr(task.ID)
+	if record.Path == "" {
+		record.Path = filepath.Join(wm.rootDir, record.Name)
+		changed = true
+	}
+	if record.Branch == "" {
+		record.Branch = inferBranch(record.Path, record.Name)
+		changed = true
+	}
+
+	if pathExists(record.Path) {
+		if record.Status != worktreeStatusActive && record.Status != worktreeStatusKept {
+			record.Status = worktreeStatusActive
+			changed = true
+		}
+		return record, changed, nil
+	}
+
+	record.Status = worktreeStatusCreating
+	changed = true
+	if err := wm.addWorktreeLocked(record.Branch, record.Path); err != nil {
+		record.Status = worktreeStatusError
+		return record, true, err
+	}
+	record.Status = worktreeStatusActive
+	return record, true, nil
+}
+
+func pathExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func (wm *WorktreeManager) reusableMissingWorktreeLocked(existing *Worktree, taskID *int) (*Worktree, bool) {
+	if existing == nil || pathExists(existing.Path) {
+		return nil, false
+	}
+	record := cloneWorktree(existing)
+	changed := false
+	if record.Path == "" {
+		record.Path = filepath.Join(wm.rootDir, record.Name)
+		changed = true
+	}
+	if record.Branch == "" {
+		record.Branch = fmt.Sprintf("wt/%s", record.Name)
+		changed = true
+	}
+	if taskID != nil {
+		if record.TaskID == nil || *record.TaskID != *taskID {
+			record.TaskID = intPtr(*taskID)
+			changed = true
+		}
+	}
+	if record.Status != worktreeStatusError && record.Status != worktreeStatusCreating {
+		record.Status = worktreeStatusError
+		changed = true
+	}
+	return record, changed
+}
+
+func (wm *WorktreeManager) isMissingButRegisteredWorktreeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "missing but already registered worktree")
 }

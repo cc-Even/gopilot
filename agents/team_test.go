@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,40 @@ func TestMessageBusPersistsUnreadAcrossRestart(t *testing.T) {
 	afterDrain := NewMessageBus(talkPath)
 	if drained := afterDrain.ReadInbox("bob"); len(drained) != 0 {
 		t.Fatalf("expected persisted inbox to drain, got %d messages", len(drained))
+	}
+}
+
+func TestMessageBusPeekAndAck(t *testing.T) {
+	talkPath := filepath.Join(t.TempDir(), "talk.txt")
+	bus := NewMessageBus(talkPath)
+	if result := bus.Send("alice", "bob", "peek me", "message", nil); !strings.Contains(result, "Sent message to bob") {
+		t.Fatalf("unexpected send result: %s", result)
+	}
+
+	peeked, keys, err := bus.PeekInbox("bob")
+	if err != nil {
+		t.Fatalf("peek inbox failed: %v", err)
+	}
+	if len(peeked) != 1 || len(keys) != 1 {
+		t.Fatalf("expected 1 peeked message and key, got messages=%d keys=%d", len(peeked), len(keys))
+	}
+	if peeked[0].Content != "peek me" {
+		t.Fatalf("unexpected peeked message: %+v", peeked[0])
+	}
+
+	peekedAgain, _, err := bus.PeekInbox("bob")
+	if err != nil {
+		t.Fatalf("second peek inbox failed: %v", err)
+	}
+	if len(peekedAgain) != 1 {
+		t.Fatalf("peek should not drain inbox, got %d messages", len(peekedAgain))
+	}
+
+	if err := bus.AckInbox("bob", keys); err != nil {
+		t.Fatalf("ack inbox failed: %v", err)
+	}
+	if drained := bus.ReadInbox("bob"); len(drained) != 0 {
+		t.Fatalf("expected inbox to be empty after ack, got %+v", drained)
 	}
 }
 
@@ -320,6 +355,53 @@ func TestTeammateManagerWakeStartsInboxDrivenLoop(t *testing.T) {
 	})
 }
 
+func TestSpawnTeammateAssignsRunID(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if !strings.Contains(result, `Spawned "worker-1"`) || !strings.Contains(result, "run_id: run_") {
+		t.Fatalf("spawn should include run_id, got %s", result)
+	}
+
+	manager.mu.Lock()
+	member := manager.findMemberLocked("worker-1")
+	if member == nil || member.RunID == "" {
+		manager.mu.Unlock()
+		t.Fatalf("expected teammate run_id to be assigned, got %+v", member)
+	}
+	run := manager.runs[member.RunID]
+	manager.mu.Unlock()
+	if run == nil || run.Status != teammateRunStatusRunning {
+		t.Fatalf("expected running teammate run, got %+v", run)
+	}
+
+	manager.mu.Lock()
+	stopRunner := manager.threads["worker-1"]
+	manager.mu.Unlock()
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+}
+
 func TestSendMessageToolRejectsUnknownRecipient(t *testing.T) {
 	tempDir := t.TempDir()
 	teamDir := filepath.Join(tempDir, ".teams")
@@ -412,6 +494,79 @@ func TestSendMessageToolAllowsSupervisorAndLeadReadsInbox(t *testing.T) {
 	})
 }
 
+func TestSendMessageToolReportsRunCompletionAndWaitTeammateReturnsResult(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	manager.mu.Lock()
+	runID := manager.findMemberLocked("worker-1").RunID
+	manager.mu.Unlock()
+	if runID == "" {
+		t.Fatal("expected run_id to be assigned")
+	}
+
+	worker := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+	sendResult, err := sendMessageTool(context.Background(), json.RawMessage(`{"to":"lead","content":"task complete","status":"completed"}`), worker)
+	if err != nil {
+		t.Fatalf("sendMessageTool failed: %v", err)
+	}
+	if !strings.Contains(sendResult, "Sent message to lead") {
+		t.Fatalf("unexpected send result: %s", sendResult)
+	}
+
+	waitResult, err := waitTeammateTool(context.Background(), json.RawMessage(fmt.Sprintf(`{"run_id":%q,"timeout_seconds":1}`, runID)), base)
+	if err != nil {
+		t.Fatalf("waitTeammateTool failed: %v", err)
+	}
+
+	var run TeammateRun
+	if err := json.Unmarshal([]byte(waitResult), &run); err != nil {
+		t.Fatalf("parse wait result failed: %v", err)
+	}
+	if run.Status != teammateRunStatusCompleted || run.Result != "task complete" {
+		t.Fatalf("unexpected run state: %+v", run)
+	}
+
+	inbox := manager.bus.ReadInbox("lead")
+	if len(inbox) != 1 {
+		t.Fatalf("expected 1 inbox message, got %d", len(inbox))
+	}
+	if inbox[0].Metadata["run_id"] != runID || inbox[0].Metadata["status"] != teammateRunStatusCompleted {
+		t.Fatalf("expected completion metadata on inbox message, got %+v", inbox[0].Metadata)
+	}
+
+	manager.mu.Lock()
+	stopRunner := manager.threads["worker-1"]
+	manager.mu.Unlock()
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+}
+
 func TestLeadInboxSurvivesManagerRestart(t *testing.T) {
 	tempDir := t.TempDir()
 	teamDir := filepath.Join(tempDir, ".teams")
@@ -477,6 +632,228 @@ func TestLeadInboxSurvivesManagerRestart(t *testing.T) {
 	if !strings.Contains(content, "survives restart") {
 		t.Fatalf("unexpected persisted inbox content: %q", content)
 	}
+}
+
+func TestTeammateLoopFailsRunWithoutExplicitCompletionReport(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		return nil
+	}
+
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	manager.mu.Lock()
+	runID := manager.findMemberLocked("worker-1").RunID
+	manager.mu.Unlock()
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+	if runID == "" {
+		t.Fatal("expected run_id to be captured before teammate exits")
+	}
+
+	waitResult, err := waitTeammateTool(context.Background(), json.RawMessage(fmt.Sprintf(`{"run_id":%q,"timeout_seconds":1}`, runID)), base)
+	if err != nil {
+		t.Fatalf("waitTeammateTool failed: %v", err)
+	}
+
+	var run TeammateRun
+	if err := json.Unmarshal([]byte(waitResult), &run); err != nil {
+		t.Fatalf("parse wait result failed: %v", err)
+	}
+	if run.Status != teammateRunStatusFailed {
+		t.Fatalf("expected failed run status, got %+v", run)
+	}
+	if !strings.Contains(run.Error, "without explicit completion report") {
+		t.Fatalf("expected missing report failure, got %+v", run)
+	}
+}
+
+func TestCompleteTaskAndReportToolCompletesTaskAndReportsRun(t *testing.T) {
+	repoDir := initTestRepo(t)
+	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("summarize team", "read and summarize team.go"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+	worktreeManager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	if err != nil {
+		t.Fatalf("create worktree manager failed: %v", err)
+	}
+
+	base := &Agent{
+		Name:            "supervisor",
+		SystemPrompt:    "You are the lead agent.",
+		Model:           "test-model",
+		TaskManager:     taskManager,
+		WorktreeManager: worktreeManager,
+		tools:           map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(filepath.Join(repoDir, ".teams"), base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "supervisor")
+	if !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	worker := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+	if _, err := claimTaskTool(context.Background(), json.RawMessage(`{"task_id":0}`), worker); err != nil {
+		t.Fatalf("claimTaskTool failed: %v", err)
+	}
+
+	output, err := completeTaskAndReportTool(context.Background(), json.RawMessage(`{"content":"done"}`), worker)
+	if err != nil {
+		t.Fatalf("completeTaskAndReportTool failed: %v", err)
+	}
+	if !strings.Contains(output, `"status": "completed"`) {
+		t.Fatalf("expected completed task output, got %s", output)
+	}
+
+	task := mustLoadTask(t, taskManager, 0)
+	if task.Status != taskStatusCompleted {
+		t.Fatalf("expected task completed, got %+v", task)
+	}
+	if task.Worktree != "" {
+		t.Fatalf("expected task worktree to be unbound, got %+v", task)
+	}
+
+	manager.mu.Lock()
+	runID := manager.runs[manager.findMemberLocked("worker-1").RunID]
+	manager.mu.Unlock()
+	if runID == nil || runID.Status != teammateRunStatusCompleted {
+		t.Fatalf("expected completed run, got %+v", runID)
+	}
+
+	inbox := manager.bus.ReadInbox("supervisor")
+	if len(inbox) != 1 {
+		t.Fatalf("expected one supervisor inbox message, got %d", len(inbox))
+	}
+	if inbox[0].Metadata["status"] != teammateRunStatusCompleted || inbox[0].Metadata["task_id"] != float64(0) && inbox[0].Metadata["task_id"] != 0 {
+		t.Fatalf("expected completed metadata, got %+v", inbox[0].Metadata)
+	}
+
+	records, err := worktreeManager.List()
+	if err != nil {
+		t.Fatalf("list worktrees failed: %v", err)
+	}
+	if len(records) == 0 || records[0].Status != worktreeStatusRemoved {
+		t.Fatalf("expected removed worktree record, got %+v", records)
+	}
+
+	manager.mu.Lock()
+	stopRunner := manager.threads["worker-1"]
+	manager.mu.Unlock()
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+}
+
+func TestCompleteTaskAndReportToolKeepsWorktreeWhenRequested(t *testing.T) {
+	repoDir := initTestRepo(t)
+	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("summarize worktree", "read and summarize worktree.go"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+	worktreeManager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	if err != nil {
+		t.Fatalf("create worktree manager failed: %v", err)
+	}
+
+	base := &Agent{
+		Name:            "supervisor",
+		SystemPrompt:    "You are the lead agent.",
+		Model:           "test-model",
+		TaskManager:     taskManager,
+		WorktreeManager: worktreeManager,
+		tools:           map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(filepath.Join(repoDir, ".teams"), base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	if result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "supervisor"); !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	worker := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+	if _, err := claimTaskTool(context.Background(), json.RawMessage(`{"task_id":0}`), worker); err != nil {
+		t.Fatalf("claimTaskTool failed: %v", err)
+	}
+
+	output, err := completeTaskAndReportTool(context.Background(), json.RawMessage(`{"content":"done","keep_worktree":true}`), worker)
+	if err != nil {
+		t.Fatalf("completeTaskAndReportTool failed: %v", err)
+	}
+	if !strings.Contains(output, `"status": "completed"`) {
+		t.Fatalf("expected completed task output, got %s", output)
+	}
+
+	task := mustLoadTask(t, taskManager, 0)
+	if task.Status != taskStatusCompleted {
+		t.Fatalf("expected task completed, got %+v", task)
+	}
+	if task.Worktree == "" {
+		t.Fatalf("expected task worktree to remain bound, got %+v", task)
+	}
+
+	records, err := worktreeManager.List()
+	if err != nil {
+		t.Fatalf("list worktrees failed: %v", err)
+	}
+	if len(records) == 0 || records[0].Status != worktreeStatusActive {
+		t.Fatalf("expected active worktree record, got %+v", records)
+	}
+	if _, err := os.Stat(records[0].Path); err != nil {
+		t.Fatalf("expected worktree path to remain: %v", err)
+	}
+
+	manager.mu.Lock()
+	stopRunner := manager.threads["worker-1"]
+	manager.mu.Unlock()
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
 }
 
 func TestTeammateManagerNextIdleEventPrefersInbox(t *testing.T) {

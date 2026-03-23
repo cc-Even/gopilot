@@ -85,6 +85,11 @@ type AgentOptions struct {
 	SkillLoader *SkillLoader
 }
 
+type turnEventAcks struct {
+	commits   []func() error
+	rollbacks []func() error
+}
+
 type AgentOption func(*AgentOptions)
 
 const (
@@ -328,14 +333,20 @@ func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessage
 	const maxTurns = 40
 	roundsSinceTodo := 0
 	for turn := 0; turn < maxTurns; turn++ {
+		var err error
 		messages = compactToolMessages(messages)
 		var compactErr error
 		messages, compactErr = a.maybeAutoCompact(ctx, messages)
 		if compactErr != nil {
 			return "", fmt.Errorf("auto compact failed (turn=%d): %w", turn, compactErr)
 		}
-		messages = a.appendBackgroundNotifications(messages)
-		messages = a.appendTeamInboxMessages(messages)
+		turnAcks := &turnEventAcks{}
+		messages = a.stageBackgroundNotifications(messages, turnAcks)
+		messages, err = a.stageTeamInboxMessages(messages, turnAcks)
+		if err != nil {
+			_ = turnAcks.Rollback()
+			return "", fmt.Errorf("stage turn events failed (turn=%d): %w", turn, err)
+		}
 
 		resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 			Model:    a.Model,
@@ -343,7 +354,11 @@ func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessage
 			Tools:    a.openAITools(),
 		})
 		if err != nil {
+			_ = turnAcks.Rollback()
 			return "", fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
+		}
+		if err := turnAcks.Commit(); err != nil {
+			return "", fmt.Errorf("ack turn events failed (turn=%d): %w", turn, err)
 		}
 		if len(resp.Choices) == 0 {
 			return "", fmt.Errorf("empty choices from model")
@@ -411,12 +426,12 @@ func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessage
 	return "", fmt.Errorf("max turns reached without final answer")
 }
 
-func (a *Agent) appendBackgroundNotifications(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+func (a *Agent) stageBackgroundNotifications(messages []openai.ChatCompletionMessageParamUnion, acks *turnEventAcks) []openai.ChatCompletionMessageParamUnion {
 	if a == nil || a.Background == nil {
 		return messages
 	}
 
-	notifications := a.Background.DrainNotifications()
+	notifications := a.Background.PeekNotifications()
 	if len(notifications) == 0 {
 		return messages
 	}
@@ -434,7 +449,33 @@ func (a *Agent) appendBackgroundNotifications(messages []openai.ChatCompletionMe
 	}
 	lines = append(lines, "</background_notifications>")
 
+	taskIDs := make([]string, 0, len(notifications))
+	for _, notification := range notifications {
+		taskIDs = append(taskIDs, notification.TaskID)
+	}
+	acks.AddCommit(func() error {
+		return a.Background.AckNotifications(taskIDs)
+	})
+
 	return append(messages, openai.UserMessage(strings.Join(lines, "\n")))
+}
+
+func (a *Agent) stageTeamInboxMessages(messages []openai.ChatCompletionMessageParamUnion, acks *turnEventAcks) ([]openai.ChatCompletionMessageParamUnion, error) {
+	if a == nil || a.TeamManager == nil || a.TeamManager.bus == nil || strings.TrimSpace(a.Name) == "" {
+		return messages, nil
+	}
+
+	inbox, keys, err := a.TeamManager.bus.PeekInbox(a.Name)
+	if err != nil {
+		return messages, err
+	}
+	if len(inbox) == 0 {
+		return messages, nil
+	}
+	acks.AddCommit(func() error {
+		return a.TeamManager.bus.AckInbox(a.Name, keys)
+	})
+	return append(messages, openai.UserMessage(formatInboxMessages(inbox))), nil
 }
 
 func (a *Agent) appendTeamInboxMessages(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
@@ -746,4 +787,53 @@ func (a *Agent) openAITools() []openai.ChatCompletionToolUnionParam {
 		})
 	}
 	return tools
+}
+
+func (a *turnEventAcks) AddCommit(fn func() error) {
+	if a == nil || fn == nil {
+		return
+	}
+	a.commits = append(a.commits, fn)
+}
+
+func (a *turnEventAcks) AddRollback(fn func() error) {
+	if a == nil || fn == nil {
+		return
+	}
+	a.rollbacks = append(a.rollbacks, fn)
+}
+
+func (a *turnEventAcks) Commit() error {
+	if a == nil {
+		return nil
+	}
+	for _, fn := range a.commits {
+		if fn == nil {
+			continue
+		}
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	a.commits = nil
+	a.rollbacks = nil
+	return nil
+}
+
+func (a *turnEventAcks) Rollback() error {
+	if a == nil {
+		return nil
+	}
+	for i := len(a.rollbacks) - 1; i >= 0; i-- {
+		fn := a.rollbacks[i]
+		if fn == nil {
+			continue
+		}
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	a.commits = nil
+	a.rollbacks = nil
+	return nil
 }

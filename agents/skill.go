@@ -449,7 +449,7 @@ func (c BashTool) Description() string {
 func (c BashTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
 	log.Printf("[BashTool] agent=%s Executing command: %s", agentLogName(agent), input)
 	result := RunBash(input, agentWorkspaceDir(agent))
-	log.Printf("[BashTool] agent=%s Command output (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
+	log.Printf("[BashTool] agent=%s Command output (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
 }
 
@@ -497,7 +497,7 @@ func (c BackgroundCheckTool) Call(_ context.Context, input string, agent *Agent)
 
 	log.Printf("[BackgroundCheckTool] agent=%s Checking task: task_id=%s", agentLogName(agent), params.TaskID)
 	result := agent.Background.Check(params.TaskID)
-	log.Printf("[BackgroundCheckTool] agent=%s Check result (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
+	log.Printf("[BackgroundCheckTool] agent=%s Check result (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
 }
 
@@ -521,7 +521,7 @@ func (r ReadFileTool) Call(_ context.Context, input string, agent *Agent) (strin
 	}
 	log.Printf("[ReadFileTool] agent=%s Reading file: path=%s, limit=%d", agentLogName(agent), params.Path, params.Limit)
 	result := RunRead(agentWorkspaceDir(agent), params.Path, params.Limit)
-	log.Printf("[ReadFileTool] agent=%s File read completed (first 200 chars): %s", agentLogName(agent), truncate(result, 200))
+	log.Printf("[ReadFileTool] agent=%s File read completed (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
 }
 

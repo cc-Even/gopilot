@@ -186,6 +186,178 @@ func TestTeammateManagerClaimAssignsWorktreeDirectory(t *testing.T) {
 	}
 }
 
+func TestWorktreeManagerEnsureForTaskRecreatesMissingDirectory(t *testing.T) {
+	repoDir := initTestRepo(t)
+	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("recreate me", "task with missing worktree"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+
+	manager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	if err != nil {
+		t.Fatalf("create worktree manager failed: %v", err)
+	}
+	record, err := manager.Create("recreate-me", intPtr(0))
+	if err != nil {
+		t.Fatalf("create worktree failed: %v", err)
+	}
+
+	runTestCmd(t, repoDir, "git", "worktree", "remove", "--force", record.Path)
+	if _, err := os.Stat(record.Path); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree path removed, got stat err=%v", err)
+	}
+
+	task := mustLoadTask(t, taskManager, 0)
+	recovered, err := manager.EnsureForTask(task)
+	if err != nil {
+		t.Fatalf("ensure for task failed: %v", err)
+	}
+	if recovered.Status != worktreeStatusActive {
+		t.Fatalf("expected recovered worktree active, got %+v", recovered)
+	}
+	if _, err := os.Stat(recovered.Path); err != nil {
+		t.Fatalf("expected recovered worktree path to exist: %v", err)
+	}
+}
+
+func TestWorktreeManagerEnsureForTaskPrunesMissingButRegisteredWorktree(t *testing.T) {
+	repoDir := initTestRepo(t)
+	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("stale registration", "task with missing but registered worktree"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+
+	manager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	if err != nil {
+		t.Fatalf("create worktree manager failed: %v", err)
+	}
+	record, err := manager.Create("stale-registration", intPtr(0))
+	if err != nil {
+		t.Fatalf("create worktree failed: %v", err)
+	}
+
+	if err := os.RemoveAll(record.Path); err != nil {
+		t.Fatalf("remove worktree path failed: %v", err)
+	}
+	if _, err := os.Stat(record.Path); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree path removed, got stat err=%v", err)
+	}
+
+	task := mustLoadTask(t, taskManager, 0)
+	recovered, err := manager.EnsureForTask(task)
+	if err != nil {
+		t.Fatalf("ensure for task failed: %v", err)
+	}
+	if recovered.Status != worktreeStatusActive {
+		t.Fatalf("expected recovered worktree active, got %+v", recovered)
+	}
+	if _, err := os.Stat(recovered.Path); err != nil {
+		t.Fatalf("expected recovered worktree path to exist: %v", err)
+	}
+}
+
+func TestWorktreeManagerCreateReusesMissingErrorRecord(t *testing.T) {
+	repoDir := initTestRepo(t)
+	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("reuse stale record", "task bound later"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+
+	rootDir := filepath.Join(repoDir, ".worktrees")
+	manager, err := NewWorktreeManager(rootDir, taskManager)
+	if err != nil {
+		t.Fatalf("create worktree manager failed: %v", err)
+	}
+
+	index := worktreeIndex{
+		Worktrees: []*Worktree{{
+			Name:   "reuse-stale-record",
+			Path:   filepath.Join(rootDir, "reuse-stale-record"),
+			Branch: "wt/reuse-stale-record",
+			Status: worktreeStatusError,
+		}},
+	}
+	data, err := json.MarshalIndent(index, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal index failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "index.json"), data, 0o644); err != nil {
+		t.Fatalf("write index failed: %v", err)
+	}
+
+	record, err := manager.Create("reuse stale record", intPtr(0))
+	if err != nil {
+		t.Fatalf("expected stale error record to be reusable, got %v", err)
+	}
+	if record.Status != worktreeStatusActive {
+		t.Fatalf("expected active worktree, got %+v", record)
+	}
+	if _, err := os.Stat(record.Path); err != nil {
+		t.Fatalf("expected worktree path to exist: %v", err)
+	}
+}
+
+func TestWorktreeManagerRebuildUnbindsRemovedWorktreeTasks(t *testing.T) {
+	repoDir := initTestRepo(t)
+	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("cleanup stale binding", "task with removed worktree"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+
+	rootDir := filepath.Join(repoDir, ".worktrees")
+	manager, err := NewWorktreeManager(rootDir, taskManager)
+	if err != nil {
+		t.Fatalf("create worktree manager failed: %v", err)
+	}
+	record, err := manager.Create("cleanup-stale-binding", intPtr(0))
+	if err != nil {
+		t.Fatalf("create worktree failed: %v", err)
+	}
+
+	runTestCmd(t, repoDir, "git", "worktree", "remove", "--force", record.Path)
+	indexPath := filepath.Join(rootDir, "index.json")
+	index := worktreeIndex{
+		Worktrees: []*Worktree{{
+			Name:   record.Name,
+			Path:   record.Path,
+			Branch: record.Branch,
+			Status: worktreeStatusRemoved,
+			TaskID: intPtr(0),
+		}},
+	}
+	data, err := json.MarshalIndent(index, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal index failed: %v", err)
+	}
+	if err := os.WriteFile(indexPath, data, 0o644); err != nil {
+		t.Fatalf("write index failed: %v", err)
+	}
+
+	if _, err := NewWorktreeManager(rootDir, taskManager); err != nil {
+		t.Fatalf("rebuild worktree manager failed: %v", err)
+	}
+
+	task := mustLoadTask(t, taskManager, 0)
+	if task.Worktree != "" {
+		t.Fatalf("expected stale removed worktree binding to be cleared, got %+v", task)
+	}
+	if task.Status != taskStatusPending {
+		t.Fatalf("expected task reset to pending after stale binding cleanup, got %+v", task)
+	}
+}
+
 func initTestRepo(t *testing.T) string {
 	t.Helper()
 

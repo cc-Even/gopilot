@@ -433,4 +433,37 @@ func TestBackgroundManager(t *testing.T) {
 			t.Fatalf("expected task result in check output, got %q", checkOne)
 		}
 	})
+
+	t.Run("PeekAndAckNotifications", func(t *testing.T) {
+		bm := NewBackgroundManager()
+		result := bm.Run("printf 'peek-notify'")
+		if !strings.Contains(result, "Background task ") {
+			t.Fatalf("unexpected run result: %s", result)
+		}
+
+		var notifications []BackgroundNotification
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			notifications = bm.PeekNotifications()
+			if len(notifications) > 0 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if len(notifications) != 1 {
+			t.Fatalf("expected 1 notification, got %d", len(notifications))
+		}
+
+		peekedAgain := bm.PeekNotifications()
+		if len(peekedAgain) != 1 {
+			t.Fatalf("peek should not drain notifications, got %d", len(peekedAgain))
+		}
+
+		if err := bm.AckNotifications([]string{notifications[0].TaskID}); err != nil {
+			t.Fatalf("ack notifications failed: %v", err)
+		}
+		if remaining := bm.PeekNotifications(); len(remaining) != 0 {
+			t.Fatalf("expected notifications to be empty after ack, got %d", len(remaining))
+		}
+	})
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 const (
 	ToolName    = "Claude Go"
 	ToolVersion = "v0.1.0"
+	LogFileName = "debug.log"
 )
 
 var (
@@ -80,8 +82,11 @@ func main() {
 		SetWordWrap(true)
 	logView.SetBorder(true).SetTitle(" Logs ")
 
-	if err := installUILogSink(app, logView); err != nil {
+	logPath := filepath.Join(agents.WORKDIR, LogFileName)
+	if err := installUILogSink(app, logView, logPath); err != nil {
 		log.Printf("Warning: failed to install UI log sink: %v", err)
+	} else {
+		log.Printf("Debug log file: %s", logPath)
 	}
 
 	inputField := tview.NewInputField().
@@ -348,6 +353,8 @@ func (s *cliSession) clearViews() {
 func buildSystemPrompt(skillLoader *agents.SkillLoader) string {
 	return fmt.Sprintf("You are a coding agent at %s. Use tools to solve tasks and summarize results. ", agents.WORKDIR) +
 		"For complex tasks, first plan, then create multiple subtasks based on the plan. Finally, create teammates to complete the task together." +
+		"When you spawn a teammate, capture the returned run_id. If later steps depend on that teammate's work, call wait_teammate with the run_id before continuing or giving a final answer. Do not assume background teammates finish before you do." +
+		"After wait_teammate returns, inspect the returned run status and any inbox report, then decide the next step." +
 		"Use TodoWrite for short checklists. " +
 		fmt.Sprintf("Skills: %s", skillLoader.GetDescriptions())
 }
@@ -433,9 +440,16 @@ func getenvOrDefault(key, fallback string) string {
 	return value
 }
 
-func installUILogSink(app *tview.Application, logView *tview.TextView) error {
+func installUILogSink(app *tview.Application, logView *tview.TextView, logPath string) error {
 	reader, writer, err := os.Pipe()
 	if err != nil {
+		return err
+	}
+
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
 		return err
 	}
 
@@ -444,10 +458,17 @@ func installUILogSink(app *tview.Application, logView *tview.TextView) error {
 	log.SetOutput(writer)
 
 	go func() {
+		defer logFile.Close()
 		scanner := bufio.NewScanner(reader)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
+			if _, err := fmt.Fprintln(logFile, line); err != nil {
+				app.QueueUpdateDraw(func() {
+					fmt.Fprintf(logView, "[red]Log Error:[white] failed to write log file: %s\n", tview.Escape(err.Error()))
+					logView.ScrollToEnd()
+				})
+			}
 			app.QueueUpdateDraw(func() {
 				fmt.Fprintf(logView, "[gray]Log:[white] %s\n", tview.Escape(line))
 				logView.ScrollToEnd()
