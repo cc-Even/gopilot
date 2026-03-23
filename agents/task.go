@@ -375,6 +375,54 @@ func (tm *TaskManager) Update(taskID int, status string, addBlockedBy, addBlocks
 	return string(data), nil
 }
 
+// ClaimNextAvailable atomically claims the first runnable unowned pending task.
+func (tm *TaskManager) ClaimNextAvailable(owner string) (*Task, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if strings.TrimSpace(owner) == "" {
+		return nil, fmt.Errorf("owner is required")
+	}
+
+	entries, err := os.ReadDir(tm.dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tasks directory: %w", err)
+	}
+
+	taskIDs := make([]int, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasPrefix(name, "task_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		taskIDs = append(taskIDs, extractTaskID(name))
+	}
+
+	sort.Ints(taskIDs)
+	for _, taskID := range taskIDs {
+		task, err := tm.load(taskID)
+		if err != nil {
+			continue
+		}
+		if task.Status != "pending" || task.Owner != "" || len(task.BlockedBy) > 0 {
+			continue
+		}
+
+		task.Owner = owner
+		task.Status = "in_progress"
+		if err := tm.save(task); err != nil {
+			return nil, err
+		}
+		return task, nil
+	}
+
+	return nil, nil
+}
+
 // clearDependency removes a completed task ID from all other tasks' blockedBy lists
 func (tm *TaskManager) clearDependency(completedID int) error {
 	entries, err := os.ReadDir(tm.dir)

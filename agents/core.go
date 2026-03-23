@@ -456,6 +456,41 @@ func (a *Agent) forceAutoCompact(ctx context.Context, messages []openai.ChatComp
 	return a.autoCompact(ctx, messages, conversationText, focus)
 }
 
+func (a *Agent) injectIdentityBlockIfCompacted(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+	if a == nil || len(messages) > 3 {
+		return messages
+	}
+
+	role, _, err := messageRoleAndContent(messages[0])
+	if err == nil && role == "system" {
+		return messages
+	}
+
+	identity := strings.TrimSpace(a.identityBlock())
+	if identity == "" {
+		return messages
+	}
+
+	return append([]openai.ChatCompletionMessageParamUnion{openai.SystemMessage(identity)}, messages...)
+}
+
+func (a *Agent) identityBlock() string {
+	if a == nil {
+		return ""
+	}
+
+	lines := []string{
+		"<identity>",
+		fmt.Sprintf("name=%s", strings.TrimSpace(a.Name)),
+		fmt.Sprintf("role=%s", strings.TrimSpace(a.Description)),
+	}
+	if strings.TrimSpace(a.SystemPrompt) != "" {
+		lines = append(lines, "instruction="+a.SystemPrompt)
+	}
+	lines = append(lines, "</identity>")
+	return strings.Join(lines, "\n")
+}
+
 func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, conversationText, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
 	workdir, err := os.Getwd()
 	if err != nil {
@@ -630,6 +665,23 @@ func parseToolMessage(message openai.ChatCompletionMessageParamUnion) (bool, str
 		return false, "", "", nil
 	}
 	return true, payload.Content, payload.ToolCallID, nil
+}
+
+func messageRoleAndContent(message openai.ChatCompletionMessageParamUnion) (string, string, error) {
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return "", "", err
+	}
+
+	type messagePayload struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	payload := messagePayload{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", "", err
+	}
+	return payload.Role, payload.Content, nil
 }
 
 func toolResultCompact(output, toolName string) string {

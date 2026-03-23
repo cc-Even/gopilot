@@ -18,6 +18,9 @@ const (
 	teammateStatusIdle     = "idle"
 	teammateStatusWorking  = "working"
 	teammateStatusShutdown = "shutdown"
+
+	teammateIdlePollInterval = 5 * time.Second
+	teammateIdleTimeout      = 60 * time.Second
 )
 
 var validMessageTypes = map[string]struct{}{
@@ -189,6 +192,9 @@ type TeammateManager struct {
 	bus        *MessageBus
 	runner     teammateRunner
 
+	idlePollInterval time.Duration
+	idleTimeout      time.Duration
+
 	mu      sync.Mutex
 	config  TeamConfig
 	threads map[string]context.CancelFunc
@@ -197,11 +203,13 @@ type TeammateManager struct {
 func NewTeammateManager(teamDir string, baseAgent *Agent) *TeammateManager {
 	_ = os.MkdirAll(teamDir, 0o755)
 	manager := &TeammateManager{
-		dir:        teamDir,
-		configPath: filepath.Join(teamDir, "config.json"),
-		baseAgent:  baseAgent,
-		bus:        NewMessageBus(filepath.Join(filepath.Dir(teamDir), "talk.txt")),
-		threads:    make(map[string]context.CancelFunc),
+		dir:              teamDir,
+		configPath:       filepath.Join(teamDir, "config.json"),
+		baseAgent:        baseAgent,
+		bus:              NewMessageBus(filepath.Join(filepath.Dir(teamDir), "talk.txt")),
+		threads:          make(map[string]context.CancelFunc),
+		idlePollInterval: teammateIdlePollInterval,
+		idleTimeout:      teammateIdleTimeout,
 	}
 	manager.config = manager.loadConfig()
 	manager.runner = manager.defaultRunner
@@ -356,9 +364,15 @@ func (m *TeammateManager) WaitUntilIdle(ctx context.Context) error {
 
 	for {
 		m.mu.Lock()
-		running := len(m.threads)
+		working := false
+		for _, member := range m.config.Members {
+			if member.Status == teammateStatusWorking {
+				working = true
+				break
+			}
+		}
 		m.mu.Unlock()
-		if running == 0 {
+		if !working {
 			return nil
 		}
 
@@ -392,7 +406,7 @@ func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 		}
 	}
 
-	return &Agent{
+	agent := &Agent{
 		Name:         name,
 		Description:  role,
 		SystemPrompt: prompt,
@@ -408,6 +422,11 @@ func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 		tools:        clonedTools,
 		order:        clonedOrder,
 	}
+	if _, exists := agent.tools["idle"]; !exists {
+		agent.tools["idle"] = idleToolDefinition()
+		agent.order = append(agent.order, "idle")
+	}
+	return agent
 }
 
 func (m *TeammateManager) defaultRunner(ctx context.Context, agent *Agent, prompt string) error {
@@ -421,56 +440,156 @@ func (m *TeammateManager) defaultRunner(ctx context.Context, agent *Agent, promp
 	}
 
 	const maxTurns = 50
-	for turn := 0; turn < maxTurns; turn++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		messages = compactToolMessages(messages)
-		var err error
-		messages, err = agent.maybeAutoCompact(ctx, messages)
+	for turn := 0; turn < maxTurns; {
+		nextMessages, enterIdle, err := m.runWorkPhase(ctx, agent, messages, turn)
 		if err != nil {
-			return fmt.Errorf("auto compact failed (turn=%d): %w", turn, err)
+			return err
 		}
-		messages = agent.appendBackgroundNotifications(messages)
-		if inbox := m.bus.ReadInbox(agent.Name); len(inbox) > 0 {
-			messages = append(messages, openai.UserMessage(formatInboxMessages(inbox)))
+		messages = nextMessages
+		turn++
+		if !enterIdle {
+			continue
 		}
 
-		resp, err := agent.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-			Model:    agent.Model,
-			Messages: messages,
-			Tools:    agent.openAITools(),
-		})
+		if err := m.setMemberStatus(agent.Name, teammateStatusIdle); err != nil {
+			log.Printf("[TeammateManager] Failed to mark teammate idle: name=%s err=%v", agent.Name, err)
+		}
+
+		idleMessage, shouldShutdown, err := m.waitForIdleEvent(ctx, agent)
 		if err != nil {
-			return fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
+			return err
 		}
-		if len(resp.Choices) == 0 {
-			return fmt.Errorf("empty choices from model")
-		}
-
-		choice := resp.Choices[0]
-		messages = append(messages, choice.Message.ToParam())
-
-		switch choice.FinishReason {
-		case "stop":
-			return nil
-		case "tool_calls":
-			for _, tc := range choice.Message.ToolCalls {
-				output, callErr := agent.executeTool(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
-				if callErr != nil {
-					output = "tool error: " + callErr.Error()
-				}
-				messages = append(messages, openai.ToolMessage(output, tc.ID))
+		if shouldShutdown {
+			if err := m.setMemberStatus(agent.Name, teammateStatusShutdown); err != nil {
+				log.Printf("[TeammateManager] Failed to mark teammate shutdown: name=%s err=%v", agent.Name, err)
 			}
-		default:
-			return fmt.Errorf("unsupported finish reason: %s", choice.FinishReason)
+			return nil
+		}
+
+		messages = append(messages, openai.UserMessage(idleMessage))
+		if err := m.setMemberStatus(agent.Name, teammateStatusWorking); err != nil {
+			log.Printf("[TeammateManager] Failed to mark teammate working: name=%s err=%v", agent.Name, err)
 		}
 	}
 
-	return fmt.Errorf("max turns reached without final answer")
+	return fmt.Errorf("max turns reached without shutdown")
+}
+
+func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messages []openai.ChatCompletionMessageParamUnion, turn int) ([]openai.ChatCompletionMessageParamUnion, bool, error) {
+	select {
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	default:
+	}
+
+	messages = compactToolMessages(messages)
+	var err error
+	messages, err = agent.maybeAutoCompact(ctx, messages)
+	if err != nil {
+		return nil, false, fmt.Errorf("auto compact failed (turn=%d): %w", turn, err)
+	}
+	messages = agent.injectIdentityBlockIfCompacted(messages)
+	messages = agent.appendBackgroundNotifications(messages)
+	if inbox := m.bus.ReadInbox(agent.Name); len(inbox) > 0 {
+		messages = append(messages, openai.UserMessage(formatInboxMessages(inbox)))
+	}
+
+	resp, err := agent.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model:    agent.Model,
+		Messages: messages,
+		Tools:    agent.openAITools(),
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
+	}
+	if len(resp.Choices) == 0 {
+		return nil, false, fmt.Errorf("empty choices from model")
+	}
+
+	choice := resp.Choices[0]
+	messages = append(messages, choice.Message.ToParam())
+
+	switch choice.FinishReason {
+	case "stop":
+		return messages, true, nil
+	case "tool_calls":
+		idleRequested := false
+		for _, tc := range choice.Message.ToolCalls {
+			output, callErr := agent.executeTool(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			if callErr != nil {
+				output = "tool error: " + callErr.Error()
+			}
+			messages = append(messages, openai.ToolMessage(output, tc.ID))
+			if tc.Function.Name == "idle" {
+				idleRequested = true
+			}
+		}
+		return messages, idleRequested, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported finish reason: %s", choice.FinishReason)
+	}
+}
+
+func (m *TeammateManager) waitForIdleEvent(ctx context.Context, agent *Agent) (string, bool, error) {
+	deadline := time.Now().Add(m.idleTimeout)
+	for {
+		message, err := m.nextIdleEvent(agent)
+		if err != nil {
+			return "", false, err
+		}
+		if message != "" {
+			return message, false, nil
+		}
+		if time.Now().After(deadline) {
+			return "", true, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		case <-time.After(m.idlePollInterval):
+		}
+	}
+}
+
+func (m *TeammateManager) nextIdleEvent(agent *Agent) (string, error) {
+	if agent == nil {
+		return "", fmt.Errorf("agent not initialized")
+	}
+
+	if inbox := m.bus.ReadInbox(agent.Name); len(inbox) > 0 {
+		return formatInboxMessages(inbox), nil
+	}
+
+	if agent.TaskManager == nil {
+		return "", nil
+	}
+
+	task, err := agent.TaskManager.ClaimNextAvailable(agent.Name)
+	if err != nil {
+		return "", err
+	}
+	if task == nil {
+		return "", nil
+	}
+
+	return formatClaimedTask(task), nil
+}
+
+func (m *TeammateManager) setMemberStatus(name, status string) error {
+	if m == nil {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	member := m.findMemberLocked(name)
+	if member == nil {
+		return fmt.Errorf("unknown teammate %q", name)
+	}
+	member.Status = status
+	return m.saveConfigLocked()
 }
 
 func (m *TeammateManager) ListAll() string {
@@ -515,6 +634,19 @@ func formatInboxMessages(messages []TeamMessage) string {
 	}
 	lines = append(lines, "</inbox>")
 	return strings.Join(lines, "\n")
+}
+
+func formatClaimedTask(task *Task) string {
+	if task == nil {
+		return ""
+	}
+
+	return strings.Join([]string{
+		"<task_claim>",
+		fmt.Sprintf("Task #%d: %s", task.ID, task.Subject),
+		task.Description,
+		"</task_claim>",
+	}, "\n")
 }
 
 func validMessageTypeList() []string {

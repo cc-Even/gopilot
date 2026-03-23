@@ -22,4 +22,5 @@ var TEAM_AGENTS_TOOLS = map[string]struct{}{
 	"edit_file":    {},
 	"send_message": {},
 	"read_inbox":   {},
+	"list_team":    {},
 }

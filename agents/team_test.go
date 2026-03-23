@@ -2,6 +2,7 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,6 +157,124 @@ func TestTeammateManagerWakeReusesOriginalPrompt(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("wake prompt not received")
+	}
+}
+
+func TestTeammateManagerNextIdleEventPrefersInbox(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+	taskDir := filepath.Join(tempDir, ".tasks")
+
+	taskManager, err := NewTaskManager(taskDir)
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("claim me", "ready"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		TaskManager:  taskManager,
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+
+	manager.bus.Send("lead", "worker-1", "check inbox first", "message", nil)
+	message, err := manager.nextIdleEvent(agent)
+	if err != nil {
+		t.Fatalf("nextIdleEvent failed: %v", err)
+	}
+	if !strings.Contains(message, "<inbox>") || !strings.Contains(message, "check inbox first") {
+		t.Fatalf("expected inbox message, got %q", message)
+	}
+
+	taskJSON, err := taskManager.Get(0)
+	if err != nil {
+		t.Fatalf("get task failed: %v", err)
+	}
+	var task Task
+	if err := json.Unmarshal([]byte(taskJSON), &task); err != nil {
+		t.Fatalf("parse task failed: %v", err)
+	}
+	if task.Owner != "" || task.Status != "pending" {
+		t.Fatalf("inbox should not claim task yet, got %+v", task)
+	}
+}
+
+func TestTeammateManagerNextIdleEventClaimsTask(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+	taskDir := filepath.Join(tempDir, ".tasks")
+
+	taskManager, err := NewTaskManager(taskDir)
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+	if _, err := taskManager.Create("claim me", "ready"); err != nil {
+		t.Fatalf("create task failed: %v", err)
+	}
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		TaskManager:  taskManager,
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+
+	message, err := manager.nextIdleEvent(agent)
+	if err != nil {
+		t.Fatalf("nextIdleEvent failed: %v", err)
+	}
+	if !strings.Contains(message, "<task_claim>") || !strings.Contains(message, `"owner": "worker-1"`) {
+		t.Fatalf("expected claimed task payload, got %q", message)
+	}
+
+	taskJSON, err := taskManager.Get(0)
+	if err != nil {
+		t.Fatalf("get task failed: %v", err)
+	}
+	var task Task
+	if err := json.Unmarshal([]byte(taskJSON), &task); err != nil {
+		t.Fatalf("parse task failed: %v", err)
+	}
+	if task.Owner != "worker-1" || task.Status != "in_progress" {
+		t.Fatalf("expected claimed task persisted, got %+v", task)
+	}
+}
+
+func TestTeammateManagerWaitUntilIdleReturnsForIdleThreads(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	manager.Spawn("worker-1", "reviewer", "inspect core changes", "")
+
+	manager.mu.Lock()
+	manager.threads["worker-1"] = func() {}
+	member := manager.findMemberLocked("worker-1")
+	member.Status = teammateStatusIdle
+	manager.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := manager.WaitUntilIdle(ctx); err != nil {
+		t.Fatalf("WaitUntilIdle should return for idle teammate, got %v", err)
 	}
 }
 

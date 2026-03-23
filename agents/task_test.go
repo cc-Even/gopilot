@@ -176,6 +176,77 @@ func TestTaskManager(t *testing.T) {
 	})
 }
 
+func TestTaskManagerClaimNextAvailable(t *testing.T) {
+	tempDir := t.TempDir()
+	tm, err := NewTaskManager(tempDir)
+	if err != nil {
+		t.Fatalf("Failed to create TaskManager: %v", err)
+	}
+
+	if _, err := tm.Create("blocked", "should stay blocked"); err != nil {
+		t.Fatalf("create task 0 failed: %v", err)
+	}
+	if _, err := tm.Create("claim me", "ready to work"); err != nil {
+		t.Fatalf("create task 1 failed: %v", err)
+	}
+	if _, err := tm.Create("owned", "already assigned"); err != nil {
+		t.Fatalf("create task 2 failed: %v", err)
+	}
+
+	if _, err := tm.Update(1, "", []int{0}, nil); err != nil {
+		t.Fatalf("block task 1 failed: %v", err)
+	}
+
+	task2, err := tm.load(2)
+	if err != nil {
+		t.Fatalf("load task 2 failed: %v", err)
+	}
+	task2.Owner = "alice"
+	if err := tm.save(task2); err != nil {
+		t.Fatalf("save task 2 failed: %v", err)
+	}
+
+	claimed, err := tm.ClaimNextAvailable("worker-1")
+	if err != nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected a claimable task")
+	}
+	if claimed.ID != 0 {
+		t.Fatalf("expected task 0 to be claimed first, got %d", claimed.ID)
+	}
+	if claimed.Owner != "worker-1" {
+		t.Fatalf("expected owner worker-1, got %q", claimed.Owner)
+	}
+	if claimed.Status != "in_progress" {
+		t.Fatalf("expected claimed task to become in_progress, got %q", claimed.Status)
+	}
+
+	if _, err := tm.Update(0, "completed", nil, nil); err != nil {
+		t.Fatalf("complete task 0 failed: %v", err)
+	}
+
+	claimed, err = tm.ClaimNextAvailable("worker-2")
+	if err != nil {
+		t.Fatalf("second claim failed: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected task 1 to become claimable")
+	}
+	if claimed.ID != 1 {
+		t.Fatalf("expected task 1 after dependency cleared, got %d", claimed.ID)
+	}
+
+	claimed, err = tm.ClaimNextAvailable("worker-3")
+	if err != nil {
+		t.Fatalf("third claim failed: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no more claimable tasks, got %+v", claimed)
+	}
+}
+
 func TestTaskManagerHelpers(t *testing.T) {
 	t.Run("extractTaskID", func(t *testing.T) {
 		id := extractTaskID("task_123.json")

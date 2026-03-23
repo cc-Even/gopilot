@@ -17,28 +17,18 @@ func main() {
 		log.Println("Warning: No .env file found, using system environment variables")
 	}
 	WORKDIR, _ := os.Getwd()
-	//subAgent := agents.NewOpenAIAgent(
-	//	"file-agent",
-	//	"You are a file reader assistant, use the tools to read and list files.",
-	//	os.Getenv("MODEL"),
-	//	agents.WithDesc("a files reader and list agent"),
-	//	agents.WithToolList(agents.DefaultToolDefinitions()),
-	//)
-	sysPrompt := fmt.Sprintf(" You are a coding agent at  %s.", WORKDIR)
+	sysPrompt := fmt.Sprintf(" You are a coding agent at  %s. When you are free, check your message", WORKDIR)
 	agent := agents.NewOpenAIAgent(
 		"supervisor",
 		sysPrompt,
 		os.Getenv("MODEL"),
 		agents.WithToolList(agents.DefaultToolDefinitions()),
-		//agents.WithSubAgents(map[string]*agents.Agent{
-		//	subAgent.Name: subAgent,
-		//}),
 	)
 
 	msgs := []string{
-		"Spawn Alice (coder) and Bob (tester). Send Alice a message:  `tell Bob to report his role to me`, send Alice the exact words.",
-		"Broadcast \"status update: phase 1 complete\" to all teammates",
-		"Check the lead inbox for any messages",
+		"Create 3 tasks on the board, then spawn alice and bob. Watch them auto-claim.",
+		"Spawn a coder teammate and let it find work from the task board itself",
+		"Create tasks with dependencies. Watch teammates respect the blocked order.",
 	}
 
 	for _, msg := range msgs {

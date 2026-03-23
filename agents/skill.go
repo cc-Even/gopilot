@@ -637,3 +637,14 @@ func TaskGetTool(ctx context.Context, input string, agent *Agent) (string, error
 	log.Printf("[TaskGetTool] agent=%s Task retrieved successfully", agentLogName(agent))
 	return result, nil
 }
+
+func idleToolDefinition() ToolDefinition {
+	return ToolDefinition{
+		Name:        "idle",
+		Description: "Yield the current work loop and wait for inbox messages or an unclaimed task board item.",
+		Parameters:  ObjectSchema(map[string]any{}),
+		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
+			return "entering idle", nil
+		},
+	}
+}

@@ -170,6 +170,32 @@ func TestMaybeAutoCompact_WithMockSummary(t *testing.T) {
 	}
 }
 
+func TestInjectIdentityBlockIfCompacted(t *testing.T) {
+	agent := &Agent{
+		Name:         "worker-1",
+		Description:  "reviewer",
+		SystemPrompt: "inspect core changes",
+	}
+
+	compacted := []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage("[Conversation compressed. Transcript: /tmp/transcript.jsonl]\n\nsummary"),
+		openai.AssistantMessage("Understood. I have the context from the summary. Continuing."),
+	}
+
+	updated := agent.injectIdentityBlockIfCompacted(compacted)
+	if len(updated) != 3 {
+		t.Fatalf("expected identity block to be prepended, got %d messages", len(updated))
+	}
+
+	role, content := mustRoleAndContent(t, updated[0])
+	if role != "system" {
+		t.Fatalf("expected prepended system message, got %q", role)
+	}
+	if !strings.Contains(content, "<identity>") || !strings.Contains(content, "name=worker-1") || !strings.Contains(content, "instruction=inspect core changes") {
+		t.Fatalf("unexpected identity block: %q", content)
+	}
+}
+
 func mustRoleAndContent(t *testing.T, msg openai.ChatCompletionMessageParamUnion) (string, string) {
 	t.Helper()
 	raw, err := json.Marshal(msg)
