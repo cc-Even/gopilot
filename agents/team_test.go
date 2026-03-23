@@ -61,6 +61,114 @@ func TestMessageBusSendReadAndBroadcast(t *testing.T) {
 	}
 }
 
+func TestMessageBusPersistsUnreadAcrossRestart(t *testing.T) {
+	talkPath := filepath.Join(t.TempDir(), "talk.txt")
+
+	bus := NewMessageBus(talkPath)
+	result := bus.Send("alice", "bob", "persist me", "message", nil)
+	if !strings.Contains(result, "Sent message to bob") {
+		t.Fatalf("unexpected send result: %s", result)
+	}
+
+	restarted := NewMessageBus(talkPath)
+	messages := restarted.ReadInbox("bob")
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 persisted inbox message, got %d", len(messages))
+	}
+	if messages[0].From != "alice" || messages[0].Content != "persist me" {
+		t.Fatalf("unexpected persisted message: %+v", messages[0])
+	}
+
+	afterDrain := NewMessageBus(talkPath)
+	if drained := afterDrain.ReadInbox("bob"); len(drained) != 0 {
+		t.Fatalf("expected persisted inbox to drain, got %d messages", len(drained))
+	}
+}
+
+func TestMessageBusSendWaitsForInboxFileLock(t *testing.T) {
+	talkPath := filepath.Join(t.TempDir(), "talk.txt")
+	bus := NewMessageBus(talkPath)
+
+	lockedFile, err := os.OpenFile(bus.inboxPath("bob"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open inbox lock file failed: %v", err)
+	}
+	defer lockedFile.Close()
+	if err := lockFile(lockedFile); err != nil {
+		t.Fatalf("lock inbox file failed: %v", err)
+	}
+
+	done := make(chan string, 1)
+	go func() {
+		done <- bus.Send("alice", "bob", "wait for lock", "message", nil)
+	}()
+
+	select {
+	case result := <-done:
+		t.Fatalf("send should block on locked inbox file, got %s", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := unlockFile(lockedFile); err != nil {
+		t.Fatalf("unlock inbox file failed: %v", err)
+	}
+
+	select {
+	case result := <-done:
+		if !strings.Contains(result, "Sent message to bob") {
+			t.Fatalf("unexpected send result after unlock: %s", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("send did not resume after unlock")
+	}
+
+	messages := bus.ReadInbox("bob")
+	if len(messages) != 1 || messages[0].Content != "wait for lock" {
+		t.Fatalf("expected locked send message to persist, got %+v", messages)
+	}
+}
+
+func TestMessageBusReadWaitsForInboxFileLock(t *testing.T) {
+	talkPath := filepath.Join(t.TempDir(), "talk.txt")
+	bus := NewMessageBus(talkPath)
+	if result := bus.Send("alice", "bob", "block reader", "message", nil); !strings.Contains(result, "Sent message to bob") {
+		t.Fatalf("unexpected send result: %s", result)
+	}
+
+	lockedFile, err := os.OpenFile(bus.inboxPath("bob"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open inbox lock file failed: %v", err)
+	}
+	defer lockedFile.Close()
+	if err := lockFile(lockedFile); err != nil {
+		t.Fatalf("lock inbox file failed: %v", err)
+	}
+
+	done := make(chan []TeamMessage, 1)
+	go func() {
+		done <- bus.ReadInbox("bob")
+	}()
+
+	select {
+	case messages := <-done:
+		t.Fatalf("read should block on locked inbox file, got %+v", messages)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := unlockFile(lockedFile); err != nil {
+		t.Fatalf("unlock inbox file failed: %v", err)
+	}
+
+	select {
+	case messages := <-done:
+		if len(messages) != 1 || messages[0].Content != "block reader" {
+			t.Fatalf("unexpected read result after unlock: %+v", messages)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read did not resume after unlock")
+	}
+}
+
 func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 	tempDir := t.TempDir()
 	teamDir := filepath.Join(tempDir, ".teams")
@@ -302,6 +410,73 @@ func TestSendMessageToolAllowsSupervisorAndLeadReadsInbox(t *testing.T) {
 		defer manager.mu.Unlock()
 		return len(manager.threads) == 0
 	})
+}
+
+func TestLeadInboxSurvivesManagerRestart(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	manager.mu.Lock()
+	stopRunner := manager.threads["worker-1"]
+	manager.mu.Unlock()
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+
+	worker := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+	sendResult, err := sendMessageTool(context.Background(), json.RawMessage(`{"to":"lead","content":"survives restart"}`), worker)
+	if err != nil {
+		t.Fatalf("sendMessageTool failed: %v", err)
+	}
+	if !strings.Contains(sendResult, "Sent message to lead") {
+		t.Fatalf("unexpected send result: %s", sendResult)
+	}
+
+	restartedLead := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+	restartedManager := NewTeammateManager(teamDir, restartedLead)
+	restartedLead.TeamManager = restartedManager
+
+	messages := []openai.ChatCompletionMessageParamUnion{openai.UserMessage("continue")}
+	updated := restartedLead.appendTeamInboxMessages(messages)
+	if len(updated) != len(messages)+1 {
+		t.Fatalf("expected restarted lead to receive persisted inbox message, got %d messages", len(updated))
+	}
+	_, content, err := messageRoleAndContent(updated[len(updated)-1])
+	if err != nil {
+		t.Fatalf("read persisted inbox payload failed: %v", err)
+	}
+	if !strings.Contains(content, "survives restart") {
+		t.Fatalf("unexpected persisted inbox content: %q", content)
+	}
 }
 
 func TestTeammateManagerNextIdleEventPrefersInbox(t *testing.T) {

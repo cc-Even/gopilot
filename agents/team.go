@@ -1,9 +1,11 @@
 package agents
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -36,45 +38,66 @@ type TeamMessage struct {
 }
 
 type MessageBus struct {
-	mu      sync.RWMutex
-	inboxes map[string]chan TeamMessage
-	buffer  int
-	logMu   sync.Mutex
-	logPath string
+	mu       sync.Mutex
+	logMu    sync.Mutex
+	logPath  string
+	inboxDir string
 }
 
 func NewMessageBus(logPath string) *MessageBus {
 	if strings.TrimSpace(logPath) == "" {
 		logPath = TALK_LOG_PATH
 	}
+	inboxDir := filepath.Join(filepath.Dir(logPath), "inboxes")
+	_ = os.MkdirAll(inboxDir, 0o755)
 	return &MessageBus{
-		inboxes: make(map[string]chan TeamMessage),
-		buffer:  64,
-		logPath: logPath,
+		logPath:  logPath,
+		inboxDir: inboxDir,
 	}
 }
 
-func (b *MessageBus) inbox(name string) chan TeamMessage {
-	b.mu.RLock()
-	inbox := b.inboxes[name]
-	b.mu.RUnlock()
-	if inbox != nil {
-		return inbox
+func (b *MessageBus) inboxPath(name string) string {
+	if b == nil {
+		return ""
 	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if inbox = b.inboxes[name]; inbox == nil {
-		inbox = make(chan TeamMessage, b.buffer)
-		b.inboxes[name] = inbox
+	clean := strings.TrimSpace(name)
+	if clean == "" {
+		clean = "unknown"
 	}
-	return inbox
+	replacer := strings.NewReplacer("/", "_", "\\", "_", "..", "_", " ", "_")
+	clean = replacer.Replace(clean)
+	return filepath.Join(b.inboxDir, clean+".jsonl")
 }
 
-func (b *MessageBus) peekInbox(name string) chan TeamMessage {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.inboxes[name]
+func (b *MessageBus) appendInboxMessage(name string, msg TeamMessage) error {
+	if b == nil {
+		return fmt.Errorf("message bus not initialized")
+	}
+	if err := os.MkdirAll(b.inboxDir, 0o755); err != nil {
+		return err
+	}
+
+	encoded, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(b.inboxPath(name), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := lockFile(file); err != nil {
+		return err
+	}
+	defer func() {
+		if err := unlockFile(file); err != nil {
+			log.Printf("[MessageBus] failed to unlock inbox file %q: %v", file.Name(), err)
+		}
+	}()
+
+	_, err = file.Write(append(encoded, '\n'))
+	return err
 }
 
 func (b *MessageBus) Send(sender, to, content, msgType string, extra map[string]any) string {
@@ -97,16 +120,16 @@ func (b *MessageBus) Send(sender, to, content, msgType string, extra map[string]
 		Timestamp: float64(now.UnixNano()) / float64(time.Second),
 	}
 
-	inbox := b.inbox(to)
-	select {
-	case inbox <- msg:
-		if err := b.appendTalkLog(now, sender, to, content); err != nil {
-			log.Printf("[MessageBus] failed to append talk log: %v", err)
-		}
-		return fmt.Sprintf("Sent %s to %s", msgType, to)
-	default:
-		return fmt.Sprintf("Error: inbox for %q is full", to)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if err := b.appendInboxMessage(to, msg); err != nil {
+		return fmt.Sprintf("Error: persist inbox for %q failed: %v", to, err)
 	}
+	if err := b.appendTalkLog(now, sender, to, content); err != nil {
+		log.Printf("[MessageBus] failed to append talk log: %v", err)
+	}
+	return fmt.Sprintf("Sent %s to %s", msgType, to)
 }
 
 func (b *MessageBus) appendTalkLog(ts time.Time, sender, receiver, content string) error {
@@ -122,11 +145,19 @@ func (b *MessageBus) appendTalkLog(ts time.Time, sender, receiver, content strin
 	b.logMu.Lock()
 	defer b.logMu.Unlock()
 
-	file, err := os.OpenFile(b.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(b.logPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	if err := lockFile(file); err != nil {
+		return err
+	}
+	defer func() {
+		if err := unlockFile(file); err != nil {
+			log.Printf("[MessageBus] failed to unlock talk log %q: %v", file.Name(), err)
+		}
+	}()
 
 	line := fmt.Sprintf("%s\tfrom=%s\tto=%s\tcontent=%s\n", ts.Format(time.RFC3339Nano), sender, receiver, string(encodedContent))
 	_, err = file.WriteString(line)
@@ -138,20 +169,69 @@ func (b *MessageBus) ReadInbox(name string) []TeamMessage {
 		return nil
 	}
 
-	inbox := b.peekInbox(name)
-	if inbox == nil {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	path := b.inboxPath(name)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		log.Printf("[MessageBus] failed to read inbox %q: %v", name, err)
+		return nil
+	}
+	defer file.Close()
+	if err := lockFile(file); err != nil {
+		log.Printf("[MessageBus] failed to lock inbox %q: %v", name, err)
+		return nil
+	}
+	defer func() {
+		if err := unlockFile(file); err != nil {
+			log.Printf("[MessageBus] failed to unlock inbox %q: %v", name, err)
+		}
+	}()
+
+	if _, err := file.Seek(0, 0); err != nil {
+		log.Printf("[MessageBus] failed to rewind inbox %q before read: %v", name, err)
+		return nil
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		log.Printf("[MessageBus] failed to read inbox %q: %v", name, err)
+		return nil
+	}
+	if len(raw) == 0 {
 		return nil
 	}
 
 	messages := make([]TeamMessage, 0)
-	for {
-		select {
-		case msg := <-inbox:
-			messages = append(messages, msg)
-		default:
-			return messages
+	scanner := bufio.NewScanner(strings.NewReader(string(raw)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
 		}
+		var msg TeamMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			log.Printf("[MessageBus] failed to decode inbox message for %q: %v", name, err)
+			continue
+		}
+		messages = append(messages, msg)
 	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[MessageBus] failed to scan inbox %q: %v", name, err)
+		return nil
+	}
+	if err := file.Truncate(0); err != nil {
+		log.Printf("[MessageBus] failed to truncate inbox %q: %v", name, err)
+		return nil
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		log.Printf("[MessageBus] failed to rewind inbox %q: %v", name, err)
+		return nil
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+	return messages
 }
 
 func (b *MessageBus) Broadcast(sender, content string, teammates []string) string {
