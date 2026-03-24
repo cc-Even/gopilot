@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -61,6 +62,7 @@ type Agent struct {
 	BaseUrl         string
 	ApiKey          string
 	Model           string
+	InheritModel    bool
 	WorkDir         string
 	SubAgents       map[string]*Agent
 	SkillLoader     *SkillLoader
@@ -182,8 +184,15 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 		return order
 	}
 
+	names := make([]string, 0, len(subAgents))
+	for subName := range subAgents {
+		names = append(names, subName)
+	}
+	sort.Strings(names)
+
 	agentListDesc := make([]map[string]string, 0, len(subAgents))
-	for subName, subAgent := range subAgents {
+	for _, subName := range names {
+		subAgent := subAgents[subName]
 		agentDesc := make(map[string]string)
 		agentDesc["name"] = subName
 		agentDesc["description"] = subAgent.Description
@@ -217,8 +226,15 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 			if !ok {
 				return "", fmt.Errorf("unknown sub-agent: %s", params.SubAgentName)
 			}
-			result, err := subAgent.Run(ctx, []openai.ChatCompletionMessageParamUnion{
-				openai.SystemMessage(subAgent.SystemPrompt),
+			runner := subAgent.cloneWithTools(subAgent.SystemPrompt, nil)
+			if runner == nil {
+				return "", fmt.Errorf("failed to clone sub-agent: %s", params.SubAgentName)
+			}
+			if runner.InheritModel {
+				runner.Model = agent.Model
+			}
+			result, err := runner.Run(ctx, []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage(runner.SystemPrompt),
 				openai.UserMessage(params.Input),
 			})
 			return result, err

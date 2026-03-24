@@ -22,6 +22,8 @@ var TASK_DIR = filepath.Join(STATE_DIR, "tasks")
 
 var SKILL_DIR = filepath.Join(TOOLDIR, "skills")
 
+var SUBAGENT_DIR = filepath.Join(TOOLDIR, "subagents")
+
 var TEAM_DIR = filepath.Join(STATE_DIR, "teams")
 
 var WORKTREE_DIR = filepath.Join(STATE_DIR, "worktrees")

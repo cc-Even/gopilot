@@ -39,17 +39,18 @@ var (
 )
 
 type cliSession struct {
-	app          *tview.Application
-	output       *tview.TextView
-	logs         *tview.TextView
-	updateHeader func()
-	envFile      string
-	skillLoader  *agents.SkillLoader
-	systemPrompt string
-	agent        *agents.Agent
-	history      []openai.ChatCompletionMessageParamUnion
-	running      bool
-	runCancel    context.CancelFunc
+	app            *tview.Application
+	output         *tview.TextView
+	logs           *tview.TextView
+	updateHeader   func()
+	envFile        string
+	skillLoader    *agents.SkillLoader
+	subAgentLoader *agents.SubAgentLoader
+	systemPrompt   string
+	agent          *agents.Agent
+	history        []openai.ChatCompletionMessageParamUnion
+	running        bool
+	runCancel      context.CancelFunc
 }
 
 func main() {
@@ -164,16 +165,18 @@ func main() {
 
 func newCLISession(app *tview.Application, output *tview.TextView, logs *tview.TextView, updateHeader func(), envFile string) *cliSession {
 	skillLoader := agents.NewSkillLoader(agents.SKILL_DIR)
-	systemPrompt := buildSystemPrompt(skillLoader)
+	subAgentLoader := agents.NewSubAgentLoader(agents.SUBAGENT_DIR)
+	systemPrompt := buildSystemPrompt(skillLoader, subAgentLoader)
 
 	session := &cliSession{
-		app:          app,
-		output:       output,
-		logs:         logs,
-		updateHeader: updateHeader,
-		envFile:      envFile,
-		skillLoader:  skillLoader,
-		systemPrompt: systemPrompt,
+		app:            app,
+		output:         output,
+		logs:           logs,
+		updateHeader:   updateHeader,
+		envFile:        envFile,
+		skillLoader:    skillLoader,
+		subAgentLoader: subAgentLoader,
+		systemPrompt:   systemPrompt,
 	}
 	session.resetConversation()
 	return session
@@ -330,11 +333,13 @@ func (s *cliSession) resetConversation() {
 
 func (s *cliSession) rebuildAgent() {
 	currentModel = getenvOrDefault("MODEL", "gpt-4o-mini")
+	subAgents := s.subAgentLoader.BuildAgents(currentModel, agents.DefaultToolDefinitions(), s.skillLoader)
 	s.agent = agents.NewOpenAIAgent(
 		"supervisor",
 		s.systemPrompt,
 		currentModel,
 		agents.WithToolList(agents.DefaultToolDefinitions()),
+		agents.WithSubAgents(subAgents),
 		agents.WithSkillLoader(s.skillLoader),
 	)
 	s.agent.SetStageOutputReporter(func(stage, content string) {
@@ -376,14 +381,15 @@ func (s *cliSession) clearViews() {
 	}
 }
 
-func buildSystemPrompt(skillLoader *agents.SkillLoader) string {
+func buildSystemPrompt(skillLoader *agents.SkillLoader, subAgentLoader *agents.SubAgentLoader) string {
 	return fmt.Sprintf("You are a coding agent at %s. Use tools to solve tasks and summarize results. ", agents.WORKDIR) +
 		"The runtime may invoke you in planner or executor stage; obey the current stage instructions exactly. " +
 		"For complex tasks, use the task board to keep the plan and execution state explicit. " +
 		"When you spawn a teammate, capture the returned run_id. If later steps depend on that teammate's work, call wait_teammate with the run_id before continuing or giving a final answer. Do not assume background teammates finish before you do. " +
 		"After wait_teammate returns, inspect the returned run status and any inbox report, then decide the next step. " +
 		"Use TodoWrite for short checklists. " +
-		fmt.Sprintf("Skills: %s", skillLoader.GetDescriptions())
+		fmt.Sprintf("Skills: %s. ", skillLoader.GetDescriptions()) +
+		fmt.Sprintf("Sub-agents: %s", subAgentLoader.GetDescriptions())
 }
 
 func detectEnvFile() string {
