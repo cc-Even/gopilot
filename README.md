@@ -1,0 +1,130 @@
+# 🚀 Gopilot
+
+> A terminal-first coding copilot built in Go, featuring task management, AI teammates, skills, and git worktrees.
+
+Gopilot 是一个专为真实开发工作流打造的终端 AI 助手。它不仅仅是一个简单的问答工具，而是能够真正帮你**拆分任务、执行代码、跟踪进度并完成收尾**，完美契合开发者的日常工作节奏。
+
+与传统的单轮对话 CLI 不同，Gopilot 将**任务看板、多 Agent 协作、技能扩展、后台命令执行以及 Git Worktree 管理**无缝整合到了同一个终端界面中。我们的目标是：让代码任务从“描述需求”到“组织执行”，都能在一个地方高效完成。
+
+## ✨ Why Gopilot?
+
+- **💻 Terminal-first**: 原生运行在终端中，完美融入你的本地仓库和日常编码心流。
+- **🔄 Multi-step execution**: 采用 Planner / Executor 双阶段执行模式，告别一次性回答，真正解决复杂问题。
+- **🛠 Built for coding workflows**: 内置任务看板、Teammate 消息机制、后台任务管理和 Worktree 隔离。
+- **🧩 Extensible by skills**: 通过 `skills/` 目录轻松扩展特定场景的 AI 能力。
+- **⚡ Implemented in Go**: 编译为单一二进制文件，部署极简，非常适合作为本地工具使用。
+
+## 🌟 Features
+
+- 🤖 **交互式编码代理**: 基于 OpenAI Chat Completions 打造。
+- 🖥️ **现代化 TUI 界面**: 清晰的输出区、日志区和命令输入区。
+- 📋 **强大的任务管理**: 支持任务的创建、查询、依赖关系处理及状态流转。
+- 🤝 **Teammate 协作**: 任务派发、状态等待、消息回传与自动收尾。
+- 🌳 **Git Worktree 管理**: 为每个任务分配隔离的工作目录，互不干扰。
+- ⚙️ **后台命令执行**: 支持后台运行命令并轮询执行结果。
+- 🎯 **Skills 扩展机制**: 支持按主题加载自定义扩展能力。
+- 🧪 **高可靠性**: 核心行为均有 Go 单元测试覆盖。
+
+## 🚀 Quick Start
+
+### 1. Requirements
+
+- Go `1.25` 或更高版本
+- Git
+- 一个可用的 OpenAI API Key
+- 操作系统：Linux / macOS / Windows
+
+### 2. Configuration
+
+复制环境变量模板并填入你的配置：
+
+```bash
+cp .env.example setting.env
+```
+
+编辑 `setting.env`：
+
+```dotenv
+OPENAI_API_KEY=your_api_key_here
+MODEL=gpt-4o-mini
+# 可选：自定义 OpenAI 兼容接口地址
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+### 3. Build & Run
+
+编译并运行：
+
+```bash
+make build
+./gopilot
+```
+
+或者直接使用快捷命令：
+
+```bash
+make run
+```
+
+## ⌨️ Command Reference
+
+启动 Gopilot 后，你可以直接输入自然语言描述你的任务。此外，还支持以下内置命令：
+
+- `/model <name>`：切换当前使用的模型，并自动保存到环境文件中。
+- `/tasks`：查看当前的任务看板。
+- `/team`：查看 Teammate 的工作状态。
+- `/stop`：中断当前主 Agent 的任务。
+- `/clear`：清空界面并重置当前会话。
+- `Ctrl+C`：退出程序。
+
+## ⚙️ Configuration Details
+
+程序启动时，会在可执行文件所在目录按以下顺序查找并加载环境文件：
+
+1. `.env`
+2. `setting.env`
+
+**核心配置项：**
+- `OPENAI_API_KEY`：你的 OpenAI API 密钥。
+- `MODEL`：默认使用的模型名称（未设置时默认为 `gpt-4o-mini`）。
+- `OPENAI_BASE_URL`：（可选）自定义的 OpenAI 兼容接口地址。
+
+> **💡 提示**：当前的技能目录和环境文件都是基于“可执行文件所在目录”进行解析的。因此，相比于直接使用 `go run .`，我们更推荐先 `make build` 编译后再运行二进制文件。
+
+## 📁 Project Layout
+
+```text
+.
+├── main.go                 # TUI 入口文件
+├── pkg/agents/             # Agent、任务、Team、Worktree 及 Skills 的核心实现
+├── pkg/version/            # 版本信息注入
+├── skills/                 # 内置技能目录
+├── Makefile                # 构建与测试脚本
+├── .env.example            # 环境变量配置模板
+└── .github/workflows/      # CI/CD 工作流配置
+```
+
+## 🛠️ Development
+
+日常开发常用命令：
+
+```bash
+make build  # 编译项目
+make test   # 运行单元测试
+make clean  # 清理构建产物
+```
+
+本项目已配置基础的 GitHub Actions CI，会在 `push` 和 `pull_request` 时自动执行构建和测试。
+
+## 🗺️ Roadmap
+
+当前版本已具备强大的本地开发辅助能力，未来我们将继续在以下方向进行演进：
+
+- [ ] 更完善的模型和 Provider 配置能力
+- [ ] 提供更正式的安装方式与预编译发布产物
+- [ ] 打造更丰富的 Skills 技能生态
+- [ ] 实现更细致的会话状态管理和恢复机制
+
+## 📝 License
+
+This project is licensed under the MIT License. See the `LICENSE` file for details.

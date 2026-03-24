@@ -280,6 +280,9 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 
 	// 处理 BaseUrl 默认值
 	baseURL := agentOpts.BaseUrl
+	if baseURL == "" {
+		baseURL = os.Getenv("OPENAI_BASE_URL")
+	}
 
 	// 构建 OpenAI 客户端选项
 	opts := []option.RequestOption{option.WithAPIKey(apiKey)}
