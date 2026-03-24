@@ -74,6 +74,8 @@ type Agent struct {
 	order  []string
 
 	autoCompactSummarizer func(context.Context, string) (string, error)
+	runLoopOverride       func(*Agent, context.Context, []openai.ChatCompletionMessageParamUnion) (string, error)
+	stageOutputReporter   func(stage, content string)
 }
 
 type AgentOptions struct {
@@ -97,6 +99,14 @@ const (
 	autoCompactSummaryMaxChar = 80000
 	autoCompactSummaryTokens  = 2000
 )
+
+var plannerToolAllowlist = map[string]struct{}{
+	"todo":        {},
+	"task_create": {},
+	"task_update": {},
+	"task_list":   {},
+	"task_get":    {},
+}
 
 func WithDesc(desc string) AgentOption {
 	return func(o *AgentOptions) {
@@ -132,6 +142,13 @@ func WithSkillLoader(skillLoader *SkillLoader) AgentOption {
 	return func(o *AgentOptions) {
 		o.SkillLoader = skillLoader
 	}
+}
+
+func (a *Agent) SetStageOutputReporter(reporter func(stage, content string)) {
+	if a == nil {
+		return
+	}
+	a.stageOutputReporter = reporter
 }
 
 func registerLoadSkillTool(toolMap map[string]ToolDefinition, order []string, skillLoader *SkillLoader) []string {
@@ -329,6 +346,35 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 }
 
 func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+	return a.runLoop(ctx, messages)
+}
+
+func (a *Agent) RunStructured(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+	planner := a.cloneWithTools(a.plannerSystemPrompt(), plannerToolAllowlist)
+	plannerMessages := applySystemPrompt(messages, planner.SystemPrompt)
+	plannerMessages = append(plannerMessages, openai.UserMessage(a.plannerContextMessage()))
+
+	plan, err := planner.runLoop(ctx, plannerMessages)
+	if err != nil {
+		return "", fmt.Errorf("planner stage failed: %w", err)
+	}
+	a.reportStageOutput("planner", plan)
+
+	executor := a.cloneWithTools(a.executorSystemPrompt(), nil)
+	executorMessages := applySystemPrompt(messages, executor.SystemPrompt)
+	executorMessages = append(executorMessages, openai.UserMessage(a.executorContextMessage(plan)))
+
+	result, err := executor.runLoop(ctx, executorMessages)
+	if err != nil {
+		return "", fmt.Errorf("executor stage failed: %w", err)
+	}
+	return result, nil
+}
+
+func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+	if a != nil && a.runLoopOverride != nil {
+		return a.runLoopOverride(a, ctx, messages)
+	}
 
 	const maxTurns = 40
 	roundsSinceTodo := 0
@@ -424,6 +470,160 @@ func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessage
 	}
 
 	return "", fmt.Errorf("max turns reached without final answer")
+}
+
+func (a *Agent) cloneWithTools(systemPrompt string, allowlist map[string]struct{}) *Agent {
+	if a == nil {
+		return nil
+	}
+
+	clone := *a
+	clone.SystemPrompt = systemPrompt
+	clone.tools = make(map[string]ToolDefinition)
+	clone.order = make([]string, 0, len(a.order))
+	for _, name := range a.order {
+		if allowlist != nil {
+			if _, ok := allowlist[name]; !ok {
+				continue
+			}
+		}
+		t, ok := a.tools[name]
+		if !ok {
+			continue
+		}
+		clone.tools[name] = t
+		clone.order = append(clone.order, name)
+	}
+	return &clone
+}
+
+func (a *Agent) reportStageOutput(stage, content string) {
+	if a == nil || a.stageOutputReporter == nil {
+		return
+	}
+	a.stageOutputReporter(stage, content)
+}
+
+func (a *Agent) plannerSystemPrompt() string {
+	rules := strings.Join([]string{
+		"You are in Planner stage.",
+		"Your only job in this stage is to produce or update the execution plan.",
+		"Only use todo and task tools. Do not edit files, run shell commands, create worktrees, or delegate work.",
+		"Prefer task_list/task_get before creating or updating tasks so you reuse the current board when possible.",
+		"When the plan is ready, return a concise ordered plan and clearly identify the current unfinished task.",
+	}, " ")
+	return appendPromptSection(a.SystemPrompt, rules)
+}
+
+func (a *Agent) executorSystemPrompt() string {
+	rules := strings.Join([]string{
+		"You are in Executor stage.",
+		"The planner stage has already produced the task list. Use it as the source of truth unless execution proves it is stale or blocked.",
+		"Work through the current unfinished tasks in order, one task at a time.",
+		"Keep todo/task status aligned with real progress, and only re-plan when blocked by new information.",
+	}, " ")
+	return appendPromptSection(a.SystemPrompt, rules)
+}
+
+func appendPromptSection(basePrompt, rules string) string {
+	basePrompt = strings.TrimSpace(basePrompt)
+	rules = strings.TrimSpace(rules)
+	switch {
+	case basePrompt == "":
+		return rules
+	case rules == "":
+		return basePrompt
+	default:
+		return basePrompt + "\n\n" + rules
+	}
+}
+
+func applySystemPrompt(messages []openai.ChatCompletionMessageParamUnion, systemPrompt string) []openai.ChatCompletionMessageParamUnion {
+	updated := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages)+1)
+	replaced := false
+	for _, message := range messages {
+		role, _, err := messageRoleAndContent(message)
+		if !replaced && err == nil && role == "system" {
+			updated = append(updated, openai.SystemMessage(systemPrompt))
+			replaced = true
+			continue
+		}
+		updated = append(updated, message)
+	}
+	if replaced {
+		return updated
+	}
+	return append([]openai.ChatCompletionMessageParamUnion{openai.SystemMessage(systemPrompt)}, updated...)
+}
+
+func (a *Agent) plannerContextMessage() string {
+	lines := []string{
+		"<planning_rule>",
+		"Create or refresh the execution plan before any implementation work starts.",
+		"Use the available todo/task tools to capture the plan.",
+		"</planning_rule>",
+		"<current_task_board>",
+		a.currentTaskBoardSummary(),
+		"</current_task_board>",
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (a *Agent) executorContextMessage(plan string) string {
+	lines := []string{
+		"<planner_output>",
+		strings.TrimSpace(plan),
+		"</planner_output>",
+		"<current_task_board>",
+		a.currentTaskBoardSummary(),
+		"</current_task_board>",
+		"<unfinished_tasks>",
+		a.unfinishedTaskSummary(),
+		"</unfinished_tasks>",
+		"<execution_rule>",
+		"Start from the first unfinished task above and complete tasks sequentially.",
+		"If a task is blocked, explain the blocker and update the task state before moving on.",
+		"</execution_rule>",
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (a *Agent) currentTaskBoardSummary() string {
+	if a == nil || a.TaskManager == nil {
+		return "Task board unavailable."
+	}
+	result, err := a.TaskManager.ListAll()
+	if err != nil {
+		return "Task board unavailable: " + err.Error()
+	}
+	return strings.TrimSpace(result)
+}
+
+func (a *Agent) unfinishedTaskSummary() string {
+	if a == nil || a.TaskManager == nil {
+		return "No task manager."
+	}
+
+	tasks, err := a.TaskManager.Snapshot()
+	if err != nil {
+		return "Unable to load unfinished tasks: " + err.Error()
+	}
+
+	lines := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		if task == nil || task.Status == taskStatusCompleted {
+			continue
+		}
+		line := fmt.Sprintf("#%d [%s] %s", task.ID, task.Status, task.Subject)
+		if len(task.BlockedBy) > 0 {
+			line += fmt.Sprintf(" blocked_by=%v", task.BlockedBy)
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) == 0 {
+		return "No unfinished tasks."
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (a *Agent) stageBackgroundNotifications(messages []openai.ChatCompletionMessageParamUnion, acks *turnEventAcks) []openai.ChatCompletionMessageParamUnion {

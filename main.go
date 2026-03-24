@@ -204,7 +204,7 @@ func (s *cliSession) handleInput(input string) {
 	s.runCancel = cancel
 
 	go func(snapshot []openai.ChatCompletionMessageParamUnion, activeAgent *agents.Agent) {
-		response, err := activeAgent.Run(runCtx, snapshot)
+		response, err := activeAgent.RunStructured(runCtx, snapshot)
 		s.app.QueueUpdateDraw(func() {
 			defer func() {
 				s.running = false
@@ -337,6 +337,17 @@ func (s *cliSession) rebuildAgent() {
 		agents.WithToolList(agents.DefaultToolDefinitions()),
 		agents.WithSkillLoader(s.skillLoader),
 	)
+	s.agent.SetStageOutputReporter(func(stage, content string) {
+		s.app.QueueUpdateDraw(func() {
+			switch stage {
+			case "planner":
+				s.appendLine("[yellow]Planner:[white] %s", tview.Escape(content))
+			default:
+				s.appendLine("[yellow]%s:[white] %s", tview.Escape(stage), tview.Escape(content))
+			}
+			s.output.ScrollToEnd()
+		})
+	})
 	currentDir = s.agent.WorkDir
 	s.updateHeader()
 }
@@ -367,9 +378,10 @@ func (s *cliSession) clearViews() {
 
 func buildSystemPrompt(skillLoader *agents.SkillLoader) string {
 	return fmt.Sprintf("You are a coding agent at %s. Use tools to solve tasks and summarize results. ", agents.WORKDIR) +
-		"For complex tasks, first plan, then create multiple subtasks based on the plan. Finally, create teammates to complete the task together." +
-		"When you spawn a teammate, capture the returned run_id. If later steps depend on that teammate's work, call wait_teammate with the run_id before continuing or giving a final answer. Do not assume background teammates finish before you do." +
-		"After wait_teammate returns, inspect the returned run status and any inbox report, then decide the next step." +
+		"The runtime may invoke you in planner or executor stage; obey the current stage instructions exactly. " +
+		"For complex tasks, use the task board to keep the plan and execution state explicit. " +
+		"When you spawn a teammate, capture the returned run_id. If later steps depend on that teammate's work, call wait_teammate with the run_id before continuing or giving a final answer. Do not assume background teammates finish before you do. " +
+		"After wait_teammate returns, inspect the returned run status and any inbox report, then decide the next step. " +
 		"Use TodoWrite for short checklists. " +
 		fmt.Sprintf("Skills: %s", skillLoader.GetDescriptions())
 }
