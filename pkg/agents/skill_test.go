@@ -146,6 +146,14 @@ func TestDefaultToolDefinitionsUseStrictObjectSchemas(t *testing.T) {
 		t.Fatalf("read_file additionalProperties = %v, want false", readSchema["additionalProperties"])
 	}
 
+	readFilesSchema := toolByName["read_files"].Parameters
+	if readFilesSchema["type"] != "object" {
+		t.Fatalf("read_files schema type = %v, want object", readFilesSchema["type"])
+	}
+	if readFilesSchema["additionalProperties"] != false {
+		t.Fatalf("read_files additionalProperties = %v, want false", readFilesSchema["additionalProperties"])
+	}
+
 	taskUpdateSchema := toolByName["task_update"].Parameters
 	properties, ok := taskUpdateSchema["properties"].(map[string]any)
 	if !ok {
@@ -167,5 +175,85 @@ func TestDefaultToolDefinitionsUseStrictObjectSchemas(t *testing.T) {
 		if enumValues[i] != want[i] {
 			t.Fatalf("task_update status enum[%d] = %q, want %q", i, enumValues[i], want[i])
 		}
+	}
+}
+
+func TestBatchReadFileToolReturnsRemainingRequestsWhenBudgetExceeded(t *testing.T) {
+	root := t.TempDir()
+	firstPath := filepath.Join(root, "first.txt")
+	secondPath := filepath.Join(root, "second.txt")
+	if err := os.WriteFile(firstPath, []byte("line1\nline2\nline3"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondPath, []byte("alpha\nbeta\ngamma"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := BatchReadFileTool{}
+	output, err := tool.Call(context.Background(), `{
+		"files": [
+			{"path":"first.txt"},
+			{"path":"second.txt"}
+		],
+		"max_chars": 11
+	}`, &Agent{WorkDir: root})
+	if err != nil {
+		t.Fatalf("read_files failed: %v", err)
+	}
+
+	var response batchReadFileResponse
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if response.Completed {
+		t.Fatalf("expected incomplete response when budget exceeded")
+	}
+	if len(response.Files) != 1 {
+		t.Fatalf("expected 1 file result, got %d", len(response.Files))
+	}
+	if !response.Files[0].BudgetTruncated {
+		t.Fatalf("expected first file to be budget truncated")
+	}
+	if response.Files[0].EndLine != 2 {
+		t.Fatalf("expected first file end_line=2, got %d", response.Files[0].EndLine)
+	}
+	if len(response.Remaining) != 2 {
+		t.Fatalf("expected 2 remaining requests, got %d", len(response.Remaining))
+	}
+	if response.Remaining[0].Path != "first.txt" || response.Remaining[0].StartLine != 3 {
+		t.Fatalf("unexpected first remaining request: %+v", response.Remaining[0])
+	}
+	if response.Remaining[1].Path != "second.txt" || response.Remaining[1].StartLine != 1 {
+		t.Fatalf("unexpected second remaining request: %+v", response.Remaining[1])
+	}
+}
+
+func TestBatchReadFileToolPreservesRemainingLineLimit(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(path, []byte("a\nb\nc\nd"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := BatchReadFileTool{}
+	output, err := tool.Call(context.Background(), `{
+		"files": [
+			{"path":"file.txt","limit":3}
+		],
+		"max_chars": 3
+	}`, &Agent{WorkDir: root})
+	if err != nil {
+		t.Fatalf("read_files failed: %v", err)
+	}
+
+	var response batchReadFileResponse
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if len(response.Remaining) != 1 {
+		t.Fatalf("expected 1 remaining request, got %d", len(response.Remaining))
+	}
+	if response.Remaining[0].StartLine != 3 || response.Remaining[0].Limit != 1 {
+		t.Fatalf("unexpected remaining request after partial limited read: %+v", response.Remaining[0])
 	}
 }

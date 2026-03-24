@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 type Skill struct {
@@ -178,8 +179,14 @@ type BashTool struct{}
 type BackgroundRunTool struct{}
 type BackgroundCheckTool struct{}
 type ReadFileTool struct{}
+type BatchReadFileTool struct{}
 type WriteFileTool struct{}
 type EditFileTool struct{}
+
+const (
+	maxReadOutputChars       = 50000
+	defaultBatchReadMaxChars = 40000
+)
 
 func StringParam() map[string]any {
 	return map[string]any{"type": "string"}
@@ -219,6 +226,7 @@ func DefaultToolDefinitions() []ToolDefinition {
 	backgroundRun := BackgroundRunTool{}
 	backgroundCheck := BackgroundCheckTool{}
 	read := ReadFileTool{}
+	batchRead := BatchReadFileTool{}
 	write := WriteFileTool{}
 	edit := EditFileTool{}
 
@@ -248,6 +256,23 @@ func DefaultToolDefinitions() []ToolDefinition {
 			read.Description(),
 			ObjectSchema(map[string]any{"path": NonEmptyStringParam(), "limit": IntegerParam()}, "path"),
 			read.Call,
+		),
+		ToolFromJSONString(
+			batchRead.Name(),
+			batchRead.Description(),
+			ObjectSchema(map[string]any{
+				"files": map[string]any{
+					"type": "array",
+					"items": ObjectSchema(map[string]any{
+						"path":       NonEmptyStringParam(),
+						"start_line": IntegerParam(),
+						"limit":      IntegerParam(),
+					}, "path"),
+					"minItems": 1,
+				},
+				"max_chars": IntegerParam(),
+			}, "files"),
+			batchRead.Call,
 		),
 		ToolFromJSONString(
 			write.Name(),
@@ -415,10 +440,96 @@ func RunRead(baseDir, path string, limit int) string {
 		lines = append(lines[:limit], fmt.Sprintf("... (%d more lines)", len(lines)-limit))
 	}
 	result := strings.Join(lines, "\n")
-	if len(result) > 50000 {
-		return result[:50000]
+	if len(result) > maxReadOutputChars {
+		return result[:maxReadOutputChars]
 	}
 	return result
+}
+
+type batchReadFileRequest struct {
+	Path      string `json:"path"`
+	StartLine int    `json:"start_line,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+}
+
+type batchReadFileResult struct {
+	Path             string `json:"path"`
+	StartLine        int    `json:"start_line"`
+	EndLine          int    `json:"end_line"`
+	TotalLines       int    `json:"total_lines,omitempty"`
+	LineLimitApplied bool   `json:"line_limit_applied,omitempty"`
+	BudgetTruncated  bool   `json:"budget_truncated,omitempty"`
+	Error            string `json:"error,omitempty"`
+	Content          string `json:"content,omitempty"`
+}
+
+type batchReadFileResponse struct {
+	BudgetChars   int                    `json:"budget_chars"`
+	ReturnedChars int                    `json:"returned_chars"`
+	Completed     bool                   `json:"completed"`
+	Files         []batchReadFileResult  `json:"files"`
+	Remaining     []batchReadFileRequest `json:"remaining,omitempty"`
+}
+
+func clampBatchReadMaxChars(maxChars int) int {
+	switch {
+	case maxChars > 0 && maxChars <= maxReadOutputChars:
+		return maxChars
+	case maxChars > maxReadOutputChars:
+		return maxReadOutputChars
+	default:
+		return defaultBatchReadMaxChars
+	}
+}
+
+func normalizeBatchReadRequest(req batchReadFileRequest) batchReadFileRequest {
+	req.Path = strings.TrimSpace(req.Path)
+	if req.StartLine <= 0 {
+		req.StartLine = 1
+	}
+	return req
+}
+
+func normalizeBatchReadRequests(requests []batchReadFileRequest) []batchReadFileRequest {
+	if len(requests) == 0 {
+		return nil
+	}
+	normalized := make([]batchReadFileRequest, 0, len(requests))
+	for _, req := range requests {
+		normalized = append(normalized, normalizeBatchReadRequest(req))
+	}
+	return normalized
+}
+
+func countRunes(text string) int {
+	return utf8.RuneCountInString(text)
+}
+
+func joinLinesWithinRuneBudget(lines []string, maxRunes int) (string, int) {
+	if maxRunes <= 0 || len(lines) == 0 {
+		return "", 0
+	}
+
+	var b strings.Builder
+	used := 0
+	consumed := 0
+	for i, line := range lines {
+		lineRunes := countRunes(line)
+		sepRunes := 0
+		if i > 0 {
+			sepRunes = 1
+		}
+		if used+sepRunes+lineRunes > maxRunes {
+			break
+		}
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+		used += sepRunes + lineRunes
+		consumed++
+	}
+	return b.String(), consumed
 }
 
 // RunWrite writes content to a file safely
@@ -546,6 +657,152 @@ func (r ReadFileTool) Call(_ context.Context, input string, agent *Agent) (strin
 	result := RunRead(agentWorkspaceDir(agent), params.Path, params.Limit)
 	log.Printf("[ReadFileTool] agent=%s File read completed (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
+}
+
+func (r BatchReadFileTool) Name() string {
+	return "read_files"
+}
+
+func (r BatchReadFileTool) Description() string {
+	return "Read multiple files in one call. Input must be a JSON object with files=[{path,start_line?,limit?}] and optional max_chars total budget. When the total output would be too large, this tool returns partial results plus remaining file requests for the next call."
+}
+
+func (r BatchReadFileTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
+	var params struct {
+		Files    []batchReadFileRequest `json:"files"`
+		MaxChars int                    `json:"max_chars"`
+	}
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		log.Printf("[BatchReadFileTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
+		return "", fmt.Errorf("invalid input: %v", err)
+	}
+	if len(params.Files) == 0 {
+		return "", fmt.Errorf("files is required")
+	}
+
+	response := batchReadFileResponse{
+		BudgetChars: clampBatchReadMaxChars(params.MaxChars),
+		Completed:   true,
+		Files:       make([]batchReadFileResult, 0, len(params.Files)),
+	}
+	baseDir := agentWorkspaceDir(agent)
+
+	for i, rawReq := range params.Files {
+		req := normalizeBatchReadRequest(rawReq)
+		if req.Path == "" {
+			response.Files = append(response.Files, batchReadFileResult{
+				Path:      rawReq.Path,
+				StartLine: req.StartLine,
+				Error:     "path is required",
+			})
+			continue
+		}
+
+		resolved, err := safePath(baseDir, req.Path)
+		if err != nil {
+			response.Files = append(response.Files, batchReadFileResult{
+				Path:      req.Path,
+				StartLine: req.StartLine,
+				Error:     err.Error(),
+			})
+			continue
+		}
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			response.Files = append(response.Files, batchReadFileResult{
+				Path:      req.Path,
+				StartLine: req.StartLine,
+				Error:     err.Error(),
+			})
+			continue
+		}
+
+		lines := strings.Split(string(data), "\n")
+		if req.StartLine > len(lines)+1 {
+			response.Files = append(response.Files, batchReadFileResult{
+				Path:       req.Path,
+				StartLine:  req.StartLine,
+				EndLine:    req.StartLine - 1,
+				TotalLines: len(lines),
+				Error:      fmt.Sprintf("start_line %d out of range", req.StartLine),
+			})
+			continue
+		}
+
+		startIdx := req.StartLine - 1
+		if startIdx > len(lines) {
+			startIdx = len(lines)
+		}
+		endIdx := len(lines)
+		lineLimitApplied := false
+		if req.Limit > 0 && startIdx+req.Limit < endIdx {
+			endIdx = startIdx + req.Limit
+			lineLimitApplied = true
+		}
+
+		selected := lines[startIdx:endIdx]
+		fullContent := strings.Join(selected, "\n")
+		fullRunes := countRunes(fullContent)
+		remainingBudget := response.BudgetChars - response.ReturnedChars
+		if remainingBudget <= 0 {
+			response.Completed = false
+			response.Remaining = append(response.Remaining, req)
+			response.Remaining = append(response.Remaining, normalizeBatchReadRequests(params.Files[i+1:])...)
+			break
+		}
+
+		if fullRunes <= remainingBudget {
+			response.Files = append(response.Files, batchReadFileResult{
+				Path:             req.Path,
+				StartLine:        req.StartLine,
+				EndLine:          req.StartLine + len(selected) - 1,
+				TotalLines:       len(lines),
+				LineLimitApplied: lineLimitApplied,
+				Content:          fullContent,
+			})
+			response.ReturnedChars += fullRunes
+			continue
+		}
+
+		partialContent, consumedLines := joinLinesWithinRuneBudget(selected, remainingBudget)
+		if consumedLines == 0 {
+			response.Completed = false
+			response.Remaining = append(response.Remaining, req)
+			response.Remaining = append(response.Remaining, normalizeBatchReadRequests(params.Files[i+1:])...)
+			break
+		}
+
+		response.Files = append(response.Files, batchReadFileResult{
+			Path:             req.Path,
+			StartLine:        req.StartLine,
+			EndLine:          req.StartLine + consumedLines - 1,
+			TotalLines:       len(lines),
+			LineLimitApplied: lineLimitApplied,
+			BudgetTruncated:  true,
+			Content:          partialContent,
+		})
+		response.ReturnedChars += countRunes(partialContent)
+		response.Completed = false
+
+		nextReq := req
+		nextReq.StartLine = req.StartLine + consumedLines
+		if nextReq.Limit > 0 {
+			nextReq.Limit -= consumedLines
+			if nextReq.Limit < 0 {
+				nextReq.Limit = 0
+			}
+		}
+		response.Remaining = append(response.Remaining, nextReq)
+		response.Remaining = append(response.Remaining, normalizeBatchReadRequests(params.Files[i+1:])...)
+		break
+	}
+
+	data, err := json.MarshalIndent(response, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	log.Printf("[BatchReadFileTool] agent=%s Read files completed: completed=%t returned_chars=%d remaining=%d", agentLogName(agent), response.Completed, response.ReturnedChars, len(response.Remaining))
+	return string(data), nil
 }
 
 // WriteFileTool implementation

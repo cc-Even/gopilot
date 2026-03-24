@@ -138,6 +138,7 @@ func newSessionID() string {
 var TEAM_AGENTS_TOOLS = map[string]struct{}{
 	"bash":                     {},
 	"read_file":                {},
+	"read_files":               {},
 	"write_file":               {},
 	"edit_file":                {},
 	"task_list":                {},

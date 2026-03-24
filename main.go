@@ -563,6 +563,7 @@ func buildSystemPrompt(skillLoader *agents.SkillLoader, subAgentLoader *agents.S
 	return fmt.Sprintf("You are a coding agent at %s. Use tools to solve tasks and summarize results. ", agents.WORKDIR) +
 		"The runtime may invoke you in planner or executor stage; obey the current stage instructions exactly. " +
 		"For complex tasks, use the task board to keep the plan and execution state explicit. " +
+		"When you need to inspect a group of related files, prefer read_files so you can batch reads under one budgeted call; use read_file when you are drilling into a single file or rereading a narrow slice. " +
 		"When you spawn a teammate, capture the returned run_id. If later steps depend on that teammate's work, call wait_teammate with the run_id before continuing or giving a final answer. Do not assume background teammates finish before you do. " +
 		"After wait_teammate returns, inspect the returned run status and any inbox report, then decide the next step. " +
 		"Use the todo tool for short checklists. " +
