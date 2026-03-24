@@ -1,12 +1,15 @@
 package agents
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 var WORKDIR, _ = os.Getwd()
@@ -16,7 +19,11 @@ var TOOLDIR = filepath.Dir(exePath)
 
 var REPO_ROOT = detectRepoRoot(WORKDIR)
 
-var STATE_DIR = filepath.Join(resolveStateBaseDir(), repoStateNamespace(REPO_ROOT))
+var SESSION_ID = newSessionID()
+
+var REPO_STATE_DIR = filepath.Join(resolveStateBaseDir(), repoStateNamespace(REPO_ROOT))
+
+var STATE_DIR = sessionStateDir(REPO_STATE_DIR, SESSION_ID)
 
 var TASK_DIR = filepath.Join(STATE_DIR, "tasks")
 
@@ -109,6 +116,23 @@ func sanitizeStateName(name string) string {
 	}
 
 	return strings.Trim(b.String(), "-")
+}
+
+func sessionStateDir(repoStateDir, sessionID string) string {
+	cleanID := sanitizeStateName(sessionID)
+	if cleanID == "" {
+		cleanID = "default"
+	}
+	return filepath.Join(repoStateDir, "sessions", cleanID)
+}
+
+func newSessionID() string {
+	var suffix [4]byte
+	if _, err := rand.Read(suffix[:]); err == nil {
+		return fmt.Sprintf("%s-%s", time.Now().UTC().Format("20060102T150405.000000000Z"), hex.EncodeToString(suffix[:]))
+	}
+
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
 }
 
 var TEAM_AGENTS_TOOLS = map[string]struct{}{

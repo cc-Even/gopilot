@@ -231,42 +231,104 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 			if err := json.Unmarshal(args, &params); err != nil {
 				return "", fmt.Errorf("invalid route_to_subagent args: %w", err)
 			}
-			subAgent, ok := agent.SubAgents[params.SubAgentName]
+			resolvedName, subAgent, ok := resolveSubAgent(agent.SubAgents, params.SubAgentName)
 			if !ok {
-				return "", fmt.Errorf("unknown sub-agent: %s", params.SubAgentName)
+				return "", fmt.Errorf(
+					"unknown sub-agent: %s. Available: %s",
+					strings.TrimSpace(params.SubAgentName),
+					strings.Join(availableSubAgentNames(agent.SubAgents), ", "),
+				)
 			}
 			agent.reportStageOutput(
-				fmt.Sprintf("SubAgent %s", params.SubAgentName),
+				fmt.Sprintf("SubAgent %s", resolvedName),
 				fmt.Sprintf("开始处理子任务:\n%s", strings.TrimSpace(params.Input)),
 			)
 			runner := subAgent.cloneWithTools(subAgent.SystemPrompt, nil)
 			if runner == nil {
-				return "", fmt.Errorf("failed to clone sub-agent: %s", params.SubAgentName)
+				return "", fmt.Errorf("failed to clone sub-agent: %s", resolvedName)
 			}
 			if runner.InheritModel {
 				runner.Model = agent.Model
 			}
-			runner.LiveOutputID = fmt.Sprintf("subagent:%s", params.SubAgentName)
-			runner.LiveOutputTitle = fmt.Sprintf("SubAgent %s", params.SubAgentName)
+			runner.LiveOutputID = fmt.Sprintf("subagent:%s", resolvedName)
+			runner.LiveOutputTitle = fmt.Sprintf("SubAgent %s", resolvedName)
 			result, err := runner.Run(ctx, []openai.ChatCompletionMessageParamUnion{
 				openai.SystemMessage(runner.SystemPrompt),
 				openai.UserMessage(params.Input),
 			})
 			if err != nil {
 				agent.reportStageOutput(
-					fmt.Sprintf("SubAgent %s", params.SubAgentName),
+					fmt.Sprintf("SubAgent %s", resolvedName),
 					fmt.Sprintf("执行失败:\n%s", err.Error()),
 				)
 				return "", err
 			}
 			agent.reportStageOutput(
-				fmt.Sprintf("SubAgent %s", params.SubAgentName),
+				fmt.Sprintf("SubAgent %s", resolvedName),
 				fmt.Sprintf("输出结果:\n%s", strings.TrimSpace(result)),
 			)
 			return result, err
 		},
 	}
 	return order
+}
+
+func resolveSubAgent(subAgents map[string]*Agent, requested string) (string, *Agent, bool) {
+	if len(subAgents) == 0 {
+		return "", nil, false
+	}
+
+	name := strings.TrimSpace(requested)
+	if name == "" {
+		return "", nil, false
+	}
+	if subAgent, ok := subAgents[name]; ok {
+		return name, subAgent, true
+	}
+
+	target := normalizeSubAgentLookupKey(name)
+	if target == "" {
+		return "", nil, false
+	}
+
+	names := availableSubAgentNames(subAgents)
+	for _, candidate := range names {
+		if normalizeSubAgentLookupKey(candidate) == target {
+			return candidate, subAgents[candidate], true
+		}
+	}
+	return "", nil, false
+}
+
+func availableSubAgentNames(subAgents map[string]*Agent) []string {
+	if len(subAgents) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(subAgents))
+	for name := range subAgents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func normalizeSubAgentLookupKey(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func registerCompactTool(toolMap map[string]ToolDefinition, order []string) []string {

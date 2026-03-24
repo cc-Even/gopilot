@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/openai/openai-go/v3"
@@ -136,5 +137,72 @@ func TestRouteToSubagentReportsOutput(t *testing.T) {
 	}
 	if contents[1] != "输出结果:\nfound one bug" {
 		t.Fatalf("unexpected result content: %q", contents[1])
+	}
+}
+
+func TestRouteToSubagentMatchesNormalizedName(t *testing.T) {
+	var called bool
+	subAgent := &Agent{
+		Name:         "code-reviewer",
+		SystemPrompt: "review changes",
+		Model:        "explicit-model",
+		runLoopOverride: func(current *Agent, _ context.Context, _ []openai.ChatCompletionMessageParamUnion) (string, error) {
+			called = true
+			return "ok", nil
+		},
+	}
+
+	parent := &Agent{
+		Name:      "supervisor",
+		Model:     "parent-model",
+		SubAgents: map[string]*Agent{"code-reviewer": subAgent},
+	}
+
+	toolMap := map[string]ToolDefinition{}
+	registerRouteToSubagentTool(toolMap, nil, parent.SubAgents)
+
+	args, err := json.Marshal(map[string]string{
+		"sub_agent_name": " Code Reviewer ",
+		"input":          "check this patch",
+	})
+	if err != nil {
+		t.Fatalf("marshal args failed: %v", err)
+	}
+
+	if _, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent); err != nil {
+		t.Fatalf("route_to_subagent failed: %v", err)
+	}
+	if !called {
+		t.Fatal("expected normalized sub-agent name to match")
+	}
+}
+
+func TestRouteToSubagentUnknownIncludesAvailableNames(t *testing.T) {
+	parent := &Agent{
+		Name:  "supervisor",
+		Model: "parent-model",
+		SubAgents: map[string]*Agent{
+			"code-reviewer": {Name: "code-reviewer"},
+			"helper":        {Name: "helper"},
+		},
+	}
+
+	toolMap := map[string]ToolDefinition{}
+	registerRouteToSubagentTool(toolMap, nil, parent.SubAgents)
+
+	args, err := json.Marshal(map[string]string{
+		"sub_agent_name": "missing-agent",
+		"input":          "check this patch",
+	})
+	if err != nil {
+		t.Fatalf("marshal args failed: %v", err)
+	}
+
+	_, err = toolMap["route_to_subagent"].Handler(context.Background(), args, parent)
+	if err == nil {
+		t.Fatal("expected route_to_subagent to fail for unknown sub-agent")
+	}
+	if !strings.Contains(err.Error(), "Available: code-reviewer, helper") {
+		t.Fatalf("expected available names in error, got %q", err.Error())
 	}
 }
