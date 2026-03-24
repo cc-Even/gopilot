@@ -1,6 +1,8 @@
 package agents
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,5 +91,81 @@ func TestSkillLoader(t *testing.T) {
 	unknown := loader.GetContent("missing")
 	if !strings.Contains(unknown, "Error: Unknown skill 'missing'. Available: ") {
 		t.Fatalf("unexpected unknown message: %s", unknown)
+	}
+}
+
+func TestLoadSkillToolLoadsNamedSkill(t *testing.T) {
+	root := t.TempDir()
+	skillDir := filepath.Join(root, "skill-one")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: alpha\ndescription: Alpha desc\n---\nalpha body"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := NewSkillLoader(root)
+	toolMap := map[string]ToolDefinition{}
+	registerLoadSkillTool(toolMap, nil, loader)
+
+	output, err := toolMap["load_skill"].Handler(context.Background(), json.RawMessage(`{"skill_name":"alpha"}`), nil)
+	if err != nil {
+		t.Fatalf("load_skill failed: %v", err)
+	}
+	if !strings.Contains(output, "<skill name=\"alpha\">") {
+		t.Fatalf("unexpected load_skill output: %s", output)
+	}
+}
+
+func TestLoadSkillToolRejectsMissingSkillName(t *testing.T) {
+	toolMap := map[string]ToolDefinition{}
+	registerLoadSkillTool(toolMap, nil, NewSkillLoader(t.TempDir()))
+
+	_, err := toolMap["load_skill"].Handler(context.Background(), json.RawMessage(`{}`), nil)
+	if err == nil || !strings.Contains(err.Error(), "missing skill_name") {
+		t.Fatalf("expected missing skill_name error, got %v", err)
+	}
+}
+
+func TestDefaultToolDefinitionsUseStrictObjectSchemas(t *testing.T) {
+	tools := DefaultToolDefinitions()
+	toolByName := make(map[string]ToolDefinition, len(tools))
+	for _, tool := range tools {
+		toolByName[tool.Name] = tool
+	}
+
+	readSchema := toolByName["read_file"].Parameters
+	if readSchema["type"] != "object" {
+		t.Fatalf("read_file schema type = %v, want object", readSchema["type"])
+	}
+	if readSchema["additionalProperties"] != false {
+		t.Fatalf("read_file additionalProperties = %v, want false", readSchema["additionalProperties"])
+	}
+
+	taskUpdateSchema := toolByName["task_update"].Parameters
+	properties, ok := taskUpdateSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("task_update properties has unexpected type %T", taskUpdateSchema["properties"])
+	}
+	statusSchema, ok := properties["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("task_update status schema has unexpected type %T", properties["status"])
+	}
+	enumValues, ok := statusSchema["enum"].([]string)
+	if !ok {
+		t.Fatalf("task_update status enum has unexpected type %T", statusSchema["enum"])
+	}
+	want := []string{taskStatusPending, taskStatusInProgress, taskStatusCompleted}
+	if len(enumValues) != len(want) {
+		t.Fatalf("task_update status enum len = %d, want %d", len(enumValues), len(want))
+	}
+	for i := range want {
+		if enumValues[i] != want[i] {
+			t.Fatalf("task_update status enum[%d] = %q, want %q", i, enumValues[i], want[i])
+		}
 	}
 }

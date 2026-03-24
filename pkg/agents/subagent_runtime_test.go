@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -204,5 +205,55 @@ func TestRouteToSubagentUnknownIncludesAvailableNames(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Available: code-reviewer, helper") {
 		t.Fatalf("expected available names in error, got %q", err.Error())
+	}
+}
+
+func TestRouteToSubagentDefinesStrictSchema(t *testing.T) {
+	subAgents := map[string]*Agent{
+		"code-reviewer": {Name: "code-reviewer"},
+		"helper":        {Name: "helper"},
+	}
+
+	toolMap := map[string]ToolDefinition{}
+	registerRouteToSubagentTool(toolMap, nil, subAgents)
+
+	schema := toolMap["route_to_subagent"].Parameters
+	if schema["type"] != "object" {
+		t.Fatalf("schema type = %v, want object", schema["type"])
+	}
+	if schema["additionalProperties"] != false {
+		t.Fatalf("additionalProperties = %v, want false", schema["additionalProperties"])
+	}
+
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties has unexpected type %T", schema["properties"])
+	}
+	nameSchema, ok := properties["sub_agent_name"].(map[string]any)
+	if !ok {
+		t.Fatalf("sub_agent_name schema has unexpected type %T", properties["sub_agent_name"])
+	}
+	enumValues, ok := nameSchema["enum"].([]string)
+	if !ok {
+		t.Fatalf("sub_agent_name enum has unexpected type %T", nameSchema["enum"])
+	}
+	if !reflect.DeepEqual(enumValues, []string{"code-reviewer", "helper"}) {
+		t.Fatalf("enum values = %v, want [code-reviewer helper]", enumValues)
+	}
+}
+
+func TestRouteToSubagentRejectsMissingArgs(t *testing.T) {
+	parent := &Agent{
+		Name:      "supervisor",
+		Model:     "parent-model",
+		SubAgents: map[string]*Agent{"code-reviewer": {Name: "code-reviewer"}},
+	}
+
+	toolMap := map[string]ToolDefinition{}
+	registerRouteToSubagentTool(toolMap, nil, parent.SubAgents)
+
+	_, err := toolMap["route_to_subagent"].Handler(context.Background(), json.RawMessage(`{}`), parent)
+	if err == nil || !strings.Contains(err.Error(), "missing sub_agent_name") {
+		t.Fatalf("expected missing sub_agent_name error, got %v", err)
 	}
 }

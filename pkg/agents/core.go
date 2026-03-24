@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -81,6 +82,40 @@ type Agent struct {
 	runLoopOverride       func(*Agent, context.Context, []openai.ChatCompletionMessageParamUnion) (string, error)
 	stageOutputReporter   func(stage, content string)
 	liveOutputReporter    func(id, title, content string, done bool)
+}
+
+type StructuredRunState struct {
+	Plan             string
+	ExecutorMessages []openai.ChatCompletionMessageParamUnion
+}
+
+type StructuredRunError struct {
+	Stage  string
+	Cause  error
+	Resume *StructuredRunState
+}
+
+func (e *StructuredRunError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if strings.TrimSpace(e.Stage) == "" {
+		if e.Cause == nil {
+			return "structured run failed"
+		}
+		return e.Cause.Error()
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("%s stage failed", e.Stage)
+	}
+	return fmt.Sprintf("%s stage failed: %v", e.Stage, e.Cause)
+}
+
+func (e *StructuredRunError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 type AgentOptions struct {
@@ -167,12 +202,18 @@ func registerLoadSkillTool(toolMap map[string]ToolDefinition, order []string, sk
 	order = append(order, "load_skill")
 	toolMap["load_skill"] = ToolDefinition{
 		Name:        "load_skill",
-		Description: "Use this method to load a skill before answering. If the question involves a specific topic, try loading a related skill first. If you don't have enough information to decide which skill to load, you can ask the user for more details.",
+		Description: "Load a skill by exact name before answering. Always pass {\"skill_name\":\"...\"} and choose only from the provided skill list.",
 		Parameters: map[string]any{
-			"skill_name": map[string]any{
-				"type":        "string",
-				"description": "name of the skill to load, choose from the provided skill list",
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"skill_name": map[string]any{
+					"type":        "string",
+					"description": "Exact skill name from the provided skill list",
+					"minLength":   1,
+				},
 			},
+			"required": []string{"skill_name"},
 		},
 		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			type paramsStruct struct {
@@ -181,6 +222,10 @@ func registerLoadSkillTool(toolMap map[string]ToolDefinition, order []string, sk
 			params := paramsStruct{}
 			if err := json.Unmarshal(args, &params); err != nil {
 				return "", fmt.Errorf("invalid load_skill args: %w", err)
+			}
+			params.SkillName = strings.TrimSpace(params.SkillName)
+			if params.SkillName == "" {
+				return "", fmt.Errorf("load_skill args missing skill_name")
 			}
 			skillContent := skillLoader.GetContent(params.SkillName)
 			return skillContent, nil
@@ -212,15 +257,24 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 	order = append(order, "route_to_subagent")
 	toolMap["route_to_subagent"] = ToolDefinition{
 		Name:        "route_to_subagent",
-		Description: fmt.Sprintf("Calling this method delegates the subtask to the sub-agent. sub-agent list: %v", agentListDesc),
+		Description: fmt.Sprintf("Delegate a subtask to one sub-agent. Always pass {\"sub_agent_name\":\"...\",\"input\":\"...\"}. Available sub-agents: %v", agentListDesc),
 		Parameters: map[string]any{
-			"sub_agent_name": map[string]any{
-				"type":        "string",
-				"description": "selected sub-agent name"},
-			"input": map[string]any{
-				"type":        "string",
-				"description": "detailed description of the task you gave to the sub-agent",
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"sub_agent_name": map[string]any{
+					"type":        "string",
+					"description": "Exact sub-agent name from the available list",
+					"minLength":   1,
+					"enum":        names,
+				},
+				"input": map[string]any{
+					"type":        "string",
+					"description": "Detailed task description for the selected sub-agent",
+					"minLength":   1,
+				},
 			},
+			"required": []string{"sub_agent_name", "input"},
 		},
 		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
 			type paramsStruct struct {
@@ -230,6 +284,14 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 			params := paramsStruct{}
 			if err := json.Unmarshal(args, &params); err != nil {
 				return "", fmt.Errorf("invalid route_to_subagent args: %w", err)
+			}
+			params.SubAgentName = strings.TrimSpace(params.SubAgentName)
+			params.Input = strings.TrimSpace(params.Input)
+			if params.SubAgentName == "" {
+				return "", fmt.Errorf("route_to_subagent args missing sub_agent_name")
+			}
+			if params.Input == "" {
+				return "", fmt.Errorf("route_to_subagent args missing input")
 			}
 			resolvedName, subAgent, ok := resolveSubAgent(agent.SubAgents, params.SubAgentName)
 			if !ok {
@@ -241,7 +303,7 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 			}
 			agent.reportStageOutput(
 				fmt.Sprintf("SubAgent %s", resolvedName),
-				fmt.Sprintf("开始处理子任务:\n%s", strings.TrimSpace(params.Input)),
+				fmt.Sprintf("开始处理子任务:\n%s", params.Input),
 			)
 			runner := subAgent.cloneWithTools(subAgent.SystemPrompt, nil)
 			if runner == nil {
@@ -459,34 +521,100 @@ func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessage
 }
 
 func (a *Agent) RunStructured(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+	result, _, err := a.RunStructuredWithState(ctx, messages)
+	return result, err
+}
+
+func (a *Agent) RunStructuredWithState(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, *StructuredRunState, error) {
+	log.Printf("[StructuredRun] agent=%s starting planner stage", agentLogName(a))
 	planner := a.cloneWithTools(a.plannerSystemPrompt(), plannerToolAllowlist)
 	planner.LiveOutputID = fmt.Sprintf("%s:planner", a.Name)
 	planner.LiveOutputTitle = "Planner"
 	plannerMessages := applySystemPrompt(messages, planner.SystemPrompt)
 	plannerMessages = append(plannerMessages, openai.UserMessage(a.plannerContextMessage()))
 
-	plan, err := planner.runLoop(ctx, plannerMessages)
+	plan, _, err := planner.runLoopWithState(ctx, plannerMessages)
 	if err != nil {
-		return "", fmt.Errorf("planner stage failed: %w", err)
+		log.Printf("[StructuredRun] agent=%s planner stage failed: %v", agentLogName(a), err)
+		return "", nil, &StructuredRunError{Stage: "planner", Cause: err}
 	}
+	log.Printf("[StructuredRun] agent=%s planner stage completed: plan_size=%d", agentLogName(a), len(strings.TrimSpace(plan)))
 	a.reportStageOutput("planner", plan)
 
+	log.Printf("[StructuredRun] agent=%s starting executor stage", agentLogName(a))
 	executor := a.cloneWithTools(a.executorSystemPrompt(), nil)
 	executor.LiveOutputID = fmt.Sprintf("%s:executor", a.Name)
 	executor.LiveOutputTitle = "Executor"
 	executorMessages := applySystemPrompt(messages, executor.SystemPrompt)
 	executorMessages = append(executorMessages, openai.UserMessage(a.executorContextMessage(plan)))
 
-	result, err := executor.runLoop(ctx, executorMessages)
+	result, resumeMessages, err := executor.runLoopWithState(ctx, executorMessages)
 	if err != nil {
-		return "", fmt.Errorf("executor stage failed: %w", err)
+		log.Printf("[StructuredRun] agent=%s executor stage failed: %v", agentLogName(a), err)
+		state := &StructuredRunState{
+			Plan:             plan,
+			ExecutorMessages: cloneChatMessages(executorMessages),
+		}
+		if len(resumeMessages) > 0 {
+			state.ExecutorMessages = cloneChatMessages(resumeMessages)
+		}
+		return "", state, &StructuredRunError{
+			Stage:  "executor",
+			Cause:  err,
+			Resume: state,
+		}
 	}
-	return result, nil
+	log.Printf("[StructuredRun] agent=%s executor stage completed: result_size=%d", agentLogName(a), len(strings.TrimSpace(result)))
+	return result, nil, nil
+}
+
+func (a *Agent) ContinueStructured(ctx context.Context, state *StructuredRunState, input string) (string, *StructuredRunState, error) {
+	if state == nil || len(state.ExecutorMessages) == 0 {
+		return "", nil, fmt.Errorf("structured executor state unavailable")
+	}
+	log.Printf("[StructuredRun] agent=%s resuming executor stage: input_size=%d", agentLogName(a), len(strings.TrimSpace(input)))
+
+	executor := a.cloneWithTools(a.executorSystemPrompt(), nil)
+	executor.LiveOutputID = fmt.Sprintf("%s:executor", a.Name)
+	executor.LiveOutputTitle = "Executor"
+
+	messages := cloneChatMessages(state.ExecutorMessages)
+	if strings.TrimSpace(input) != "" {
+		messages = append(messages, openai.UserMessage(input))
+	}
+
+	result, resumeMessages, err := executor.runLoopWithState(ctx, messages)
+	if err != nil {
+		log.Printf("[StructuredRun] agent=%s resumed executor failed: %v", agentLogName(a), err)
+		next := &StructuredRunState{
+			Plan:             state.Plan,
+			ExecutorMessages: cloneChatMessages(messages),
+		}
+		if len(resumeMessages) > 0 {
+			next.ExecutorMessages = cloneChatMessages(resumeMessages)
+		}
+		return "", next, &StructuredRunError{
+			Stage:  "executor",
+			Cause:  err,
+			Resume: next,
+		}
+	}
+	log.Printf("[StructuredRun] agent=%s resumed executor completed: result_size=%d", agentLogName(a), len(strings.TrimSpace(result)))
+	return result, nil, nil
 }
 
 func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+	result, _, err := a.runLoopWithState(ctx, messages)
+	return result, err
+}
+
+func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, []openai.ChatCompletionMessageParamUnion, error) {
 	if a != nil && a.runLoopOverride != nil {
-		return a.runLoopOverride(a, ctx, messages)
+		result, err := a.runLoopOverride(a, ctx, messages)
+		if err != nil {
+			return "", cloneChatMessages(messages), err
+		}
+		return result, nil, nil
 	}
 
 	const maxTurns = 40
@@ -497,40 +625,40 @@ func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMes
 		var compactErr error
 		messages, compactErr = a.maybeAutoCompact(ctx, messages)
 		if compactErr != nil {
-			return "", fmt.Errorf("auto compact failed (turn=%d): %w", turn, compactErr)
+			return "", cloneChatMessages(messages), fmt.Errorf("auto compact failed (turn=%d): %w", turn, compactErr)
 		}
+		stableMessages := cloneChatMessages(messages)
 		turnAcks := &turnEventAcks{}
 		messages = a.stageBackgroundNotifications(messages, turnAcks)
 		messages, err = a.stageTeamInboxMessages(messages, turnAcks)
 		if err != nil {
 			_ = turnAcks.Rollback()
-			return "", fmt.Errorf("stage turn events failed (turn=%d): %w", turn, err)
+			return "", stableMessages, fmt.Errorf("stage turn events failed (turn=%d): %w", turn, err)
 		}
 
 		resp, err := a.streamChatCompletion(ctx, messages, turn)
 		if err != nil {
 			_ = turnAcks.Rollback()
-			return "", err
+			return "", stableMessages, err
 		}
 		if err := turnAcks.Commit(); err != nil {
-			return "", fmt.Errorf("ack turn events failed (turn=%d): %w", turn, err)
+			return "", stableMessages, fmt.Errorf("ack turn events failed (turn=%d): %w", turn, err)
 		}
 		if len(resp.Choices) == 0 {
-			return "", fmt.Errorf("empty choices from model")
+			return "", stableMessages, fmt.Errorf("empty choices from model")
 		}
 
 		usedTodo := false
 
 		choice := resp.Choices[0]
 
-		// 把 assistant 这条消息（含 tool_calls）放回上下文，保证下一轮可继续
-		messages = append(messages, choice.Message.ToParam())
-
 		switch choice.FinishReason {
 		case "stop":
-			return choice.Message.Content, nil
+			messages = append(messages, choice.Message.ToParam())
+			return choice.Message.Content, nil, nil
 
 		case "tool_calls":
+			messages = append(messages, choice.Message.ToParam())
 			manualCompacted := false
 			for _, tc := range choice.Message.ToolCalls {
 				toolName := tc.Function.Name
@@ -557,11 +685,11 @@ func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMes
 				if toolName == "compact" && callErr == nil {
 					focus, parseErr := parseCompactFocus(toolArgs)
 					if parseErr != nil {
-						return "", fmt.Errorf("manual compact args parse failed (turn=%d): %w", turn, parseErr)
+						return "", cloneChatMessages(messages), fmt.Errorf("manual compact args parse failed (turn=%d): %w", turn, parseErr)
 					}
 					messages, err = a.forceAutoCompact(ctx, messages, focus)
 					if err != nil {
-						return "", fmt.Errorf("manual compact failed (turn=%d): %w", turn, err)
+						return "", cloneChatMessages(messages), fmt.Errorf("manual compact failed (turn=%d): %w", turn, err)
 					}
 					manualCompacted = true
 					roundsSinceTodo = 0
@@ -572,8 +700,11 @@ func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMes
 				continue
 			}
 
+		case "network_error":
+			return "", stableMessages, fmt.Errorf("model interrupted with finish reason: %s", choice.FinishReason)
+
 		default:
-			return "", fmt.Errorf("unsupported finish reason: %s", choice.FinishReason)
+			return "", stableMessages, fmt.Errorf("unsupported finish reason: %s", choice.FinishReason)
 		}
 
 		if usedTodo {
@@ -586,7 +717,7 @@ func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMes
 		}
 	}
 
-	return "", fmt.Errorf("max turns reached without final answer")
+	return "", cloneChatMessages(messages), fmt.Errorf("max turns reached without final answer")
 }
 
 func (a *Agent) cloneWithTools(systemPrompt string, allowlist map[string]struct{}) *Agent {
@@ -615,13 +746,40 @@ func (a *Agent) cloneWithTools(systemPrompt string, allowlist map[string]struct{
 }
 
 func (a *Agent) reportStageOutput(stage, content string) {
+	log.Printf(
+		"[StageOutput] agent=%s stage=%s content=%s",
+		agentLogName(a),
+		strings.TrimSpace(stage),
+		truncate(strings.TrimSpace(content), 4000),
+	)
 	if a == nil || a.stageOutputReporter == nil {
 		return
 	}
 	a.stageOutputReporter(stage, content)
 }
 
+func cloneChatMessages(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+	if len(messages) == 0 {
+		return nil
+	}
+	cloned := make([]openai.ChatCompletionMessageParamUnion, len(messages))
+	copy(cloned, messages)
+	return cloned
+}
+
 func (a *Agent) reportLiveOutput(id, title, content string, done bool) {
+	if done {
+		trimmed := strings.TrimSpace(content)
+		if trimmed != "" {
+			log.Printf(
+				"[LiveOutput] agent=%s id=%s title=%s state=final content=%s",
+				agentLogName(a),
+				strings.TrimSpace(id),
+				strings.TrimSpace(title),
+				truncate(trimmed, 4000),
+			)
+		}
+	}
 	if a == nil || a.liveOutputReporter == nil {
 		return
 	}
@@ -687,7 +845,7 @@ func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.Chat
 		a.reportLiveOutput(liveID, liveTitle, "", true)
 		return nil, fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
 	}
-	a.reportLiveOutput(liveID, liveTitle, "", true)
+	a.reportLiveOutput(liveID, liveTitle, renderStreamingPreview(acc.ChatCompletion), true)
 
 	if len(acc.Choices) == 0 {
 		return nil, fmt.Errorf("empty choices from model")

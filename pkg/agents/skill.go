@@ -185,6 +185,10 @@ func StringParam() map[string]any {
 	return map[string]any{"type": "string"}
 }
 
+func NonEmptyStringParam() map[string]any {
+	return map[string]any{"type": "string", "minLength": 1}
+}
+
 func IntegerParam() map[string]any {
 	return map[string]any{"type": "integer"}
 }
@@ -193,10 +197,15 @@ func BoolParam() map[string]any {
 	return map[string]any{"type": "boolean"}
 }
 
+func EnumStringParam(values ...string) map[string]any {
+	return map[string]any{"type": "string", "enum": values}
+}
+
 func ObjectSchema(properties map[string]any, required ...string) map[string]any {
 	schema := map[string]any{
-		"type":       "object",
-		"properties": properties,
+		"type":                 "object",
+		"properties":           properties,
+		"additionalProperties": false,
 	}
 	if len(required) > 0 {
 		schema["required"] = required
@@ -218,14 +227,14 @@ func DefaultToolDefinitions() []ToolDefinition {
 			bash.Name(),
 			bash.Description(),
 			"command",
-			ObjectSchema(map[string]any{"command": StringParam()}, "command"),
+			ObjectSchema(map[string]any{"command": NonEmptyStringParam()}, "command"),
 			bash.Call,
 		),
 		ToolFromStringArg(
 			backgroundRun.Name(),
 			backgroundRun.Description(),
 			"command",
-			ObjectSchema(map[string]any{"command": StringParam()}, "command"),
+			ObjectSchema(map[string]any{"command": NonEmptyStringParam()}, "command"),
 			backgroundRun.Call,
 		),
 		ToolFromJSONString(
@@ -237,19 +246,19 @@ func DefaultToolDefinitions() []ToolDefinition {
 		ToolFromJSONString(
 			read.Name(),
 			read.Description(),
-			ObjectSchema(map[string]any{"path": StringParam(), "limit": IntegerParam()}, "path"),
+			ObjectSchema(map[string]any{"path": NonEmptyStringParam(), "limit": IntegerParam()}, "path"),
 			read.Call,
 		),
 		ToolFromJSONString(
 			write.Name(),
 			write.Description(),
-			ObjectSchema(map[string]any{"path": StringParam(), "content": StringParam()}, "path", "content"),
+			ObjectSchema(map[string]any{"path": NonEmptyStringParam(), "content": StringParam()}, "path", "content"),
 			write.Call,
 		),
 		ToolFromJSONString(
 			edit.Name(),
 			edit.Description(),
-			ObjectSchema(map[string]any{"path": StringParam(), "old_text": StringParam(), "new_text": StringParam()}, "path", "old_text", "new_text"),
+			ObjectSchema(map[string]any{"path": NonEmptyStringParam(), "old_text": StringParam(), "new_text": StringParam()}, "path", "old_text", "new_text"),
 			edit.Call,
 		),
 		ToolFromJSONString(
@@ -276,15 +285,15 @@ func DefaultToolDefinitions() []ToolDefinition {
 		ToolFromJSONString(
 			"task_create",
 			"Create a new task.",
-			ObjectSchema(map[string]any{"subject": StringParam(), "description": StringParam()}, "subject"),
+			ObjectSchema(map[string]any{"subject": NonEmptyStringParam(), "description": StringParam()}, "subject"),
 			TaskCreateTool,
 		),
 		ToolFromJSONString(
 			"task_update",
-			"Update a task's status or dependencies.",
+			"Update a task's status or dependencies. Use status only with pending, in_progress, or completed.",
 			ObjectSchema(map[string]any{
 				"task_id":      IntegerParam(),
-				"status":       StringParam(),
+				"status":       EnumStringParam(taskStatusPending, taskStatusInProgress, taskStatusCompleted),
 				"addBlockedBy": map[string]any{"type": "array", "items": IntegerParam()},
 				"addBlocks":    map[string]any{"type": "array", "items": IntegerParam()},
 			}, "task_id"),
@@ -306,7 +315,7 @@ func DefaultToolDefinitions() []ToolDefinition {
 			"worktree_create",
 			"Create a git worktree and optionally bind it to a task.",
 			ObjectSchema(map[string]any{
-				"name":    StringParam(),
+				"name":    NonEmptyStringParam(),
 				"task_id": IntegerParam(),
 			}, "name"),
 			WorktreeCreateTool,
@@ -320,14 +329,14 @@ func DefaultToolDefinitions() []ToolDefinition {
 		ToolFromJSONString(
 			"worktree_keep",
 			"Mark a worktree as kept so the directory remains available.",
-			ObjectSchema(map[string]any{"name": StringParam()}, "name"),
+			ObjectSchema(map[string]any{"name": NonEmptyStringParam()}, "name"),
 			WorktreeKeepTool,
 		),
 		ToolFromJSONString(
 			"worktree_remove",
 			"Remove a worktree directory. Optionally complete and unbind its task in the same call.",
 			ObjectSchema(map[string]any{
-				"name":          StringParam(),
+				"name":          NonEmptyStringParam(),
 				"force":         BoolParam(),
 				"complete_task": BoolParam(),
 			}, "name"),
@@ -521,7 +530,7 @@ func (r ReadFileTool) Name() string {
 }
 
 func (r ReadFileTool) Description() string {
-	return "Read file contents. input should be a JSON string with fields: path, limit (optional, number of lines to read)."
+	return "Read file contents. Input must be a JSON object with path and optional limit (number of lines to read)."
 }
 
 func (r ReadFileTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
@@ -545,7 +554,7 @@ func (w WriteFileTool) Name() string {
 }
 
 func (w WriteFileTool) Description() string {
-	return "Write content to file. input should be a JSON string with fields: path, content."
+	return "Write content to file. Input must be a JSON object with path and content."
 }
 
 func (w WriteFileTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
@@ -569,7 +578,7 @@ func (e EditFileTool) Name() string {
 }
 
 func (e EditFileTool) Description() string {
-	return "Replace exact text in file. input should be a JSON string with fields: path, old_text, new_text."
+	return "Replace exact text in file. Input must be a JSON object with path, old_text, and new_text."
 }
 
 func (e EditFileTool) Call(_ context.Context, input string, agent *Agent) (string, error) {

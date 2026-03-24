@@ -5,6 +5,7 @@ import (
 	"claude-go/pkg/agents"
 	"claude-go/pkg/version"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -54,6 +55,8 @@ type cliSession struct {
 	liveOrder      []string
 	running        bool
 	runCancel      context.CancelFunc
+	resumeState    *agents.StructuredRunState
+	resumeHistory  []openai.ChatCompletionMessageParamUnion
 }
 
 type liveOutputBlock struct {
@@ -205,37 +208,19 @@ func (s *cliSession) handleInput(input string) {
 	}
 
 	s.appendLine("[purple]User:[white] %s", tview.Escape(input))
+	if s.resumeState != nil {
+		s.appendLine("[green]Gopilot:[white] 正在从中断的 executor 继续...")
+		s.output.ScrollToEnd()
+		s.runResume(input)
+		return
+	}
+
 	s.appendLine("[green]Gopilot:[white] 正在思考中...")
 	s.output.ScrollToEnd()
 
 	history := append([]openai.ChatCompletionMessageParamUnion{}, s.history...)
 	history = append(history, openai.UserMessage(input))
-	agent := s.agent
-	runCtx, cancel := context.WithCancel(context.Background())
-	s.running = true
-	s.runCancel = cancel
-
-	go func(snapshot []openai.ChatCompletionMessageParamUnion, activeAgent *agents.Agent) {
-		response, err := activeAgent.RunStructured(runCtx, snapshot)
-		s.app.QueueUpdateDraw(func() {
-			defer func() {
-				s.running = false
-				s.runCancel = nil
-				s.output.ScrollToEnd()
-			}()
-
-			if err != nil {
-				s.appendLine("[red]Gopilot Error:[white] %s", tview.Escape(err.Error()))
-				return
-			}
-
-			s.history = append(snapshot, openai.AssistantMessage(response))
-			currentDir = activeAgent.WorkDir
-			currentModel = activeAgent.Model
-			s.updateHeader()
-			s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
-		})
-	}(history, agent)
+	s.runStructured(history)
 }
 
 func (s *cliSession) executeCommand(input string) {
@@ -338,6 +323,7 @@ func (s *cliSession) resetConversation() {
 	s.history = []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage(s.systemPrompt),
 	}
+	s.clearResumeState()
 }
 
 func (s *cliSession) rebuildAgent() {
@@ -376,6 +362,98 @@ func (s *cliSession) rebuildAgent() {
 	)
 	currentDir = s.agent.WorkDir
 	s.updateHeader()
+}
+
+func (s *cliSession) runStructured(snapshot []openai.ChatCompletionMessageParamUnion) {
+	agent := s.agent
+	runCtx, cancel := context.WithCancel(context.Background())
+	s.running = true
+	s.runCancel = cancel
+
+	go func(historySnapshot []openai.ChatCompletionMessageParamUnion, activeAgent *agents.Agent) {
+		response, state, err := activeAgent.RunStructuredWithState(runCtx, historySnapshot)
+		s.app.QueueUpdateDraw(func() {
+			defer s.finishRun(activeAgent)
+
+			if err != nil {
+				s.captureResumeState(historySnapshot, state)
+				s.reportRunError(err)
+				return
+			}
+
+			s.clearResumeState()
+			s.history = append(copyMessages(historySnapshot), openai.AssistantMessage(response))
+			s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+		})
+	}(copyMessages(snapshot), agent)
+}
+
+func (s *cliSession) runResume(input string) {
+	state := s.resumeState
+	if state == nil {
+		return
+	}
+
+	agent := s.agent
+	baseHistory := copyMessages(s.resumeHistory)
+	runCtx, cancel := context.WithCancel(context.Background())
+	s.running = true
+	s.runCancel = cancel
+
+	go func(resumeInput string, historySnapshot []openai.ChatCompletionMessageParamUnion, resumeState *agents.StructuredRunState, activeAgent *agents.Agent) {
+		response, nextState, err := activeAgent.ContinueStructured(runCtx, resumeState, resumeInput)
+		s.app.QueueUpdateDraw(func() {
+			defer s.finishRun(activeAgent)
+
+			if err != nil {
+				nextHistory := append(copyMessages(historySnapshot), openai.UserMessage(resumeInput))
+				s.captureResumeState(nextHistory, nextState)
+				s.reportRunError(err)
+				return
+			}
+
+			updatedHistory := append(copyMessages(historySnapshot), openai.UserMessage(resumeInput))
+			updatedHistory = append(updatedHistory, openai.AssistantMessage(response))
+			s.clearResumeState()
+			s.history = updatedHistory
+			s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+		})
+	}(input, baseHistory, state, agent)
+}
+
+func (s *cliSession) finishRun(activeAgent *agents.Agent) {
+	s.running = false
+	s.runCancel = nil
+	currentDir = activeAgent.WorkDir
+	currentModel = activeAgent.Model
+	s.updateHeader()
+	s.output.ScrollToEnd()
+}
+
+func (s *cliSession) captureResumeState(history []openai.ChatCompletionMessageParamUnion, state *agents.StructuredRunState) {
+	if state == nil {
+		s.clearResumeState()
+		return
+	}
+	s.resumeState = &agents.StructuredRunState{
+		Plan:             state.Plan,
+		ExecutorMessages: copyMessages(state.ExecutorMessages),
+	}
+	s.resumeHistory = copyMessages(history)
+}
+
+func (s *cliSession) clearResumeState() {
+	s.resumeState = nil
+	s.resumeHistory = nil
+}
+
+func (s *cliSession) reportRunError(err error) {
+	s.appendLine("[red]Gopilot Error:[white] %s", tview.Escape(err.Error()))
+
+	var runErr *agents.StructuredRunError
+	if errors.As(err, &runErr) && runErr.Resume != nil {
+		s.appendLine("[yellow]System:[white] 可输入 continue 或补充说明，从中断的 executor 位置继续；如需放弃本次现场可使用 /clear。")
+	}
 }
 
 func (s *cliSession) appendLine(format string, args ...any) {
@@ -470,6 +548,15 @@ func wireAgentReporters(
 	for _, subAgent := range agent.SubAgents {
 		wireAgentReporters(subAgent, stageReporter, liveReporter)
 	}
+}
+
+func copyMessages(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
+	if len(messages) == 0 {
+		return nil
+	}
+	cloned := make([]openai.ChatCompletionMessageParamUnion, len(messages))
+	copy(cloned, messages)
+	return cloned
 }
 
 func buildSystemPrompt(skillLoader *agents.SkillLoader, subAgentLoader *agents.SubAgentLoader) string {
