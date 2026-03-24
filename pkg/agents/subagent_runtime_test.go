@@ -88,3 +88,53 @@ func TestRouteToSubagentKeepsExplicitModel(t *testing.T) {
 		t.Fatalf("expected explicit model to win, got %q", subAgentModel)
 	}
 }
+
+func TestRouteToSubagentReportsOutput(t *testing.T) {
+	var stages []string
+	var contents []string
+	subAgent := &Agent{
+		Name:         "reviewer",
+		SystemPrompt: "review changes",
+		Model:        "explicit-model",
+		runLoopOverride: func(current *Agent, _ context.Context, _ []openai.ChatCompletionMessageParamUnion) (string, error) {
+			return "found one bug", nil
+		},
+	}
+
+	parent := &Agent{
+		Name:      "supervisor",
+		Model:     "parent-model",
+		SubAgents: map[string]*Agent{"reviewer": subAgent},
+		stageOutputReporter: func(stage, content string) {
+			stages = append(stages, stage)
+			contents = append(contents, content)
+		},
+	}
+
+	toolMap := map[string]ToolDefinition{}
+	registerRouteToSubagentTool(toolMap, nil, parent.SubAgents)
+
+	args, err := json.Marshal(map[string]string{
+		"sub_agent_name": "reviewer",
+		"input":          "check this patch",
+	})
+	if err != nil {
+		t.Fatalf("marshal args failed: %v", err)
+	}
+
+	if _, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent); err != nil {
+		t.Fatalf("route_to_subagent failed: %v", err)
+	}
+	if len(stages) != 2 {
+		t.Fatalf("expected 2 reported events, got %d", len(stages))
+	}
+	if stages[0] != "SubAgent reviewer" || stages[1] != "SubAgent reviewer" {
+		t.Fatalf("unexpected stages: %v", stages)
+	}
+	if contents[0] != "开始处理子任务:\ncheck this patch" {
+		t.Fatalf("unexpected start content: %q", contents[0])
+	}
+	if contents[1] != "输出结果:\nfound one bug" {
+		t.Fatalf("unexpected result content: %q", contents[1])
+	}
+}

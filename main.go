@@ -49,8 +49,16 @@ type cliSession struct {
 	systemPrompt   string
 	agent          *agents.Agent
 	history        []openai.ChatCompletionMessageParamUnion
+	outputHistory  []string
+	liveBlocks     map[string]liveOutputBlock
+	liveOrder      []string
 	running        bool
 	runCancel      context.CancelFunc
+}
+
+type liveOutputBlock struct {
+	Title   string
+	Content string
 }
 
 func main() {
@@ -177,6 +185,7 @@ func newCLISession(app *tview.Application, output *tview.TextView, logs *tview.T
 		skillLoader:    skillLoader,
 		subAgentLoader: subAgentLoader,
 		systemPrompt:   systemPrompt,
+		liveBlocks:     make(map[string]liveOutputBlock),
 	}
 	session.resetConversation()
 	return session
@@ -342,23 +351,36 @@ func (s *cliSession) rebuildAgent() {
 		agents.WithSubAgents(subAgents),
 		agents.WithSkillLoader(s.skillLoader),
 	)
-	s.agent.SetStageOutputReporter(func(stage, content string) {
-		s.app.QueueUpdateDraw(func() {
-			switch stage {
-			case "planner":
-				s.appendLine("[yellow]Planner:[white] %s", tview.Escape(content))
-			default:
-				s.appendLine("[yellow]%s:[white] %s", tview.Escape(stage), tview.Escape(content))
-			}
-			s.output.ScrollToEnd()
-		})
-	})
+	wireAgentReporters(s.agent,
+		func(stage, content string) {
+			s.app.QueueUpdateDraw(func() {
+				switch stage {
+				case "planner":
+					s.appendLine("[yellow]Planner:[white] %s", tview.Escape(content))
+				default:
+					s.appendLine("[yellow]%s:[white] %s", tview.Escape(stage), tview.Escape(content))
+				}
+				s.output.ScrollToEnd()
+			})
+		},
+		func(id, title, content string, done bool) {
+			s.app.QueueUpdateDraw(func() {
+				if done {
+					s.clearLiveBlock(id)
+				} else {
+					s.setLiveBlock(id, title, content)
+				}
+				s.output.ScrollToEnd()
+			})
+		},
+	)
 	currentDir = s.agent.WorkDir
 	s.updateHeader()
 }
 
 func (s *cliSession) appendLine(format string, args ...any) {
-	fmt.Fprintf(s.output, format+"\n", args...)
+	s.outputHistory = append(s.outputHistory, fmt.Sprintf(format, args...))
+	s.renderOutput()
 }
 
 func (s *cliSession) showStartupLogo() {
@@ -375,9 +397,78 @@ func (s *cliSession) appendLogLine(line string) {
 }
 
 func (s *cliSession) clearViews() {
-	s.output.Clear()
+	s.outputHistory = nil
+	s.liveBlocks = make(map[string]liveOutputBlock)
+	s.liveOrder = nil
+	s.renderOutput()
 	if s.logs != nil {
 		s.logs.Clear()
+	}
+}
+
+func (s *cliSession) setLiveBlock(id, title, content string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	if _, exists := s.liveBlocks[id]; !exists {
+		s.liveOrder = append(s.liveOrder, id)
+	}
+	s.liveBlocks[id] = liveOutputBlock{Title: title, Content: content}
+	s.renderOutput()
+}
+
+func (s *cliSession) clearLiveBlock(id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	if _, exists := s.liveBlocks[id]; !exists {
+		return
+	}
+	delete(s.liveBlocks, id)
+	next := make([]string, 0, len(s.liveOrder))
+	for _, existing := range s.liveOrder {
+		if existing != id {
+			next = append(next, existing)
+		}
+	}
+	s.liveOrder = next
+	s.renderOutput()
+}
+
+func (s *cliSession) renderOutput() {
+	if s.output == nil {
+		return
+	}
+	s.output.Clear()
+	for _, line := range s.outputHistory {
+		fmt.Fprintln(s.output, line)
+	}
+	for _, id := range s.liveOrder {
+		block, ok := s.liveBlocks[id]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(
+			s.output,
+			"[yellow]%s:[white] %s\n",
+			tview.Escape(block.Title),
+			tview.Escape(block.Content),
+		)
+	}
+}
+
+func wireAgentReporters(
+	agent *agents.Agent,
+	stageReporter func(stage, content string),
+	liveReporter func(id, title, content string, done bool),
+) {
+	if agent == nil {
+		return
+	}
+	agent.SetStageOutputReporter(stageReporter)
+	agent.SetLiveOutputReporter(liveReporter)
+	for _, subAgent := range agent.SubAgents {
+		wireAgentReporters(subAgent, stageReporter, liveReporter)
 	}
 }
 
@@ -387,7 +478,7 @@ func buildSystemPrompt(skillLoader *agents.SkillLoader, subAgentLoader *agents.S
 		"For complex tasks, use the task board to keep the plan and execution state explicit. " +
 		"When you spawn a teammate, capture the returned run_id. If later steps depend on that teammate's work, call wait_teammate with the run_id before continuing or giving a final answer. Do not assume background teammates finish before you do. " +
 		"After wait_teammate returns, inspect the returned run status and any inbox report, then decide the next step. " +
-		"Use TodoWrite for short checklists. " +
+		"Use the todo tool for short checklists. " +
 		fmt.Sprintf("Skills: %s. ", skillLoader.GetDescriptions()) +
 		fmt.Sprintf("Sub-agents: %s", subAgentLoader.GetDescriptions())
 }

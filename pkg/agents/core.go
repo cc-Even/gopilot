@@ -63,6 +63,8 @@ type Agent struct {
 	ApiKey          string
 	Model           string
 	InheritModel    bool
+	LiveOutputID    string
+	LiveOutputTitle string
 	WorkDir         string
 	SubAgents       map[string]*Agent
 	SkillLoader     *SkillLoader
@@ -78,6 +80,7 @@ type Agent struct {
 	autoCompactSummarizer func(context.Context, string) (string, error)
 	runLoopOverride       func(*Agent, context.Context, []openai.ChatCompletionMessageParamUnion) (string, error)
 	stageOutputReporter   func(stage, content string)
+	liveOutputReporter    func(id, title, content string, done bool)
 }
 
 type AgentOptions struct {
@@ -153,6 +156,13 @@ func (a *Agent) SetStageOutputReporter(reporter func(stage, content string)) {
 	a.stageOutputReporter = reporter
 }
 
+func (a *Agent) SetLiveOutputReporter(reporter func(id, title, content string, done bool)) {
+	if a == nil {
+		return
+	}
+	a.liveOutputReporter = reporter
+}
+
 func registerLoadSkillTool(toolMap map[string]ToolDefinition, order []string, skillLoader *SkillLoader) []string {
 	order = append(order, "load_skill")
 	toolMap["load_skill"] = ToolDefinition{
@@ -221,11 +231,14 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 			if err := json.Unmarshal(args, &params); err != nil {
 				return "", fmt.Errorf("invalid route_to_subagent args: %w", err)
 			}
-			fmt.Println("Routing to sub-agent:", params.SubAgentName, "with input:", params.Input)
 			subAgent, ok := agent.SubAgents[params.SubAgentName]
 			if !ok {
 				return "", fmt.Errorf("unknown sub-agent: %s", params.SubAgentName)
 			}
+			agent.reportStageOutput(
+				fmt.Sprintf("SubAgent %s", params.SubAgentName),
+				fmt.Sprintf("开始处理子任务:\n%s", strings.TrimSpace(params.Input)),
+			)
 			runner := subAgent.cloneWithTools(subAgent.SystemPrompt, nil)
 			if runner == nil {
 				return "", fmt.Errorf("failed to clone sub-agent: %s", params.SubAgentName)
@@ -233,10 +246,23 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 			if runner.InheritModel {
 				runner.Model = agent.Model
 			}
+			runner.LiveOutputID = fmt.Sprintf("subagent:%s", params.SubAgentName)
+			runner.LiveOutputTitle = fmt.Sprintf("SubAgent %s", params.SubAgentName)
 			result, err := runner.Run(ctx, []openai.ChatCompletionMessageParamUnion{
 				openai.SystemMessage(runner.SystemPrompt),
 				openai.UserMessage(params.Input),
 			})
+			if err != nil {
+				agent.reportStageOutput(
+					fmt.Sprintf("SubAgent %s", params.SubAgentName),
+					fmt.Sprintf("执行失败:\n%s", err.Error()),
+				)
+				return "", err
+			}
+			agent.reportStageOutput(
+				fmt.Sprintf("SubAgent %s", params.SubAgentName),
+				fmt.Sprintf("输出结果:\n%s", strings.TrimSpace(result)),
+			)
 			return result, err
 		},
 	}
@@ -347,6 +373,8 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		BaseUrl:         baseURL,
 		ApiKey:          apiKey,
 		Model:           model,
+		LiveOutputID:    "agent:" + name,
+		LiveOutputTitle: name,
 		WorkDir:         WORKDIR,
 		SubAgents:       subAgents,
 		SkillLoader:     skillLoader,
@@ -370,6 +398,8 @@ func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessage
 
 func (a *Agent) RunStructured(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
 	planner := a.cloneWithTools(a.plannerSystemPrompt(), plannerToolAllowlist)
+	planner.LiveOutputID = fmt.Sprintf("%s:planner", a.Name)
+	planner.LiveOutputTitle = "Planner"
 	plannerMessages := applySystemPrompt(messages, planner.SystemPrompt)
 	plannerMessages = append(plannerMessages, openai.UserMessage(a.plannerContextMessage()))
 
@@ -380,6 +410,8 @@ func (a *Agent) RunStructured(ctx context.Context, messages []openai.ChatComplet
 	a.reportStageOutput("planner", plan)
 
 	executor := a.cloneWithTools(a.executorSystemPrompt(), nil)
+	executor.LiveOutputID = fmt.Sprintf("%s:executor", a.Name)
+	executor.LiveOutputTitle = "Executor"
 	executorMessages := applySystemPrompt(messages, executor.SystemPrompt)
 	executorMessages = append(executorMessages, openai.UserMessage(a.executorContextMessage(plan)))
 
@@ -413,14 +445,10 @@ func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMes
 			return "", fmt.Errorf("stage turn events failed (turn=%d): %w", turn, err)
 		}
 
-		resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-			Model:    a.Model,
-			Messages: messages,
-			Tools:    a.openAITools(),
-		})
+		resp, err := a.streamChatCompletion(ctx, messages, turn)
 		if err != nil {
 			_ = turnAcks.Rollback()
-			return "", fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
+			return "", err
 		}
 		if err := turnAcks.Commit(); err != nil {
 			return "", fmt.Errorf("ack turn events failed (turn=%d): %w", turn, err)
@@ -445,10 +473,18 @@ func (a *Agent) runLoop(ctx context.Context, messages []openai.ChatCompletionMes
 			for _, tc := range choice.Message.ToolCalls {
 				toolName := tc.Function.Name
 				toolArgs := json.RawMessage(tc.Function.Arguments)
+				a.reportStageOutput(
+					fmt.Sprintf("%s Tool %s", a.displayTitle(), toolName),
+					fmt.Sprintf("开始执行:\n%s", strings.TrimSpace(tc.Function.Arguments)),
+				)
 				output, callErr := a.executeTool(ctx, toolName, toolArgs)
 				if callErr != nil {
 					output = "tool error: " + callErr.Error()
 				}
+				a.reportStageOutput(
+					fmt.Sprintf("%s Tool %s", a.displayTitle(), toolName),
+					fmt.Sprintf("执行结果:\n%s", strings.TrimSpace(toolResultCompact(output, toolName))),
+				)
 
 				// 回填 tool 消息，关联 tool_call_id
 				messages = append(messages, openai.ToolMessage(output, tc.ID))
@@ -521,6 +557,118 @@ func (a *Agent) reportStageOutput(stage, content string) {
 		return
 	}
 	a.stageOutputReporter(stage, content)
+}
+
+func (a *Agent) reportLiveOutput(id, title, content string, done bool) {
+	if a == nil || a.liveOutputReporter == nil {
+		return
+	}
+	a.liveOutputReporter(id, title, content, done)
+}
+
+func (a *Agent) displayTitle() string {
+	if a == nil {
+		return "Agent"
+	}
+	if strings.TrimSpace(a.LiveOutputTitle) != "" {
+		return a.LiveOutputTitle
+	}
+	if strings.TrimSpace(a.Name) != "" {
+		return a.Name
+	}
+	return "Agent"
+}
+
+func (a *Agent) liveOutputIdentity() (string, string) {
+	if a == nil {
+		return "", ""
+	}
+	id := strings.TrimSpace(a.LiveOutputID)
+	if id == "" {
+		id = "agent:" + strings.TrimSpace(a.Name)
+	}
+	title := strings.TrimSpace(a.LiveOutputTitle)
+	if title == "" {
+		title = a.displayTitle()
+	}
+	return id, title
+}
+
+func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, turn int) (*openai.ChatCompletion, error) {
+	stream := a.client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
+		Model:    a.Model,
+		Messages: messages,
+		Tools:    a.openAITools(),
+	})
+	acc := openai.ChatCompletionAccumulator{}
+	liveID, liveTitle := a.liveOutputIdentity()
+	lastPreview := ""
+	if liveID != "" {
+		lastPreview = "思考中..."
+		a.reportLiveOutput(liveID, liveTitle, lastPreview, false)
+	}
+
+	for stream.Next() {
+		chunk := stream.Current()
+		if !acc.AddChunk(chunk) {
+			a.reportLiveOutput(liveID, liveTitle, "", true)
+			return nil, fmt.Errorf("chat completion stream accumulate failed (turn=%d)", turn)
+		}
+		preview := renderStreamingPreview(acc.ChatCompletion)
+		if preview != "" && preview != lastPreview {
+			lastPreview = preview
+			a.reportLiveOutput(liveID, liveTitle, preview, false)
+		}
+	}
+
+	if err := stream.Err(); err != nil {
+		a.reportLiveOutput(liveID, liveTitle, "", true)
+		return nil, fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
+	}
+	a.reportLiveOutput(liveID, liveTitle, "", true)
+
+	if len(acc.Choices) == 0 {
+		return nil, fmt.Errorf("empty choices from model")
+	}
+	resp := acc.ChatCompletion
+	return &resp, nil
+}
+
+func renderStreamingPreview(resp openai.ChatCompletion) string {
+	if len(resp.Choices) == 0 {
+		return ""
+	}
+	choice := resp.Choices[0]
+	parts := make([]string, 0, 2)
+	if strings.TrimSpace(choice.Message.Content) != "" {
+		parts = append(parts, choice.Message.Content)
+	} else if strings.TrimSpace(choice.Message.Refusal) != "" {
+		parts = append(parts, choice.Message.Refusal)
+	}
+	if len(choice.Message.ToolCalls) > 0 {
+		parts = append(parts, "调用工具:\n"+formatToolCallPreview(choice.Message.ToolCalls))
+	}
+	if len(parts) == 0 {
+		return "思考中..."
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
+func formatToolCallPreview(toolCalls []openai.ChatCompletionMessageToolCallUnion) string {
+	lines := make([]string, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		name := strings.TrimSpace(tc.Function.Name)
+		if name == "" {
+			name = "(pending)"
+		}
+		args := strings.TrimSpace(tc.Function.Arguments)
+		if args == "" {
+			lines = append(lines, fmt.Sprintf("- %s", name))
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s %s", name, args))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (a *Agent) plannerSystemPrompt() string {

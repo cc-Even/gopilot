@@ -23,12 +23,31 @@ func UpdateTodoTool(_ context.Context, input string, agent *Agent) (string, erro
 }
 
 func parseTodoItems(input string) ([]TodoItems, error) {
-	var items []TodoItems
-	err := json.Unmarshal([]byte(input), &items)
-	if err != nil {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" || trimmed == "null" {
+		return nil, fmt.Errorf("todo args empty")
+	}
+
+	// Keep backward compatibility with the legacy top-level array format while
+	// making the primary contract an object with an items field.
+	if strings.HasPrefix(trimmed, "[") {
+		var items []TodoItems
+		if err := json.Unmarshal([]byte(trimmed), &items); err != nil {
+			return nil, err
+		}
+		return items, nil
+	}
+
+	var payload struct {
+		Items *[]TodoItems `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
 		return nil, err
 	}
-	return items, nil
+	if payload.Items == nil {
+		return nil, fmt.Errorf("todo args missing items")
+	}
+	return *payload.Items, nil
 }
 
 func UpdateTodo(items []TodoItems) (string, error) {

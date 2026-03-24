@@ -254,8 +254,22 @@ func DefaultToolDefinitions() []ToolDefinition {
 		),
 		ToolFromJSONString(
 			"todo",
-			"Update todo items.You need enter the complete todo list. input should be a JSON array of objects with fields: id, text, status (pending, in_progress, completed).",
-			ObjectSchema(map[string]any{"id": IntegerParam(), "text": StringParam(), "status": StringParam()}),
+			"Update todo items. Always send the complete list in {\"items\":[...]}. Each item must include id, text, and optional status from pending, in_progress, completed.",
+			ObjectSchema(map[string]any{
+				"items": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type":                 "object",
+						"additionalProperties": false,
+						"properties": map[string]any{
+							"id":     IntegerParam(),
+							"text":   StringParam(),
+							"status": map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
+						},
+						"required": []string{"id", "text"},
+					},
+				},
+			}, "items"),
 			UpdateTodoTool,
 		),
 		// Task management tools
