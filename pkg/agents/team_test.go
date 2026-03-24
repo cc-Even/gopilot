@@ -687,14 +687,19 @@ func TestTeammateLoopFailsRunWithoutExplicitCompletionReport(t *testing.T) {
 
 func TestCompleteTaskAndReportToolCompletesTaskAndReportsRun(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+	teamDir := filepath.Join(stateDir, "teams")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
 	if _, err := taskManager.Create("summarize team", "read and summarize team.go"); err != nil {
 		t.Fatalf("create task failed: %v", err)
 	}
-	worktreeManager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	worktreeManager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -708,7 +713,7 @@ func TestCompleteTaskAndReportToolCompletesTaskAndReportsRun(t *testing.T) {
 		tools:           map[string]ToolDefinition{},
 	}
 
-	manager := NewTeammateManager(filepath.Join(repoDir, ".teams"), base)
+	manager := NewTeammateManager(teamDir, base)
 	base.TeamManager = manager
 	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
 		<-ctx.Done()
@@ -779,14 +784,19 @@ func TestCompleteTaskAndReportToolCompletesTaskAndReportsRun(t *testing.T) {
 
 func TestCompleteTaskAndReportToolKeepsWorktreeWhenRequested(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+	teamDir := filepath.Join(stateDir, "teams")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
 	if _, err := taskManager.Create("summarize worktree", "read and summarize worktree.go"); err != nil {
 		t.Fatalf("create task failed: %v", err)
 	}
-	worktreeManager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	worktreeManager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -800,7 +810,7 @@ func TestCompleteTaskAndReportToolKeepsWorktreeWhenRequested(t *testing.T) {
 		tools:           map[string]ToolDefinition{},
 	}
 
-	manager := NewTeammateManager(filepath.Join(repoDir, ".teams"), base)
+	manager := NewTeammateManager(teamDir, base)
 	base.TeamManager = manager
 	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
 		<-ctx.Done()

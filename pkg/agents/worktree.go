@@ -63,17 +63,20 @@ type WorktreeManager struct {
 	mu         sync.Mutex
 }
 
-func NewWorktreeManager(rootDir string, tasks *TaskManager) (*WorktreeManager, error) {
+func NewWorktreeManager(repoRoot, rootDir string, tasks *TaskManager) (*WorktreeManager, error) {
+	if strings.TrimSpace(repoRoot) == "" {
+		return nil, fmt.Errorf("repo root is required")
+	}
 	if strings.TrimSpace(rootDir) == "" {
 		return nil, fmt.Errorf("worktree root is required")
 	}
-	if err := os.MkdirAll(rootDir, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create worktree root: %w", err)
-	}
 
-	repoRoot, err := gitRepoRoot(filepath.Dir(rootDir))
+	repoRoot, err := gitRepoRoot(repoRoot)
 	if err != nil {
 		return nil, err
+	}
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create worktree root: %w", err)
 	}
 
 	wm := &WorktreeManager{

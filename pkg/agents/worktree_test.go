@@ -11,7 +11,11 @@ import (
 
 func TestWorktreeManagerCreateRemoveCompletesTask(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
@@ -19,7 +23,7 @@ func TestWorktreeManagerCreateRemoveCompletesTask(t *testing.T) {
 		t.Fatalf("create task failed: %v", err)
 	}
 
-	manager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	manager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -36,6 +40,9 @@ func TestWorktreeManagerCreateRemoveCompletesTask(t *testing.T) {
 	}
 	if _, err := os.Stat(record.Path); err != nil {
 		t.Fatalf("expected worktree path to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, ".worktrees")); !os.IsNotExist(err) {
+		t.Fatalf("expected assistant state to stay out of repo, stat err=%v", err)
 	}
 
 	task := mustLoadTask(t, taskManager, 0)
@@ -65,7 +72,7 @@ func TestWorktreeManagerCreateRemoveCompletesTask(t *testing.T) {
 		t.Fatalf("expected task worktree unbound, got %+v", task)
 	}
 
-	indexRaw, err := os.ReadFile(filepath.Join(repoDir, ".worktrees", "index.json"))
+	indexRaw, err := os.ReadFile(filepath.Join(worktreeDir, "index.json"))
 	if err != nil {
 		t.Fatalf("read index failed: %v", err)
 	}
@@ -73,7 +80,7 @@ func TestWorktreeManagerCreateRemoveCompletesTask(t *testing.T) {
 		t.Fatalf("index missing removed status: %s", string(indexRaw))
 	}
 
-	eventsRaw, err := os.ReadFile(filepath.Join(repoDir, ".worktrees", "events.jsonl"))
+	eventsRaw, err := os.ReadFile(filepath.Join(worktreeDir, "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read events failed: %v", err)
 	}
@@ -92,7 +99,11 @@ func TestWorktreeManagerCreateRemoveCompletesTask(t *testing.T) {
 
 func TestWorktreeManagerRebuildsIndexFromTasks(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
@@ -100,8 +111,7 @@ func TestWorktreeManagerRebuildsIndexFromTasks(t *testing.T) {
 		t.Fatalf("create task failed: %v", err)
 	}
 
-	rootDir := filepath.Join(repoDir, ".worktrees")
-	manager, err := NewWorktreeManager(rootDir, taskManager)
+	manager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -109,12 +119,12 @@ func TestWorktreeManagerRebuildsIndexFromTasks(t *testing.T) {
 		t.Fatalf("create worktree failed: %v", err)
 	}
 
-	indexPath := filepath.Join(rootDir, "index.json")
+	indexPath := filepath.Join(worktreeDir, "index.json")
 	if err := os.Remove(indexPath); err != nil {
 		t.Fatalf("remove index failed: %v", err)
 	}
 
-	manager, err = NewWorktreeManager(rootDir, taskManager)
+	manager, err = NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("rebuild worktree manager failed: %v", err)
 	}
@@ -137,7 +147,12 @@ func TestWorktreeManagerRebuildsIndexFromTasks(t *testing.T) {
 
 func TestTeammateManagerClaimAssignsWorktreeDirectory(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+	teamDir := filepath.Join(stateDir, "teams")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
@@ -145,7 +160,7 @@ func TestTeammateManagerClaimAssignsWorktreeDirectory(t *testing.T) {
 		t.Fatalf("create task failed: %v", err)
 	}
 
-	worktreeManager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	worktreeManager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -160,7 +175,7 @@ func TestTeammateManagerClaimAssignsWorktreeDirectory(t *testing.T) {
 		tools:           map[string]ToolDefinition{},
 	}
 
-	manager := NewTeammateManager(filepath.Join(repoDir, ".teams"), base)
+	manager := NewTeammateManager(teamDir, base)
 	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
 
 	message, err := manager.nextIdleEvent(agent)
@@ -188,7 +203,11 @@ func TestTeammateManagerClaimAssignsWorktreeDirectory(t *testing.T) {
 
 func TestWorktreeManagerEnsureForTaskRecreatesMissingDirectory(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
@@ -196,7 +215,7 @@ func TestWorktreeManagerEnsureForTaskRecreatesMissingDirectory(t *testing.T) {
 		t.Fatalf("create task failed: %v", err)
 	}
 
-	manager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	manager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -225,7 +244,11 @@ func TestWorktreeManagerEnsureForTaskRecreatesMissingDirectory(t *testing.T) {
 
 func TestWorktreeManagerEnsureForTaskPrunesMissingButRegisteredWorktree(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
@@ -233,7 +256,7 @@ func TestWorktreeManagerEnsureForTaskPrunesMissingButRegisteredWorktree(t *testi
 		t.Fatalf("create task failed: %v", err)
 	}
 
-	manager, err := NewWorktreeManager(filepath.Join(repoDir, ".worktrees"), taskManager)
+	manager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -264,7 +287,11 @@ func TestWorktreeManagerEnsureForTaskPrunesMissingButRegisteredWorktree(t *testi
 
 func TestWorktreeManagerCreateReusesMissingErrorRecord(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
@@ -272,8 +299,7 @@ func TestWorktreeManagerCreateReusesMissingErrorRecord(t *testing.T) {
 		t.Fatalf("create task failed: %v", err)
 	}
 
-	rootDir := filepath.Join(repoDir, ".worktrees")
-	manager, err := NewWorktreeManager(rootDir, taskManager)
+	manager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -281,7 +307,7 @@ func TestWorktreeManagerCreateReusesMissingErrorRecord(t *testing.T) {
 	index := worktreeIndex{
 		Worktrees: []*Worktree{{
 			Name:   "reuse-stale-record",
-			Path:   filepath.Join(rootDir, "reuse-stale-record"),
+			Path:   filepath.Join(worktreeDir, "reuse-stale-record"),
 			Branch: "wt/reuse-stale-record",
 			Status: worktreeStatusError,
 		}},
@@ -290,7 +316,7 @@ func TestWorktreeManagerCreateReusesMissingErrorRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal index failed: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(rootDir, "index.json"), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(worktreeDir, "index.json"), data, 0o644); err != nil {
 		t.Fatalf("write index failed: %v", err)
 	}
 
@@ -308,7 +334,11 @@ func TestWorktreeManagerCreateReusesMissingErrorRecord(t *testing.T) {
 
 func TestWorktreeManagerRebuildUnbindsRemovedWorktreeTasks(t *testing.T) {
 	repoDir := initTestRepo(t)
-	taskManager, err := NewTaskManager(filepath.Join(repoDir, ".tasks"))
+	stateDir := t.TempDir()
+	taskDir := filepath.Join(stateDir, "tasks")
+	worktreeDir := filepath.Join(stateDir, "worktrees")
+
+	taskManager, err := NewTaskManager(taskDir)
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
 	}
@@ -316,8 +346,7 @@ func TestWorktreeManagerRebuildUnbindsRemovedWorktreeTasks(t *testing.T) {
 		t.Fatalf("create task failed: %v", err)
 	}
 
-	rootDir := filepath.Join(repoDir, ".worktrees")
-	manager, err := NewWorktreeManager(rootDir, taskManager)
+	manager, err := NewWorktreeManager(repoDir, worktreeDir, taskManager)
 	if err != nil {
 		t.Fatalf("create worktree manager failed: %v", err)
 	}
@@ -327,7 +356,7 @@ func TestWorktreeManagerRebuildUnbindsRemovedWorktreeTasks(t *testing.T) {
 	}
 
 	runTestCmd(t, repoDir, "git", "worktree", "remove", "--force", record.Path)
-	indexPath := filepath.Join(rootDir, "index.json")
+	indexPath := filepath.Join(worktreeDir, "index.json")
 	index := worktreeIndex{
 		Worktrees: []*Worktree{{
 			Name:   record.Name,
@@ -345,7 +374,7 @@ func TestWorktreeManagerRebuildUnbindsRemovedWorktreeTasks(t *testing.T) {
 		t.Fatalf("write index failed: %v", err)
 	}
 
-	if _, err := NewWorktreeManager(rootDir, taskManager); err != nil {
+	if _, err := NewWorktreeManager(repoDir, worktreeDir, taskManager); err != nil {
 		t.Fatalf("rebuild worktree manager failed: %v", err)
 	}
 

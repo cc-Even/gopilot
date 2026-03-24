@@ -2,7 +2,8 @@ package main
 
 import (
 	"bufio"
-	"claude-go/agents"
+	"claude-go/pkg/agents"
+	"claude-go/pkg/version"
 	"context"
 	"fmt"
 	"log"
@@ -18,10 +19,18 @@ import (
 )
 
 const (
-	ToolName    = "Claude Go"
-	ToolVersion = "v0.1.0"
 	LogFileName = "debug.log"
+	ToolName    = "Gopilot"
 )
+
+const logo = `
+  ____             _ _       _   
+ / ___| ___  _ __ (_) | ___ | |_ 
+| |  _ / _ \| '_ \| | |/ _ \| __|
+| |_| | (_) | |_) | | | (_) | |_ 
+ \____|\___/| .__/|_|_|\___/ \__|
+            |_|                  
+`
 
 var (
 	currentModel = "unknown"
@@ -62,7 +71,7 @@ func main() {
 		headerText := fmt.Sprintf(
 			"[yellow::b]%s [white::]%s | [gray]Model:[green] %s [gray]| Dir:[blue] %s",
 			ToolName,
-			ToolVersion,
+			version.Version,
 			tview.Escape(currentModel),
 			tview.Escape(currentDir),
 		)
@@ -82,7 +91,7 @@ func main() {
 		SetWordWrap(true)
 	logView.SetBorder(true).SetTitle(" Logs ")
 
-	logPath := filepath.Join(agents.WORKDIR, LogFileName)
+	logPath := filepath.Join(agents.TOOLDIR, LogFileName)
 	if err := installUILogSink(app, logView, logPath); err != nil {
 		log.Printf("Warning: failed to install UI log sink: %v", err)
 	} else {
@@ -103,6 +112,7 @@ func main() {
 	}
 
 	session := newCLISession(app, outputView, logView, updateHeader, envFile)
+	session.showStartupLogo()
 
 	inputField.SetAutocompleteFunc(func(currentText string) (entries []string) {
 		if !strings.HasPrefix(currentText, "/") {
@@ -183,7 +193,7 @@ func (s *cliSession) handleInput(input string) {
 	}
 
 	s.appendLine("[purple]User:[white] %s", tview.Escape(input))
-	s.appendLine("[green]Claude:[white] 正在处理...")
+	s.appendLine("[green]Gopilot:[white] 正在思考中...")
 	s.output.ScrollToEnd()
 
 	history := append([]openai.ChatCompletionMessageParamUnion{}, s.history...)
@@ -203,7 +213,7 @@ func (s *cliSession) handleInput(input string) {
 			}()
 
 			if err != nil {
-				s.appendLine("[red]Claude Error:[white] %s", tview.Escape(err.Error()))
+				s.appendLine("[red]Gopilot Error:[white] %s", tview.Escape(err.Error()))
 				return
 			}
 
@@ -211,7 +221,7 @@ func (s *cliSession) handleInput(input string) {
 			currentDir = activeAgent.WorkDir
 			currentModel = activeAgent.Model
 			s.updateHeader()
-			s.appendLine("[green]Claude:[white] %s", tview.Escape(response))
+			s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
 		})
 	}(history, agent)
 }
@@ -335,6 +345,11 @@ func (s *cliSession) appendLine(format string, args ...any) {
 	fmt.Fprintf(s.output, format+"\n", args...)
 }
 
+func (s *cliSession) showStartupLogo() {
+	s.appendLine("[green]%s[white]", tview.Escape(strings.TrimPrefix(logo, "\n")))
+	s.output.ScrollToBeginning()
+}
+
 func (s *cliSession) appendLogLine(line string) {
 	if s.logs == nil {
 		return
@@ -361,8 +376,9 @@ func buildSystemPrompt(skillLoader *agents.SkillLoader) string {
 
 func detectEnvFile() string {
 	for _, candidate := range []string{".env", "setting.env"} {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
+		envPath := filepath.Join(agents.TOOLDIR, candidate)
+		if _, err := os.Stat(envPath); err == nil {
+			return envPath
 		}
 	}
 	return ".env"

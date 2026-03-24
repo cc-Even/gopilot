@@ -296,7 +296,7 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize task manager: %v\n", err)
 	}
-	worktreeManager, err := NewWorktreeManager(WORKTREE_DIR, taskManager)
+	worktreeManager, err := NewWorktreeManager(REPO_ROOT, WORKTREE_DIR, taskManager)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize worktree manager: %v\n", err)
 	}
