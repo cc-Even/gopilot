@@ -621,7 +621,6 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 	roundsSinceTodo := 0
 	for turn := 0; turn < maxTurns; turn++ {
 		var err error
-		messages = compactToolMessages(messages)
 		var compactErr error
 		messages, compactErr = a.maybeAutoCompact(ctx, messages)
 		if compactErr != nil {
@@ -1099,15 +1098,11 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, messages []openai.ChatComp
 	if utf8.RuneCountInString(conversationText) <= autoCompactTriggerChars {
 		return messages, nil
 	}
-	return a.autoCompact(ctx, messages, conversationText, "")
+	return a.autoCompact(ctx, messages, "")
 }
 
 func (a *Agent) forceAutoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
-	conversationText, err := marshalConversation(messages)
-	if err != nil {
-		return nil, err
-	}
-	return a.autoCompact(ctx, messages, conversationText, focus)
+	return a.autoCompact(ctx, messages, focus)
 }
 
 func (a *Agent) injectIdentityBlockIfCompacted(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
@@ -1145,7 +1140,7 @@ func (a *Agent) identityBlock() string {
 	return strings.Join(lines, "\n")
 }
 
-func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, conversationText, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
+func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
 	workdir, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("get working directory failed: %w", err)
@@ -1173,9 +1168,21 @@ func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletio
 	}
 	fmt.Printf("[transcript saved: %s]\n", transcriptPath)
 
+	systemMessages, summarizeMessages, recentMessages, err := splitMessagesForAutoCompact(messages)
+	if err != nil {
+		return nil, err
+	}
+	if len(summarizeMessages) == 0 {
+		return messages, nil
+	}
+
+	conversationText, err := marshalConversation(summarizeMessages)
+	if err != nil {
+		return nil, err
+	}
 	conversationText = truncateByRunes(conversationText, autoCompactSummaryMaxChar)
-	prompt := "Summarize this conversation for continuity. Include: " +
-		"1) What was accomplished, 2) Current state, 3) Key decisions made. " +
+	prompt := "Summarize the older portion of this conversation for continuity while newer messages remain verbatim. Include: " +
+		"1) What was accomplished, 2) Current state and pending work, 3) Key decisions, constraints, and important metadata. " +
 		"Be concise but preserve critical details.\n\n" + conversationText
 	if strings.TrimSpace(focus) != "" {
 		prompt += "\n\nFocus to preserve: " + focus
@@ -1186,10 +1193,13 @@ func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletio
 		return nil, err
 	}
 
-	return []openai.ChatCompletionMessageParamUnion{
+	compacted := cloneChatMessages(systemMessages)
+	compacted = append(compacted,
 		openai.UserMessage(fmt.Sprintf("[Conversation compressed. Transcript: %s]\n\n%s", transcriptPath, summary)),
 		openai.AssistantMessage("Understood. I have the context from the summary. Continuing."),
-	}, nil
+	)
+	compacted = append(compacted, cloneChatMessages(recentMessages)...)
+	return compacted, nil
 }
 
 func (a *Agent) summarizeForAutoCompact(ctx context.Context, prompt string) (string, error) {
@@ -1237,88 +1247,42 @@ func truncateByRunes(input string, maxRunes int) string {
 	return string(out)
 }
 
-func compactToolMessages(messages []openai.ChatCompletionMessageParamUnion) []openai.ChatCompletionMessageParamUnion {
-	toolCallNameByID := buildToolCallNameByID(messages)
+func splitMessagesForAutoCompact(messages []openai.ChatCompletionMessageParamUnion) ([]openai.ChatCompletionMessageParamUnion, []openai.ChatCompletionMessageParamUnion, []openai.ChatCompletionMessageParamUnion, error) {
+	if len(messages) == 0 {
+		return nil, nil, nil, nil
+	}
 
-	lastToolIndex := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if ok, _, _, _ := parseToolMessage(messages[i]); ok {
-			lastToolIndex = i
+	systemPrefixCount := 0
+	for systemPrefixCount < len(messages) {
+		role, _, err := messageRoleAndContent(messages[systemPrefixCount])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if role != "system" {
 			break
 		}
-	}
-	if lastToolIndex == -1 {
-		return messages
+		systemPrefixCount++
 	}
 
-	compacted := make([]openai.ChatCompletionMessageParamUnion, len(messages))
-	copy(compacted, messages)
-	for i := 0; i < len(compacted); i++ {
-		if i == lastToolIndex {
-			continue
-		}
-		ok, content, toolCallID, err := parseToolMessage(compacted[i])
-		if err != nil || !ok {
-			continue
-		}
-		compactedContent := toolResultCompact(content, toolCallNameByID[toolCallID])
-		if compactedContent == content || toolCallID == "" {
-			continue
-		}
-		compacted[i] = openai.ToolMessage(compactedContent, toolCallID)
-	}
-	return compacted
-}
-
-func buildToolCallNameByID(messages []openai.ChatCompletionMessageParamUnion) map[string]string {
-	toolCallNameByID := make(map[string]string)
-	for _, message := range messages {
-		raw, err := json.Marshal(message)
-		if err != nil {
-			continue
-		}
-		type toolCall struct {
-			ID       string `json:"id"`
-			Function struct {
-				Name string `json:"name"`
-			} `json:"function"`
-		}
-		type payload struct {
-			ToolCalls []toolCall `json:"tool_calls"`
-		}
-		p := payload{}
-		if err := json.Unmarshal(raw, &p); err != nil {
-			continue
-		}
-		for _, tc := range p.ToolCalls {
-			if tc.ID == "" || tc.Function.Name == "" {
-				continue
-			}
-			toolCallNameByID[tc.ID] = tc.Function.Name
-		}
-	}
-	return toolCallNameByID
-}
-
-func parseToolMessage(message openai.ChatCompletionMessageParamUnion) (bool, string, string, error) {
-	raw, err := json.Marshal(message)
-	if err != nil {
-		return false, "", "", err
+	systemMessages := cloneChatMessages(messages[:systemPrefixCount])
+	nonSystemMessages := cloneChatMessages(messages[systemPrefixCount:])
+	if len(nonSystemMessages) == 0 {
+		return systemMessages, nil, nil, nil
 	}
 
-	type messagePayload struct {
-		Role       string `json:"role"`
-		Content    string `json:"content"`
-		ToolCallID string `json:"tool_call_id"`
+	recentCount := (len(nonSystemMessages)*30 + 99) / 100
+	if recentCount <= 0 {
+		recentCount = 1
 	}
-	payload := messagePayload{}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return false, "", "", err
+	if recentCount >= len(nonSystemMessages) {
+		if len(nonSystemMessages) == 1 {
+			return systemMessages, cloneChatMessages(nonSystemMessages), nil, nil
+		}
+		recentCount = len(nonSystemMessages) - 1
 	}
-	if payload.Role != "tool" {
-		return false, "", "", nil
-	}
-	return true, payload.Content, payload.ToolCallID, nil
+
+	splitIndex := len(nonSystemMessages) - recentCount
+	return systemMessages, cloneChatMessages(nonSystemMessages[:splitIndex]), cloneChatMessages(nonSystemMessages[splitIndex:]), nil
 }
 
 func messageRoleAndContent(message openai.ChatCompletionMessageParamUnion) (string, string, error) {

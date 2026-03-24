@@ -907,7 +907,6 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 	default:
 	}
 
-	messages = compactToolMessages(messages)
 	var err error
 	messages, err = agent.maybeAutoCompact(ctx, messages)
 	if err != nil {

@@ -11,96 +11,40 @@ import (
 	"github.com/openai/openai-go/v3"
 )
 
-func TestCompactToolMessages_CompactOldKeepLatest(t *testing.T) {
+func TestSplitMessagesForAutoCompact_PreservesSystemPrefixAndRecentTail(t *testing.T) {
 	messages := []openai.ChatCompletionMessageParamUnion{
-		openai.SystemMessage("system"),
-		openai.UserMessage("user"),
+		openai.SystemMessage("system-1"),
+		openai.SystemMessage("system-2"),
+		openai.UserMessage("older-user"),
+		openai.AssistantMessage("older-assistant"),
+		openai.UserMessage("recent-user"),
+		openai.AssistantMessage("recent-assistant"),
 	}
 
-	tc1 := struct {
-		ID   string
-		Name string
-	}{ID: "tc_1", Name: "load_skill"}
-	tc2 := struct {
-		ID   string
-		Name string
-	}{ID: "tc_2", Name: "route_to_subagent"}
-
-	messages = append(messages, assistantToolCallMessage(tc1.ID, tc1.Name))
-	oldOutput := strings.Repeat("A", 120)
-	messages = append(messages, openai.ToolMessage(oldOutput, tc1.ID))
-
-	messages = append(messages, assistantToolCallMessage(tc2.ID, tc2.Name))
-	latestOutput := strings.Repeat("B", 120)
-	messages = append(messages, openai.ToolMessage(latestOutput, tc2.ID))
-
-	compacted := compactToolMessages(messages)
-
-	gotOld := mustToolContentByID(t, compacted, tc1.ID)
-	wantOld := "Previous: used load_skill"
-	if gotOld != wantOld {
-		t.Fatalf("old tool message not compacted, got %q, want %q", gotOld, wantOld)
+	systemMessages, summarizeMessages, recentMessages, err := splitMessagesForAutoCompact(messages)
+	if err != nil {
+		t.Fatalf("splitMessagesForAutoCompact failed: %v", err)
 	}
 
-	gotLatest := mustToolContentByID(t, compacted, tc2.ID)
-	if gotLatest != latestOutput {
-		t.Fatalf("latest tool message should be kept, got %q, want %q", gotLatest, latestOutput)
+	if len(systemMessages) != 2 {
+		t.Fatalf("expected 2 system messages, got %d", len(systemMessages))
 	}
-}
-
-func TestCompactToolMessages_DoNotCompactShortToolMessage(t *testing.T) {
-	messages := []openai.ChatCompletionMessageParamUnion{
-		openai.SystemMessage("system"),
-		openai.UserMessage("user"),
+	if len(summarizeMessages) != 2 {
+		t.Fatalf("expected 2 summarized messages, got %d", len(summarizeMessages))
+	}
+	if len(recentMessages) != 2 {
+		t.Fatalf("expected 2 recent messages, got %d", len(recentMessages))
 	}
 
-	tc := struct {
-		ID   string
-		Name string
-	}{ID: "tc_short", Name: "load_skill"}
-	shortOutput := strings.Repeat("x", 100)
-
-	messages = append(messages, assistantToolCallMessage(tc.ID, tc.Name))
-	messages = append(messages, openai.ToolMessage(shortOutput, tc.ID))
-	messages = append(messages, openai.AssistantMessage("done"))
-
-	compacted := compactToolMessages(messages)
-	got := mustToolContentByID(t, compacted, tc.ID)
-	if got != shortOutput {
-		t.Fatalf("short tool message should not be compacted, got %q, want %q", got, shortOutput)
+	if role, content := mustRoleAndContent(t, systemMessages[0]); role != "system" || content != "system-1" {
+		t.Fatalf("unexpected first system message: role=%q content=%q", role, content)
 	}
-}
-
-func assistantToolCallMessage(toolCallID, toolName string) openai.ChatCompletionMessageParamUnion {
-	assistant := openai.ChatCompletionAssistantMessageParam{
-		ToolCalls: []openai.ChatCompletionMessageToolCallUnionParam{
-			{
-				OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
-					ID: toolCallID,
-					Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
-						Name:      toolName,
-						Arguments: "{}",
-					},
-				},
-			},
-		},
+	if role, content := mustRoleAndContent(t, recentMessages[0]); role != "user" || content != "recent-user" {
+		t.Fatalf("unexpected recent user message: role=%q content=%q", role, content)
 	}
-	return openai.ChatCompletionMessageParamUnion{OfAssistant: &assistant}
-}
-
-func mustToolContentByID(t *testing.T, messages []openai.ChatCompletionMessageParamUnion, toolCallID string) string {
-	t.Helper()
-	for _, msg := range messages {
-		ok, content, id, err := parseToolMessage(msg)
-		if err != nil {
-			t.Fatalf("parseToolMessage failed: %v", err)
-		}
-		if ok && id == toolCallID {
-			return content
-		}
+	if role, content := mustRoleAndContent(t, recentMessages[1]); role != "assistant" || content != "recent-assistant" {
+		t.Fatalf("unexpected recent assistant message: role=%q content=%q", role, content)
 	}
-	t.Fatalf("tool message not found for tool_call_id=%s", toolCallID)
-	return ""
 }
 
 func TestMaybeAutoCompact_WithMockSummary(t *testing.T) {
@@ -117,48 +61,78 @@ func TestMaybeAutoCompact_WithMockSummary(t *testing.T) {
 	})
 
 	mockSummary := "mock summary: state preserved"
+	var summarizePrompt string
 	agent := &Agent{
 		Model: "gpt-4o-mini",
 		autoCompactSummarizer: func(ctx context.Context, prompt string) (string, error) {
-			if !strings.Contains(prompt, "Summarize this conversation for continuity.") {
+			summarizePrompt = prompt
+			if !strings.Contains(prompt, "Summarize the older portion of this conversation for continuity") {
 				t.Fatalf("unexpected summarize prompt: %q", prompt)
 			}
 			return mockSummary, nil
 		},
 	}
 
-	longText := strings.Repeat("x", autoCompactTriggerChars+10)
+	oldUser := strings.Repeat("u", 25000)
+	oldAssistant := strings.Repeat("a", 25000)
+	recentUser := strings.Repeat("r", 20000)
+	recentAssistant := strings.Repeat("s", 20000)
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage("system"),
-		openai.UserMessage(longText),
+		openai.UserMessage(oldUser),
+		openai.AssistantMessage(oldAssistant),
+		openai.UserMessage(recentUser),
+		openai.AssistantMessage(recentAssistant),
 	}
 
 	compacted, err := agent.maybeAutoCompact(context.Background(), messages)
 	if err != nil {
 		t.Fatalf("maybeAutoCompact failed: %v", err)
 	}
-	if len(compacted) != 2 {
-		t.Fatalf("expected 2 messages after compact, got %d", len(compacted))
+	if len(compacted) != 5 {
+		t.Fatalf("expected 5 messages after compact, got %d", len(compacted))
 	}
 
 	role0, content0 := mustRoleAndContent(t, compacted[0])
-	if role0 != "user" {
-		t.Fatalf("expected first role user, got %q", role0)
-	}
-	if !strings.Contains(content0, "[Conversation compressed. Transcript: ") {
-		t.Fatalf("first message missing transcript marker: %q", content0)
-	}
-	if !strings.Contains(content0, mockSummary) {
-		t.Fatalf("first message missing summary content: %q", content0)
+	if role0 != "system" || content0 != "system" {
+		t.Fatalf("expected system prompt to be preserved, got role=%q content=%q", role0, content0)
 	}
 
 	role1, content1 := mustRoleAndContent(t, compacted[1])
-	if role1 != "assistant" {
-		t.Fatalf("expected second role assistant, got %q", role1)
+	if role1 != "user" {
+		t.Fatalf("expected summary marker as user message, got %q", role1)
+	}
+	if !strings.Contains(content1, "[Conversation compressed. Transcript: ") {
+		t.Fatalf("summary marker missing transcript marker: %q", content1)
+	}
+	if !strings.Contains(content1, mockSummary) {
+		t.Fatalf("summary marker missing summary content: %q", content1)
+	}
+
+	role2, content2 := mustRoleAndContent(t, compacted[2])
+	if role2 != "assistant" {
+		t.Fatalf("expected continuation assistant message, got %q", role2)
 	}
 	wantAssistant := "Understood. I have the context from the summary. Continuing."
-	if content1 != wantAssistant {
-		t.Fatalf("unexpected assistant continuation message, got %q", content1)
+	if content2 != wantAssistant {
+		t.Fatalf("unexpected assistant continuation message, got %q", content2)
+	}
+
+	role3, content3 := mustRoleAndContent(t, compacted[3])
+	if role3 != "user" || content3 != recentUser {
+		t.Fatalf("expected recent user message to be preserved verbatim, got role=%q content=%q", role3, content3)
+	}
+
+	role4, content4 := mustRoleAndContent(t, compacted[4])
+	if role4 != "assistant" || content4 != recentAssistant {
+		t.Fatalf("expected recent assistant message to be preserved verbatim, got role=%q content=%q", role4, content4)
+	}
+
+	if !strings.Contains(summarizePrompt, oldUser) || !strings.Contains(summarizePrompt, oldAssistant) {
+		t.Fatalf("summarize prompt missing older messages")
+	}
+	if strings.Contains(summarizePrompt, recentUser) || strings.Contains(summarizePrompt, recentAssistant) {
+		t.Fatalf("summarize prompt should exclude preserved recent messages: %q", summarizePrompt)
 	}
 
 	matches, err := filepath.Glob(filepath.Join(tmp, "transcripts", "transcript_*.jsonl"))
