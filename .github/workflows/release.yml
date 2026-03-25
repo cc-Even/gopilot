@@ -1,0 +1,77 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  # --- 阶段 1: 运行测试 ---
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run Tests
+        run: go test ./...
+
+  # --- 阶段 2: 多平台编译并发布 ---
+  # 只有推送到 tag 且测试通过后才执行
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 定义需要构建的系统和架构
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          # 从 tag 中提取版本号，如 v1.2.3
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # 针对 Windows 特殊处理后缀
+          BINARY_NAME="myapp-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="$BINARY_NAME.exe"
+          fi
+          
+          # 执行编译，通过 -X 注入版本号（可选）
+          go build -v -ldflags "-X main.version=$VERSION" -o "$BINARY_NAME" .
+          
+          # 将文件名存入环境变量，方便下一步引用
+          echo "ASSET_PATH=$BINARY_NAME" >> $GITHUB_ENV
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
