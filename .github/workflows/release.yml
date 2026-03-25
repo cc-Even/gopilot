@@ -101,7 +101,7 @@ jobs:
         - name: Generate Release Notes
           id: changelog
           run: |
-            echo "## 🚀 GoPilot $GITHUB_REF_NAME" > release_notes.md
+            echo "## 🚀 Gopilot $GITHUB_REF_NAME" > release_notes.md
             echo "" >> release_notes.md
 
             echo "### 📦 包含内容" >> release_notes.md
