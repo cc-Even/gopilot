@@ -955,6 +955,30 @@ func normalizePlanningPolicy(policy PlanningPolicy) PlanningPolicy {
 	}
 }
 
+func ParsePlanningPolicy(raw string) (PlanningPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "auto":
+		return PlanningPolicyAuto, nil
+	case "on", "enable", "enabled", "required", "force-on", "force_on":
+		return PlanningPolicyRequired, nil
+	case "off", "disable", "disabled", "skip", "force-off", "force_off":
+		return PlanningPolicySkip, nil
+	default:
+		return "", fmt.Errorf("unknown planning policy %q", raw)
+	}
+}
+
+func PlanningPolicyLabel(policy PlanningPolicy) string {
+	switch normalizePlanningPolicy(policy) {
+	case PlanningPolicyRequired:
+		return "FORCED ON"
+	case PlanningPolicySkip:
+		return "FORCED OFF"
+	default:
+		return "AUTO"
+	}
+}
+
 func (a *Agent) buildExecutorState(plan string, baseMessages []openai.ChatCompletionMessageParamUnion, resumeMessages []openai.ChatCompletionMessageParamUnion, pause *StructuredPauseInfo) *StructuredRunState {
 	state := &StructuredRunState{
 		Stage:            "executor",

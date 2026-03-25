@@ -6,6 +6,7 @@ import (
 	"claude-go/pkg/version"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -41,9 +42,10 @@ const logo = `
 `
 
 var (
-	currentModel = "unknown"
-	currentDir   = agents.WORKDIR
-	modelEnvLine = regexp.MustCompile(`^(\s*)(export\s+)?MODEL\s*=`)
+	currentModel          = "unknown"
+	currentDir            = agents.WORKDIR
+	currentPlanningPolicy = agents.PlanningPolicyAuto
+	modelEnvLine          = regexp.MustCompile(`^(\s*)(export\s+)?MODEL\s*=`)
 )
 
 type cliSession struct {
@@ -56,6 +58,7 @@ type cliSession struct {
 	subAgentLoader *agents.SubAgentLoader
 	systemPrompt   string
 	agent          *agents.Agent
+	planningPolicy agents.PlanningPolicy
 	history        []openai.ChatCompletionMessageParamUnion
 	outputHistory  []string
 	liveBlocks     map[string]liveOutputBlock
@@ -418,6 +421,13 @@ func clampInt(value, minValue, maxValue int) int {
 }
 
 func main() {
+	planningPolicy, err := parsePlanningPolicyArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to parse planning mode: %v\n", err)
+		os.Exit(2)
+	}
+	currentPlanningPolicy = planningPolicy
+
 	envFile := detectEnvFile()
 	if err := reloadEnvFile(envFile); err != nil {
 		log.Printf("Warning: failed to load env file %q: %v", envFile, err)
@@ -432,23 +442,25 @@ func main() {
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
 
-	updateHeader := func() {
-		headerText := fmt.Sprintf(
-			"[yellow::b]%s [white::]%s | [gray]Model:[green] %s [gray]| Dir:[blue] %s",
-			ToolName,
-			version.Version,
-			tview.Escape(currentModel),
-			tview.Escape(currentDir),
-		)
-		header.SetText(headerText)
-	}
-	updateHeader()
-
 	outputView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(true).
 		SetWordWrap(true)
 	outputView.SetBorder(true).SetTitle(" Output ")
+
+	updateHeader := func() {
+		headerText := fmt.Sprintf(
+			"[yellow::b]%s [white::]%s | [gray]Mode:[#f59e0b] %s [gray]| Model:[green] %s [gray]| Dir:[blue] %s",
+			ToolName,
+			version.Version,
+			tview.Escape(agents.PlanningPolicyLabel(currentPlanningPolicy)),
+			tview.Escape(currentModel),
+			tview.Escape(currentDir),
+		)
+		header.SetText(headerText)
+		outputView.SetTitle(fmt.Sprintf(" Output | Plan %s ", agents.PlanningPolicyLabel(currentPlanningPolicy)))
+	}
+	updateHeader()
 
 	logView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -463,12 +475,13 @@ func main() {
 		log.Printf("Debug log file: %s", logPath)
 	}
 
-	session := newCLISession(app, outputView, logView, updateHeader, envFile)
+	session := newCLISession(app, outputView, logView, updateHeader, envFile, planningPolicy)
 	session.showStartupLogo()
 	inputArea := newComposerInput(session.handleInput)
 	commandSuggestions := []string{
 		"/cd",
 		"/model",
+		"/plan",
 		"/tasks",
 		"/team",
 		"/stop",
@@ -577,7 +590,7 @@ func main() {
 	}
 }
 
-func newCLISession(app *tview.Application, output *tview.TextView, logs *tview.TextView, updateHeader func(), envFile string) *cliSession {
+func newCLISession(app *tview.Application, output *tview.TextView, logs *tview.TextView, updateHeader func(), envFile string, planningPolicy agents.PlanningPolicy) *cliSession {
 	skillLoader := agents.NewSkillLoader(agents.SKILL_DIR)
 	subAgentLoader := agents.NewSubAgentLoader(agents.SUBAGENT_DIR)
 	systemPrompt := buildSystemPrompt(skillLoader, subAgentLoader)
@@ -591,6 +604,7 @@ func newCLISession(app *tview.Application, output *tview.TextView, logs *tview.T
 		skillLoader:    skillLoader,
 		subAgentLoader: subAgentLoader,
 		systemPrompt:   systemPrompt,
+		planningPolicy: planningPolicy,
 		liveBlocks:     make(map[string]liveOutputBlock),
 	}
 	session.resetConversation()
@@ -646,6 +660,12 @@ func (s *cliSession) executeCommand(input string) {
 			return
 		}
 		s.handleModelCommand(parts[1:])
+	case "/plan":
+		if s.running {
+			s.appendLine("[red]System:[white] 主 agent 运行中，暂时不能切换 plan 模式。")
+			return
+		}
+		s.handlePlanCommand(parts[1:])
 	case "/tasks":
 		s.handleTasksCommand()
 	case "/team":
@@ -712,6 +732,39 @@ func (s *cliSession) handleModelCommand(args []string) {
 		"[green]System:[white] 已切换模型为 %s，并重新加载 %s。",
 		tview.Escape(currentModel),
 		tview.Escape(s.envFile),
+	)
+}
+
+func (s *cliSession) handlePlanCommand(args []string) {
+	if len(args) == 0 {
+		s.appendLinef(
+			"[yellow]System:[white] 用法: /plan <auto|on|off>  当前模式: %s",
+			tview.Escape(agents.PlanningPolicyLabel(s.planningPolicy)),
+		)
+		return
+	}
+
+	policy, err := agents.ParsePlanningPolicy(args[0])
+	if err != nil {
+		s.appendLinef("[red]System:[white] 切换 plan 模式失败: %s", tview.Escape(err.Error()))
+		return
+	}
+
+	s.planningPolicy = policy
+	currentPlanningPolicy = policy
+	s.updateHeader()
+
+	if s.resumeState != nil {
+		s.appendLinef(
+			"[green]System:[white] 已切换 plan 模式为 %s。当前暂停中的 executor 恢复时仍会继续原现场；新任务将使用新模式。",
+			tview.Escape(agents.PlanningPolicyLabel(policy)),
+		)
+		return
+	}
+
+	s.appendLinef(
+		"[green]System:[white] 已切换 plan 模式为 %s。",
+		tview.Escape(agents.PlanningPolicyLabel(policy)),
 	)
 }
 
@@ -802,7 +855,7 @@ func (s *cliSession) runStructured(snapshot []openai.ChatCompletionMessageParamU
 	s.runCancel = cancel
 
 	go func(historySnapshot []openai.ChatCompletionMessageParamUnion, activeAgent *agents.Agent) {
-		response, state, err := activeAgent.RunStructuredWithState(runCtx, historySnapshot)
+		response, state, err := activeAgent.RunStructuredWithPolicyAndState(runCtx, historySnapshot, s.planningPolicy)
 		s.app.QueueUpdateDraw(func() {
 			defer s.finishRun(activeAgent)
 
@@ -933,11 +986,49 @@ func (s *cliSession) showStartupLogo() {
 		s.appendLine(startupBannerLine(fmt.Sprintf("[%s::b]%s[white:-:-]", color, tview.Escape(line))))
 	}
 	s.appendLine(startupBannerBorder("╠", "╣"))
-	s.appendLine(startupBannerLine(fmt.Sprintf("[gray]version:[white] %s   [gray]model:[white] %s", tview.Escape(version.Version), tview.Escape(currentModel))))
+	s.appendLine(startupBannerLine(fmt.Sprintf("[gray]version:[white] %s   [gray]plan:[white] %s", tview.Escape(version.Version), tview.Escape(agents.PlanningPolicyLabel(currentPlanningPolicy)))))
+	s.appendLine(startupBannerLine(fmt.Sprintf("[gray]model:[white] %s", tview.Escape(currentModel))))
 	s.appendLine(startupBannerLine(fmt.Sprintf("[gray]workspace:[white] %s", tview.Escape(currentDir))))
 	s.appendLine(startupBannerLine("[gray]controls:[white] [green]Enter[white] send  [green]Shift+Enter[white] newline  [green]/[white] commands"))
 	s.appendLine(startupBannerBorder("╚", "╝"))
 	s.output.ScrollToBeginning()
+}
+
+func parsePlanningPolicyArgs(args []string) (agents.PlanningPolicy, error) {
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	planEnabled := fs.Bool("plan", false, "force enable planner stage")
+	planDisabled := fs.Bool("no-plan", false, "force disable planner stage")
+	planMode := fs.String("plan-mode", "auto", "planning mode: auto|on|off")
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+
+	if *planEnabled && *planDisabled {
+		return "", fmt.Errorf("--plan and --no-plan cannot be used together")
+	}
+
+	policy, err := agents.ParsePlanningPolicy(*planMode)
+	if err != nil {
+		return "", err
+	}
+
+	if *planEnabled {
+		if policy == agents.PlanningPolicySkip {
+			return "", fmt.Errorf("--plan conflicts with --plan-mode=%s", *planMode)
+		}
+		policy = agents.PlanningPolicyRequired
+	}
+
+	if *planDisabled {
+		if policy == agents.PlanningPolicyRequired {
+			return "", fmt.Errorf("--no-plan conflicts with --plan-mode=%s", *planMode)
+		}
+		policy = agents.PlanningPolicySkip
+	}
+
+	return policy, nil
 }
 
 func startupBannerBorder(left, right string) string {
@@ -1007,6 +1098,11 @@ func (s *cliSession) renderOutput() {
 		return
 	}
 	s.output.Clear()
+	fmt.Fprintf(
+		s.output,
+		"[#f59e0b::b]PLAN MODE[white:-:-] [white]%s\n\n",
+		tview.Escape(agents.PlanningPolicyLabel(s.planningPolicy)),
+	)
 	for _, line := range s.outputHistory {
 		fmt.Fprintln(s.output, line)
 	}

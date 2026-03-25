@@ -79,6 +79,7 @@ make build
 
 - `/model <name>`：切换当前使用的模型，并自动保存到环境文件中。
 - `/cd  <path>`: 切换工作目录到绝对路径
+- `/plan <mod>`: 计划模式切换为on/off/auto 默认auto
 - `/tasks`：查看当前的任务看板。
 - `/team`：查看 Teammate 的工作状态。
 - `/stop`：中断当前主 Agent 的任务。
