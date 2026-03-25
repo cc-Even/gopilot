@@ -609,7 +609,7 @@ func (a *Agent) RunStructuredWithPolicyAndState(ctx context.Context, messages []
 	plan := ""
 	plannerRan := false
 
-	if a.shouldRunPlanner(messages, policy) {
+	if a.shouldRunPlanner(ctx, messages, policy) {
 		log.Printf("[StructuredRun] agent=%s starting planner stage", agentLogName(a))
 		planner := a.cloneWithTools(a.plannerSystemPrompt(), plannerToolAllowlist)
 		planner.runStage = "planner"
@@ -895,7 +895,7 @@ func (a *Agent) buildExecutorState(plan string, baseMessages []openai.ChatComple
 	return state
 }
 
-func (a *Agent) shouldRunPlanner(messages []openai.ChatCompletionMessageParamUnion, policy PlanningPolicy) bool {
+func (a *Agent) shouldRunPlanner(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, policy PlanningPolicy) bool {
 	switch normalizePlanningPolicy(policy) {
 	case PlanningPolicyRequired:
 		return true
@@ -911,7 +911,7 @@ func (a *Agent) shouldRunPlanner(messages []openai.ChatCompletionMessageParamUni
 	if latest == "" {
 		return true
 	}
-	return !isSimpleDirectExecutionRequest(latest)
+	return !isSimpleDirectExecutionRequest(ctx, a.client, a.Model, latest)
 }
 
 func (a *Agent) hasUnfinishedTasks() bool {
@@ -940,8 +940,54 @@ func lastUserMessageContent(messages []openai.ChatCompletionMessageParamUnion) s
 	return ""
 }
 
-func isSimpleDirectExecutionRequest(input string) bool {
-	trimmed := strings.TrimSpace(strings.ToLower(input))
+// 判断是否需要运行计划器的判断逻辑现在改为使用大模型
+func isSimpleDirectExecutionRequest(ctx context.Context, client openai.Client, model, userInput string) bool {
+	trimmed := strings.TrimSpace(userInput)
+	if trimmed == "" {
+		return false
+	}
+
+	// 调用大模型进行判断
+	return useModelToDetermineSimpleRequest(ctx, client, model, trimmed)
+}
+
+// useModelToDetermineSimpleRequest 使用大模型判断是否为简单请求
+func useModelToDetermineSimpleRequest(ctx context.Context, client openai.Client, model, userInput string) bool {
+	systemPrompt := `你是一个简单请求判断器。你的任务是根据用户输入判断该请求是否足够简单，可以直接执行而无需详细的计划。
+
+判断标准：
+- 简单请求：单一任务、明确目标、不需要多步骤处理
+- 复杂请求：需要多个步骤、涉及多个文件、包含复杂逻辑、或者明确提到需要计划/规划
+
+请只回答 "yes" 或 "no"：
+- "yes"：这是一个简单请求，可以直接执行
+- "no"：这不是一个简单请求，需要计划模式`
+
+	resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model: model,
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage(systemPrompt),
+			openai.UserMessage(fmt.Sprintf("用户输入：%s\n\n请回答 yes 或 no：", userInput)),
+		},
+		MaxCompletionTokens: openai.Int(10), // 设置非常短的 maxTokens
+	})
+	if err != nil {
+		// 如果调用失败，默认返回 false（走计划模式）
+		log.Printf("[isSimpleDirectExecutionRequest] model call failed: %v, defaulting to false", err)
+		return false
+	}
+	if len(resp.Choices) == 0 {
+		return false
+	}
+
+	answer := strings.TrimSpace(strings.ToLower(resp.Choices[0].Message.Content))
+	log.Printf("[isSimpleDirectExecutionRequest] model response: %s for input: %s", answer, truncate(userInput, 50))
+
+	// 只在明确是 "yes" 时返回 true
+	return answer == "yes"
+}
+
+func isSimpleDirectExecutionRequestRule(trimmed string) bool {
 	if trimmed == "" {
 		return false
 	}
