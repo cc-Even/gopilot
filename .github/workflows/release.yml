@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+
 jobs:
   # --- 阶段 1: 运行测试 ---
   test:
