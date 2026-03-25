@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/joho/godotenv"
@@ -22,6 +24,11 @@ import (
 const (
 	LogFileName = "debug.log"
 	ToolName    = "Gopilot"
+
+	composerMinHeight       = 4
+	composerMaxHeight       = 10
+	composerLongInputLimit  = 1200
+	composerBasePlaceholder = "输入消息，Enter 发送，Shift+Enter 换行。`/` 唤出命令后按 Tab 进行选择. Ctrl+C 退出。"
 )
 
 const logo = `
@@ -62,6 +69,352 @@ type cliSession struct {
 type liveOutputBlock struct {
 	Title   string
 	Content string
+}
+
+type composerInput struct {
+	*tview.TextArea
+
+	submit            func(string)
+	resize            func(int)
+	onTextChanged     func(string)
+	beforeKeyEvent    func(event *tcell.EventKey) *tcell.EventKey
+	basePlaceholder   string
+	minHeight         int
+	maxHeight         int
+	lastHeight        int
+	maskedPastes      map[string]string
+	nextMaskedPasteID int
+}
+
+type maskedPasteRange struct {
+	placeholder string
+	start       int
+	end         int
+}
+
+func newComposerInput(submit func(string)) *composerInput {
+	composer := &composerInput{
+		TextArea:        tview.NewTextArea(),
+		submit:          submit,
+		basePlaceholder: composerBasePlaceholder,
+		minHeight:       composerMinHeight,
+		maxHeight:       composerMaxHeight,
+		lastHeight:      composerMinHeight,
+		maskedPastes:    make(map[string]string),
+	}
+
+	composer.
+		SetLabel("[purple::b]❯ [white]").
+		SetWrap(true).
+		SetWordWrap(true).
+		SetPlaceholder(composer.basePlaceholder).
+		SetTextStyle(tcell.StyleDefault.Background(tcell.ColorDefault).Foreground(tcell.ColorWhite)).
+		SetPlaceholderStyle(tcell.StyleDefault.Background(tcell.ColorDefault).Foreground(tcell.ColorGray)).
+		SetLabelStyle(tcell.StyleDefault.Foreground(tcell.ColorWhite))
+
+	composer.SetChangedFunc(func() {
+		composer.syncHeight()
+		if composer.onTextChanged != nil {
+			composer.onTextChanged(composer.TextArea.GetText())
+		}
+	})
+
+	composer.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if composer.beforeKeyEvent != nil {
+			event = composer.beforeKeyEvent(event)
+			if event == nil {
+				return nil
+			}
+		}
+
+		if event.Key() == tcell.KeyEnter && event.Modifiers() == 0 {
+			composer.submitDraft()
+			return nil
+		}
+
+		switch event.Key() {
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
+			if composer.deleteMaskedBlockAtCursor(true) {
+				return nil
+			}
+		case tcell.KeyDelete, tcell.KeyCtrlD:
+			if composer.deleteMaskedBlockAtCursor(false) {
+				return nil
+			}
+		case tcell.KeyRune:
+			if event.Modifiers() == 0 && composer.replaceMaskedBlockAtCursor(string(event.Rune())) {
+				return nil
+			}
+		}
+
+		return event
+	})
+
+	composer.syncHeight()
+	return composer
+}
+
+func (c *composerInput) PasteHandler() func(string, func(p tview.Primitive)) {
+	return func(pastedText string, setFocus func(p tview.Primitive)) {
+		if shouldMaskComposerInput(pastedText) {
+			pastedText = c.storeMaskedPaste(pastedText)
+		}
+
+		text := c.TextArea.GetText()
+		_, start, end := c.GetSelection()
+		start, end = c.expandReplaceRange(text, start, end)
+		c.Replace(start, end, pastedText)
+	}
+}
+
+func (c *composerInput) SetResizeFunc(fn func(int)) {
+	c.resize = fn
+	c.syncHeight()
+}
+
+func (c *composerInput) SetTextChangedFunc(fn func(string)) {
+	c.onTextChanged = fn
+	if c.onTextChanged != nil {
+		c.onTextChanged(c.TextArea.GetText())
+	}
+}
+
+func (c *composerInput) SetBeforeKeyEventFunc(fn func(event *tcell.EventKey) *tcell.EventKey) {
+	c.beforeKeyEvent = fn
+}
+
+func (c *composerInput) submitDraft() {
+	userInput := strings.TrimSpace(c.resolveMaskedText(c.TextArea.GetText()))
+	if userInput == "" {
+		return
+	}
+
+	c.clearDraft()
+	c.submit(userInput)
+}
+
+func (c *composerInput) clearDraft() {
+	c.maskedPastes = make(map[string]string)
+	c.nextMaskedPasteID = 0
+	c.TextArea.SetText("", false)
+	c.syncHeight()
+}
+
+func (c *composerInput) storeMaskedPaste(text string) string {
+	c.nextMaskedPasteID++
+	placeholder := fmt.Sprintf(
+		"[pasted #%d: %d chars, %d lines]",
+		c.nextMaskedPasteID,
+		utf8.RuneCountInString(text),
+		strings.Count(text, "\n")+1,
+	)
+	c.maskedPastes[placeholder] = text
+	return placeholder
+}
+
+func (c *composerInput) resolveMaskedText(text string) string {
+	for placeholder, original := range c.maskedPastes {
+		text = strings.ReplaceAll(text, placeholder, original)
+	}
+	return text
+}
+
+func (c *composerInput) deleteMaskedBlockAtCursor(backspace bool) bool {
+	text := c.TextArea.GetText()
+	_, start, end := c.GetSelection()
+	start, end, ok := c.expandDeleteRange(text, start, end, backspace)
+	if !ok {
+		return false
+	}
+
+	c.Replace(start, end, "")
+	c.cleanupMaskedPastes()
+	return true
+}
+
+func (c *composerInput) replaceMaskedBlockAtCursor(insertText string) bool {
+	text := c.TextArea.GetText()
+	_, start, end := c.GetSelection()
+	start, end = c.expandReplaceRange(text, start, end)
+	if start == end {
+		return false
+	}
+
+	c.Replace(start, end, insertText)
+	c.cleanupMaskedPastes()
+	return true
+}
+
+func (c *composerInput) expandDeleteRange(text string, start, end int, backspace bool) (int, int, bool) {
+	ranges := c.maskedRanges(text)
+	if len(ranges) == 0 {
+		return start, end, false
+	}
+
+	if start != end {
+		newStart, newEnd, ok := expandSelectionOverRanges(start, end, ranges)
+		return newStart, newEnd, ok
+	}
+
+	cursor := start
+	for _, r := range ranges {
+		if backspace {
+			if cursor > r.start && cursor <= r.end {
+				return r.start, r.end, true
+			}
+			continue
+		}
+
+		if cursor >= r.start && cursor < r.end {
+			return r.start, r.end, true
+		}
+	}
+
+	return start, end, false
+}
+
+func (c *composerInput) expandReplaceRange(text string, start, end int) (int, int) {
+	ranges := c.maskedRanges(text)
+	if len(ranges) == 0 {
+		return start, end
+	}
+
+	if start != end {
+		newStart, newEnd, ok := expandSelectionOverRanges(start, end, ranges)
+		if ok {
+			return newStart, newEnd
+		}
+		return start, end
+	}
+
+	cursor := start
+	for _, r := range ranges {
+		if cursor > r.start && cursor < r.end {
+			return r.start, r.end
+		}
+	}
+
+	return start, end
+}
+
+func (c *composerInput) maskedRanges(text string) []maskedPasteRange {
+	ranges := make([]maskedPasteRange, 0, len(c.maskedPastes))
+	for placeholder := range c.maskedPastes {
+		index := strings.Index(text, placeholder)
+		if index < 0 {
+			continue
+		}
+		ranges = append(ranges, maskedPasteRange{
+			placeholder: placeholder,
+			start:       index,
+			end:         index + len(placeholder),
+		})
+	}
+
+	sort.Slice(ranges, func(i, j int) bool {
+		return ranges[i].start < ranges[j].start
+	})
+	return ranges
+}
+
+func expandSelectionOverRanges(start, end int, ranges []maskedPasteRange) (int, int, bool) {
+	changed := false
+	for {
+		expanded := false
+		for _, r := range ranges {
+			if end <= r.start || start >= r.end {
+				continue
+			}
+			if start > r.start {
+				start = r.start
+				expanded = true
+			}
+			if end < r.end {
+				end = r.end
+				expanded = true
+			}
+		}
+		if !expanded {
+			break
+		}
+		changed = true
+	}
+	return start, end, changed
+}
+
+func (c *composerInput) cleanupMaskedPastes() {
+	text := c.TextArea.GetText()
+	for placeholder := range c.maskedPastes {
+		if !strings.Contains(text, placeholder) {
+			delete(c.maskedPastes, placeholder)
+		}
+	}
+}
+
+func (c *composerInput) syncHeight() {
+	targetHeight := clampInt(countWrappedLines(c.TextArea.GetText(), c.availableWidth()), c.minHeight, c.maxHeight)
+
+	if c.lastHeight == targetHeight {
+		return
+	}
+
+	c.lastHeight = targetHeight
+	if c.resize != nil {
+		c.resize(targetHeight)
+	}
+}
+
+func (c *composerInput) availableWidth() int {
+	_, _, width, _ := c.GetInnerRect()
+	if width <= 0 {
+		return 1
+	}
+
+	labelWidth := c.GetLabelWidth()
+	if labelWidth == 0 {
+		labelWidth = tview.TaggedStringWidth(c.GetLabel())
+	}
+	width -= labelWidth
+	if width <= 0 {
+		return 1
+	}
+
+	return width
+}
+
+func shouldMaskComposerInput(text string) bool {
+	return utf8.RuneCountInString(text) > composerLongInputLimit
+}
+
+func countWrappedLines(text string, width int) int {
+	if width <= 0 || text == "" {
+		return 1
+	}
+
+	total := 0
+	for _, line := range strings.Split(text, "\n") {
+		wrapped := tview.WordWrap(line, width)
+		if len(wrapped) == 0 {
+			total++
+			continue
+		}
+		total += len(wrapped)
+	}
+
+	if total == 0 {
+		return 1
+	}
+	return total
+}
+
+func clampInt(value, minValue, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func main() {
@@ -110,47 +463,57 @@ func main() {
 		log.Printf("Debug log file: %s", logPath)
 	}
 
-	inputField := tview.NewInputField().
-		SetLabel("[purple::b]❯ [white]").
-		SetFieldBackgroundColor(tcell.ColorDefault).
-		SetFieldTextColor(tcell.ColorWhite)
-
-	availableCommands := []string{
+	session := newCLISession(app, outputView, logView, updateHeader, envFile)
+	session.showStartupLogo()
+	inputArea := newComposerInput(session.handleInput)
+	commandSuggestions := []string{
 		"/model",
 		"/tasks",
 		"/team",
 		"/stop",
 		"/clear",
 	}
+	commandList := tview.NewList().
+		ShowSecondaryText(false).
+		SetWrapAround(false).
+		SetMainTextColor(tcell.ColorWhite).
+		SetSelectedTextColor(tcell.ColorBlack).
+		SetSelectedBackgroundColor(tcell.ColorGreen).
+		SetHighlightFullLine(true)
+	commandList.SetBorder(true).SetTitle(" Commands ")
+	var commandMatches []string
+	const commandListMaxVisible = 5
 
-	session := newCLISession(app, outputView, logView, updateHeader, envFile)
-	session.showStartupLogo()
-
-	inputField.SetAutocompleteFunc(func(currentText string) (entries []string) {
-		if !strings.HasPrefix(currentText, "/") {
-			return nil
+	applyCommandSelection := func(index int) {
+		if index < 0 || index >= len(commandMatches) {
+			return
 		}
-		for _, cmd := range availableCommands {
-			if strings.HasPrefix(cmd, currentText) {
-				entries = append(entries, cmd)
+		inputArea.TextArea.SetText(commandMatches[index], true)
+	}
+
+	updateCommandList := func(text string) {
+		commandMatches = commandMatches[:0]
+		commandList.Clear()
+
+		trimmed := strings.TrimSpace(text)
+		if trimmed == "" || strings.Contains(text, "\n") || !strings.HasPrefix(trimmed, "/") {
+			return
+		}
+
+		for _, cmd := range commandSuggestions {
+			if strings.HasPrefix(cmd, trimmed) {
+				commandMatches = append(commandMatches, cmd)
 			}
 		}
-		return entries
-	})
 
-	inputField.SetDoneFunc(func(key tcell.Key) {
-		if key != tcell.KeyEnter {
-			return
+		for _, cmd := range commandMatches {
+			selectedCmd := cmd
+			commandList.AddItem(selectedCmd, "", 0, func() {
+				inputArea.TextArea.SetText(selectedCmd, true)
+			})
 		}
-
-		userInput := strings.TrimSpace(inputField.GetText())
-		if userInput == "" {
-			return
-		}
-
-		inputField.SetText("")
-		session.handleInput(userInput)
-	})
+		commandList.SetCurrentItem(0)
+	}
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlC {
@@ -167,9 +530,48 @@ func main() {
 	layout := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(header, 1, 0, false).
 		AddItem(body, 0, 1, false).
-		AddItem(inputField, 1, 0, true)
+		AddItem(commandList, 0, 0, false).
+		AddItem(inputArea, composerMinHeight, 0, true)
 
-	if err := app.SetRoot(layout, true).EnableMouse(true).Run(); err != nil {
+	inputArea.SetResizeFunc(func(height int) {
+		layout.ResizeItem(inputArea, height, 0)
+	})
+	commandList.SetSelectedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
+		applyCommandSelection(index)
+	})
+	inputArea.SetTextChangedFunc(func(text string) {
+		updateCommandList(text)
+		height := 0
+		if len(commandMatches) > 0 {
+			height = len(commandMatches)
+			if height > commandListMaxVisible {
+				height = commandListMaxVisible
+			}
+			height += 2
+		}
+		layout.ResizeItem(commandList, height, 0)
+	})
+	inputArea.SetBeforeKeyEventFunc(func(event *tcell.EventKey) *tcell.EventKey {
+		if len(commandMatches) == 0 {
+			return event
+		}
+
+		switch event.Key() {
+		case tcell.KeyDown:
+			commandList.SetCurrentItem(commandList.GetCurrentItem() + 1)
+			return nil
+		case tcell.KeyUp:
+			commandList.SetCurrentItem(commandList.GetCurrentItem() - 1)
+			return nil
+		case tcell.KeyTab:
+			applyCommandSelection(commandList.GetCurrentItem())
+			return nil
+		default:
+			return event
+		}
+	})
+
+	if err := app.SetRoot(layout, true).EnableMouse(true).EnablePaste(true).Run(); err != nil {
 		panic(err)
 	}
 }
@@ -479,8 +881,44 @@ func (s *cliSession) appendLine(format string, args ...any) {
 }
 
 func (s *cliSession) showStartupLogo() {
-	s.appendLine("[green]%s[white]", tview.Escape(strings.TrimPrefix(logo, "\n")))
+	logoLines := strings.Split(strings.TrimPrefix(strings.TrimSuffix(logo, "\n"), "\n"), "\n")
+	logoColors := []string{
+		"#38bdf8",
+		"#22d3ee",
+		"#14b8a6",
+		"#10b981",
+		"#84cc16",
+		"#eab308",
+	}
+
+	s.appendLine(startupBannerBorder("╔", "╗"))
+	s.appendLine(startupBannerLine("[white::b]SYSTEM BOOT[white:-:-] [gray]gopilot terminal initialized"))
+	s.appendLine(startupBannerBorder("╠", "╣"))
+	for index, line := range logoLines {
+		color := logoColors[index%len(logoColors)]
+		s.appendLine(startupBannerLine(fmt.Sprintf("[%s::b]%s[white:-:-]", color, tview.Escape(line))))
+	}
+	s.appendLine(startupBannerBorder("╠", "╣"))
+	s.appendLine(startupBannerLine(fmt.Sprintf("[gray]version:[white] %s   [gray]model:[white] %s", tview.Escape(version.Version), tview.Escape(currentModel))))
+	s.appendLine(startupBannerLine(fmt.Sprintf("[gray]workspace:[white] %s", tview.Escape(currentDir))))
+	s.appendLine(startupBannerLine("[gray]controls:[white] [green]Enter[white] send  [green]Shift+Enter[white] newline  [green]/[white] commands"))
+	s.appendLine(startupBannerBorder("╚", "╝"))
 	s.output.ScrollToBeginning()
+}
+
+func startupBannerBorder(left, right string) string {
+	return fmt.Sprintf("[#38bdf8]%s%s%s", left, strings.Repeat("═", 70), right)
+}
+
+func startupBannerLine(content string) string {
+	const bannerWidth = 70
+
+	padding := bannerWidth - 1 - tview.TaggedStringWidth(content)
+	if padding < 0 {
+		padding = 0
+	}
+
+	return fmt.Sprintf("[#38bdf8]║ %s%s[#38bdf8]║", content, strings.Repeat(" ", padding))
 }
 
 func (s *cliSession) appendLogLine(line string) {
