@@ -55,6 +55,8 @@ OPENAI_API_KEY=your_api_key_here
 MODEL=gpt-4o-mini
 # 可选：自定义 OpenAI 兼容接口地址
 OPENAI_BASE_URL=https://api.openai.com/v1
+# 可选：遇到 HTTP 429 时等待多少秒后重试，支持浮点数
+OPENAI_RATE_LIMIT_RETRY_SECONDS=2.5
 ```
 
 ### 4.(Optional) Build
@@ -95,6 +97,7 @@ make build
 - `OPENAI_API_KEY`：你的 OpenAI API 密钥。
 - `MODEL`：默认使用的模型名称（未设置时默认为 `gpt-4o-mini`）。
 - `OPENAI_BASE_URL`：（可选）自定义的 OpenAI 兼容接口地址。
+- `OPENAI_RATE_LIMIT_RETRY_SECONDS`：（可选）遇到 `429 Too Many Requests` 时等待多少秒后重试，支持浮点数，例如 `2.5`。
 
 > **💡 提示**：当前的技能目录和环境文件都是基于“可执行文件所在目录”进行解析的。因此，相比于直接使用 `go run .`，我们更推荐先 `make build` 编译后再运行二进制文件。
 

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 )
@@ -546,5 +548,51 @@ func TestRecordTokenUsageLogsAndAppendsFile(t *testing.T) {
 	tokenLog := string(raw)
 	if !strings.Contains(tokenLog, "[TokenUsage] agent=supervisor stage=executor kind=stream_chat_completion turn=3 model=gpt-4o-mini finish_reason=stop prompt_tokens=120 completion_tokens=45 total_tokens=165") {
 		t.Fatalf("missing token usage file entry: %q", tokenLog)
+	}
+}
+
+func TestWithOpenAIRateLimitRetryRetries429WhenConfigured(t *testing.T) {
+	t.Setenv(openAIRateLimitRetryEnv, "2.5")
+
+	originalSleep := rateLimitSleep
+	defer func() {
+		rateLimitSleep = originalSleep
+	}()
+
+	var slept []time.Duration
+	rateLimitSleep = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return nil
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatalf("new request failed: %v", err)
+	}
+	resp := &http.Response{StatusCode: http.StatusTooManyRequests}
+
+	attempts := 0
+	result, err := withOpenAIRateLimitRetry(context.Background(), "unit_test", func() (string, error) {
+		attempts++
+		if attempts == 1 {
+			return "", &openai.Error{
+				StatusCode: http.StatusTooManyRequests,
+				Request:    req,
+				Response:   resp,
+			}
+		}
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("withOpenAIRateLimitRetry failed: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("unexpected result: %q", result)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if len(slept) != 1 || slept[0] != 2500*time.Millisecond {
+		t.Fatalf("unexpected sleep durations: %v", slept)
 	}
 }

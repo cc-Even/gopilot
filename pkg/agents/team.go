@@ -921,10 +921,12 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 		return nil, false, fmt.Errorf("stage turn events failed (turn=%d): %w", turn, err)
 	}
 
-	resp, err := agent.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model:    agent.Model,
-		Messages: messages,
-		Tools:    agent.openAITools(),
+	resp, err := withOpenAIRateLimitRetry(ctx, "teammate_work_phase", func() (*openai.ChatCompletion, error) {
+		return agent.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+			Model:    agent.Model,
+			Messages: messages,
+			Tools:    agent.openAITools(),
+		})
 	})
 	if err != nil {
 		_ = turnAcks.Rollback()

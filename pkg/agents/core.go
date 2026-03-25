@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -157,6 +159,7 @@ const (
 	autoCompactTriggerChars   = 80000
 	autoCompactSummaryMaxChar = 80000
 	autoCompactSummaryTokens  = 2000
+	openAIRateLimitRetryEnv   = "OPENAI_RATE_LIMIT_RETRY_SECONDS"
 
 	PlanningPolicyAuto     PlanningPolicy = "auto"
 	PlanningPolicyRequired PlanningPolicy = "required"
@@ -171,6 +174,7 @@ var plannerToolAllowlist = map[string]struct{}{
 }
 
 var tokenLogMu sync.Mutex
+var rateLimitSleep = sleepWithContext
 
 type runPausedError struct {
 	Stage    string
@@ -222,6 +226,73 @@ func WithSubAgents(SubAgents map[string]*Agent) AgentOption {
 func WithSkillLoader(skillLoader *SkillLoader) AgentOption {
 	return func(o *AgentOptions) {
 		o.SkillLoader = skillLoader
+	}
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func openAIRateLimitRetryDelay() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(openAIRateLimitRetryEnv))
+	if raw == "" {
+		return 0
+	}
+
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		log.Printf("[OpenAI429Retry] invalid %s value %q: %v", openAIRateLimitRetryEnv, raw, err)
+		return 0
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds * float64(time.Second))
+}
+
+func isOpenAIRateLimitError(err error) bool {
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusTooManyRequests
+	}
+	return false
+}
+
+func withOpenAIRateLimitRetry[T any](ctx context.Context, label string, fn func() (T, error)) (T, error) {
+	var zero T
+	delay := openAIRateLimitRetryDelay()
+	if delay <= 0 {
+		return fn()
+	}
+
+	attempt := 1
+	for {
+		result, err := fn()
+		if err == nil || !isOpenAIRateLimitError(err) {
+			return result, err
+		}
+
+		log.Printf(
+			"[OpenAI429Retry] call=%s attempt=%d wait_seconds=%.3f",
+			strings.TrimSpace(label),
+			attempt,
+			delay.Seconds(),
+		)
+		if sleepErr := rateLimitSleep(ctx, delay); sleepErr != nil {
+			return zero, sleepErr
+		}
+		attempt++
 	}
 }
 
@@ -965,13 +1036,15 @@ func useModelToDetermineSimpleRequest(ctx context.Context, client openai.Client,
 - "yes"：这是一个简单请求，可以直接执行
 - "no"：这不是一个简单请求，需要计划模式`
 
-	resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model: model,
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(systemPrompt),
-			openai.UserMessage(fmt.Sprintf("用户输入：%s\n\n请回答 yes 或 no：", userInput)),
-		},
-		MaxCompletionTokens: openai.Int(10), // 设置非常短的 maxTokens
+	resp, err := withOpenAIRateLimitRetry(ctx, "simple_request_classifier", func() (*openai.ChatCompletion, error) {
+		return client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+			Model: model,
+			Messages: []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage(systemPrompt),
+				openai.UserMessage(fmt.Sprintf("用户输入：%s\n\n请回答 yes 或 no：", userInput)),
+			},
+			MaxCompletionTokens: openai.Int(10), // 设置非常短的 maxTokens
+		})
 	})
 	if err != nil {
 		// 如果调用失败，默认返回 false（走计划模式）
@@ -1161,47 +1234,49 @@ func (a *Agent) liveOutputIdentity() (string, string) {
 }
 
 func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, turn int) (*openai.ChatCompletion, error) {
-	stream := a.client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
-		Model:    a.Model,
-		Messages: messages,
-		Tools:    a.openAITools(),
-		StreamOptions: openai.ChatCompletionStreamOptionsParam{
-			IncludeUsage: openai.Bool(true),
-		},
-	})
-	acc := openai.ChatCompletionAccumulator{}
-	liveID, liveTitle := a.liveOutputIdentity()
-	lastPreview := ""
-	if liveID != "" {
-		lastPreview = "思考中..."
-		a.reportLiveOutput(liveID, liveTitle, lastPreview, false)
-	}
+	return withOpenAIRateLimitRetry(ctx, "stream_chat_completion", func() (*openai.ChatCompletion, error) {
+		stream := a.client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
+			Model:    a.Model,
+			Messages: messages,
+			Tools:    a.openAITools(),
+			StreamOptions: openai.ChatCompletionStreamOptionsParam{
+				IncludeUsage: openai.Bool(true),
+			},
+		})
+		acc := openai.ChatCompletionAccumulator{}
+		liveID, liveTitle := a.liveOutputIdentity()
+		lastPreview := ""
+		if liveID != "" {
+			lastPreview = "思考中..."
+			a.reportLiveOutput(liveID, liveTitle, lastPreview, false)
+		}
 
-	for stream.Next() {
-		chunk := stream.Current()
-		if !acc.AddChunk(chunk) {
+		for stream.Next() {
+			chunk := stream.Current()
+			if !acc.AddChunk(chunk) {
+				a.reportLiveOutput(liveID, liveTitle, "", true)
+				return nil, fmt.Errorf("chat completion stream accumulate failed (turn=%d)", turn)
+			}
+			preview := renderStreamingPreview(acc.ChatCompletion)
+			if preview != "" && preview != lastPreview {
+				lastPreview = preview
+				a.reportLiveOutput(liveID, liveTitle, preview, false)
+			}
+		}
+
+		if err := stream.Err(); err != nil {
 			a.reportLiveOutput(liveID, liveTitle, "", true)
-			return nil, fmt.Errorf("chat completion stream accumulate failed (turn=%d)", turn)
+			return nil, fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
 		}
-		preview := renderStreamingPreview(acc.ChatCompletion)
-		if preview != "" && preview != lastPreview {
-			lastPreview = preview
-			a.reportLiveOutput(liveID, liveTitle, preview, false)
+		a.reportLiveOutput(liveID, liveTitle, renderStreamingPreview(acc.ChatCompletion), true)
+
+		if len(acc.Choices) == 0 {
+			return nil, fmt.Errorf("empty choices from model")
 		}
-	}
-
-	if err := stream.Err(); err != nil {
-		a.reportLiveOutput(liveID, liveTitle, "", true)
-		return nil, fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
-	}
-	a.reportLiveOutput(liveID, liveTitle, renderStreamingPreview(acc.ChatCompletion), true)
-
-	if len(acc.Choices) == 0 {
-		return nil, fmt.Errorf("empty choices from model")
-	}
-	resp := acc.ChatCompletion
-	recordTokenUsage(a, a.Model, "stream_chat_completion", turn, resp.Choices[0].FinishReason, resp.Usage)
-	return &resp, nil
+		resp := acc.ChatCompletion
+		recordTokenUsage(a, a.Model, "stream_chat_completion", turn, resp.Choices[0].FinishReason, resp.Usage)
+		return &resp, nil
+	})
 }
 
 func renderStreamingPreview(resp openai.ChatCompletion) string {
@@ -1579,10 +1654,12 @@ func (a *Agent) summarizeForAutoCompact(ctx context.Context, prompt string) (str
 		return a.autoCompactSummarizer(ctx, prompt)
 	}
 
-	resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model:               a.Model,
-		Messages:            []openai.ChatCompletionMessageParamUnion{openai.UserMessage(prompt)},
-		MaxCompletionTokens: openai.Int(autoCompactSummaryTokens),
+	resp, err := withOpenAIRateLimitRetry(ctx, "auto_compact_summary", func() (*openai.ChatCompletion, error) {
+		return a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+			Model:               a.Model,
+			Messages:            []openai.ChatCompletionMessageParamUnion{openai.UserMessage(prompt)},
+			MaxCompletionTokens: openai.Int(autoCompactSummaryTokens),
+		})
 	})
 	if err != nil {
 		return "", fmt.Errorf("summary generation failed: %w", err)
