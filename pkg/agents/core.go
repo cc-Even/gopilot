@@ -160,6 +160,7 @@ const (
 	autoCompactSummaryMaxChar = 80000
 	autoCompactSummaryTokens  = 2000
 	openAIRateLimitRetryEnv   = "OPENAI_RATE_LIMIT_RETRY_SECONDS"
+	planningReminderTurns     = 6
 
 	PlanningPolicyAuto     PlanningPolicy = "auto"
 	PlanningPolicyRequired PlanningPolicy = "required"
@@ -857,7 +858,7 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 						Question: strings.TrimSpace(output),
 					}
 				}
-				if toolName == "todo" {
+				if countsAsPlanningTool(toolName) {
 					usedTodo = true
 				}
 
@@ -891,12 +892,17 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 		} else {
 			roundsSinceTodo++
 		}
-		if roundsSinceTodo >= 3 {
-			messages = append(messages, openai.UserMessage("<reminder>Update your todos.</reminder>"))
+		if roundsSinceTodo >= planningReminderTurns {
+			messages = append(messages, openai.UserMessage("<reminder>Update your task status or todos.</reminder>"))
 		}
 	}
 
 	return "", cloneChatMessages(messages), fmt.Errorf("max turns reached without final answer")
+}
+
+func countsAsPlanningTool(toolName string) bool {
+	toolName = strings.TrimSpace(toolName)
+	return toolName == "todo" || strings.HasPrefix(toolName, "task_")
 }
 
 func (a *Agent) cloneWithTools(systemPrompt string, allowlist map[string]struct{}) *Agent {

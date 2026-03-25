@@ -51,3 +51,30 @@ func TestPlanningPolicyLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestCountsAsPlanningTool(t *testing.T) {
+	tests := []struct {
+		name     string
+		toolName string
+		want     bool
+	}{
+		{name: "todo", toolName: "todo", want: true},
+		{name: "task create", toolName: "task_create", want: true},
+		{name: "task list", toolName: "task_list", want: true},
+		{name: "task with whitespace", toolName: " task_update ", want: true},
+		{name: "non planning tool", toolName: "bash", want: false},
+		{name: "similar prefix only", toolName: "tasks", want: false},
+	}
+
+	for _, tt := range tests {
+		if got := countsAsPlanningTool(tt.toolName); got != tt.want {
+			t.Fatalf("%s: countsAsPlanningTool(%q) = %v, want %v", tt.name, tt.toolName, got, tt.want)
+		}
+	}
+}
+
+func TestPlanningReminderTurns(t *testing.T) {
+	if planningReminderTurns != 6 {
+		t.Fatalf("planningReminderTurns = %d, want 6", planningReminderTurns)
+	}
+}
