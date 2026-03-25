@@ -598,7 +598,7 @@ func newCLISession(app *tview.Application, output *tview.TextView, logs *tview.T
 
 func (s *cliSession) handleInput(input string) {
 	if strings.HasPrefix(input, "/") {
-		s.appendLine("[purple]User:[white] %s", tview.Escape(input))
+		s.appendLinef("[purple]User:[white] %s", tview.Escape(input))
 		s.executeCommand(input)
 		s.output.ScrollToEnd()
 		return
@@ -609,7 +609,7 @@ func (s *cliSession) handleInput(input string) {
 		return
 	}
 
-	s.appendLine("[purple]User:[white] %s", tview.Escape(input))
+	s.appendLinef("[purple]User:[white] %s", tview.Escape(input))
 	if s.resumeState != nil {
 		s.appendLine("[green]Gopilot:[white] 正在继续等待输入的 executor...")
 		s.output.ScrollToEnd()
@@ -654,13 +654,13 @@ func (s *cliSession) executeCommand(input string) {
 	case "/exit":
 		s.app.Stop()
 	default:
-		s.appendLine("[red]System:[white] 未知命令: %s", tview.Escape(parts[0]))
+		s.appendLinef("[red]System:[white] 未知命令: %s", tview.Escape(parts[0]))
 	}
 }
 
 func (s *cliSession) handleModelCommand(args []string) {
 	if len(args) == 0 {
-		s.appendLine("[yellow]System:[white] 用法: /model <model-name>  当前模型: %s", tview.Escape(currentModel))
+		s.appendLinef("[yellow]System:[white] 用法: /model <model-name>  当前模型: %s", tview.Escape(currentModel))
 		return
 	}
 
@@ -671,16 +671,16 @@ func (s *cliSession) handleModelCommand(args []string) {
 	}
 
 	if err := updateModelInEnvFile(s.envFile, modelName); err != nil {
-		s.appendLine("[red]System:[white] 更新环境文件失败: %s", tview.Escape(err.Error()))
+		s.appendLinef("[red]System:[white] 更新环境文件失败: %s", tview.Escape(err.Error()))
 		return
 	}
 	if err := reloadEnvFile(s.envFile); err != nil {
-		s.appendLine("[red]System:[white] 重新加载环境变量失败: %s", tview.Escape(err.Error()))
+		s.appendLinef("[red]System:[white] 重新加载环境变量失败: %s", tview.Escape(err.Error()))
 		return
 	}
 
 	s.rebuildAgent()
-	s.appendLine(
+	s.appendLinef(
 		"[green]System:[white] 已切换模型为 %s，并重新加载 %s。",
 		tview.Escape(currentModel),
 		tview.Escape(s.envFile),
@@ -695,10 +695,10 @@ func (s *cliSession) handleTasksCommand() {
 
 	result, err := s.agent.TaskManager.ListAll()
 	if err != nil {
-		s.appendLine("[red]System:[white] 读取任务列表失败: %s", tview.Escape(err.Error()))
+		s.appendLinef("[red]System:[white] 读取任务列表失败: %s", tview.Escape(err.Error()))
 		return
 	}
-	s.appendLine("[yellow]Tasks:[white]\n%s", tview.Escape(result))
+	s.appendLinef("[yellow]Tasks:[white]\n%s", tview.Escape(result))
 }
 
 func (s *cliSession) handleTeamCommand() {
@@ -707,7 +707,7 @@ func (s *cliSession) handleTeamCommand() {
 		return
 	}
 
-	s.appendLine("[yellow]Team:[white]\n%s", tview.Escape(s.agent.TeamManager.ListAll()))
+	s.appendLinef("[yellow]Team:[white]\n%s", tview.Escape(s.agent.TeamManager.ListAll()))
 }
 
 func (s *cliSession) handleStopCommand() {
@@ -744,9 +744,9 @@ func (s *cliSession) rebuildAgent() {
 			s.app.QueueUpdateDraw(func() {
 				switch stage {
 				case "planner":
-					s.appendLine("[yellow]Planner:[white] %s", tview.Escape(content))
+					s.appendLinef("[yellow]Planner:[white] %s", tview.Escape(content))
 				default:
-					s.appendLine("[yellow]%s:[white] %s", tview.Escape(stage), tview.Escape(content))
+					s.appendLinef("[yellow]%s:[white] %s", tview.Escape(stage), tview.Escape(content))
 				}
 				s.output.ScrollToEnd()
 			})
@@ -785,14 +785,14 @@ func (s *cliSession) runStructured(snapshot []openai.ChatCompletionMessageParamU
 			if state != nil && state.Status == agents.RunPaused {
 				pausedHistory := append(copyMessages(historySnapshot), openai.AssistantMessage(response))
 				s.captureResumeState(pausedHistory, state)
-				s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+				s.appendLinef("[green]Gopilot:[white] %s", tview.Escape(response))
 				s.appendLine("[yellow]System:[white] 已暂停等待你的补充，直接回复即可从当前 executor 继续；如需放弃本次现场可使用 /clear。")
 				return
 			}
 
 			s.clearResumeState()
 			s.history = append(copyMessages(historySnapshot), openai.AssistantMessage(response))
-			s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+			s.appendLinef("[green]Gopilot:[white] %s", tview.Escape(response))
 		})
 	}(copyMessages(snapshot), agent)
 }
@@ -825,14 +825,14 @@ func (s *cliSession) runResume(input string) {
 			if nextState != nil && nextState.Status == agents.RunPaused {
 				pausedHistory := append(copyMessages(updatedHistory), openai.AssistantMessage(response))
 				s.captureResumeState(pausedHistory, nextState)
-				s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+				s.appendLinef("[green]Gopilot:[white] %s", tview.Escape(response))
 				s.appendLine("[yellow]System:[white] 仍在等待补充信息，直接回复即可继续当前 executor；如需放弃本次现场可使用 /clear。")
 				return
 			}
 			updatedHistory = append(updatedHistory, openai.AssistantMessage(response))
 			s.clearResumeState()
 			s.history = updatedHistory
-			s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+			s.appendLinef("[green]Gopilot:[white] %s", tview.Escape(response))
 		})
 	}(input, baseHistory, state, agent)
 }
@@ -867,7 +867,7 @@ func (s *cliSession) clearResumeState() {
 }
 
 func (s *cliSession) reportRunError(err error) {
-	s.appendLine("[red]Gopilot Error:[white] %s", tview.Escape(err.Error()))
+	s.appendLinef("[red]Gopilot Error:[white] %s", tview.Escape(err.Error()))
 
 	var runErr *agents.StructuredRunError
 	if errors.As(err, &runErr) && runErr.Resume != nil {
@@ -875,7 +875,12 @@ func (s *cliSession) reportRunError(err error) {
 	}
 }
 
-func (s *cliSession) appendLine(format string, args ...any) {
+func (s *cliSession) appendLine(line string) {
+	s.outputHistory = append(s.outputHistory, line)
+	s.renderOutput()
+}
+
+func (s *cliSession) appendLinef(format string, args ...any) {
 	s.outputHistory = append(s.outputHistory, fmt.Sprintf(format, args...))
 	s.renderOutput()
 }
