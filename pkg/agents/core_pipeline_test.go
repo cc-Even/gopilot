@@ -138,7 +138,7 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	}
 }
 
-func TestRunStructuredAutoSkipsPlannerForSimpleRequest(t *testing.T) {
+func TestRunStructuredSkipPolicySkipsPlannerForSimpleRequest(t *testing.T) {
 	taskManager, err := NewTaskManager(t.TempDir())
 	if err != nil {
 		t.Fatalf("create task manager failed: %v", err)
@@ -185,11 +185,11 @@ func TestRunStructuredAutoSkipsPlannerForSimpleRequest(t *testing.T) {
 		},
 	}
 
-	result, err := agent.RunStructured(context.Background(), []openai.ChatCompletionMessageParamUnion{
+	result, _, err := agent.RunStructuredWithPolicyAndState(context.Background(), []openai.ChatCompletionMessageParamUnion{
 		openai.UserMessage("read the README"),
-	})
+	}, PlanningPolicySkip)
 	if err != nil {
-		t.Fatalf("RunStructured failed: %v", err)
+		t.Fatalf("RunStructuredWithPolicyAndState failed: %v", err)
 	}
 	if result != "executor finished" {
 		t.Fatalf("unexpected executor result: %q", result)
@@ -198,7 +198,7 @@ func TestRunStructuredAutoSkipsPlannerForSimpleRequest(t *testing.T) {
 		t.Fatalf("expected only executor call, got %d", len(calls))
 	}
 	if strings.Contains(calls[0].systemPrompt, "Planner stage") {
-		t.Fatalf("auto policy unexpectedly ran planner: %q", calls[0].systemPrompt)
+		t.Fatalf("skip policy unexpectedly ran planner: %q", calls[0].systemPrompt)
 	}
 	if !strings.Contains(calls[0].lastUser, "planner_skipped") {
 		t.Fatalf("executor context missing skipped-planner marker: %q", calls[0].lastUser)
@@ -286,17 +286,17 @@ func TestRunStructuredAskUserReturnsPausedState(t *testing.T) {
 		},
 	}
 
-	response, state, err := agent.RunStructuredWithState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+	response, state, err := agent.RunStructuredWithPolicyAndState(context.Background(), []openai.ChatCompletionMessageParamUnion{
 		openai.UserMessage("inspect the config"),
-	})
+	}, PlanningPolicySkip)
 	if err != nil {
-		t.Fatalf("RunStructuredWithState returned error: %v", err)
+		t.Fatalf("RunStructuredWithPolicyAndState returned error: %v", err)
 	}
 	if response != "Which file should I inspect?" {
 		t.Fatalf("unexpected pause question: %q", response)
 	}
 	if calls != 1 {
-		t.Fatalf("expected auto policy to skip planner for simple request, got %d calls", calls)
+		t.Fatalf("expected skip policy to bypass planner, got %d calls", calls)
 	}
 	if state == nil {
 		t.Fatal("expected paused state")
@@ -430,11 +430,11 @@ func TestContinueStructuredResumesPausedExecutorWithoutPlanner(t *testing.T) {
 		},
 	}
 
-	response, state, err := agent.RunStructuredWithState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+	response, state, err := agent.RunStructuredWithPolicyAndState(context.Background(), []openai.ChatCompletionMessageParamUnion{
 		openai.UserMessage("inspect the config"),
-	})
+	}, PlanningPolicySkip)
 	if err != nil {
-		t.Fatalf("RunStructuredWithState failed: %v", err)
+		t.Fatalf("RunStructuredWithPolicyAndState failed: %v", err)
 	}
 	if response != "Need the exact file path." {
 		t.Fatalf("unexpected pause response: %q", response)
