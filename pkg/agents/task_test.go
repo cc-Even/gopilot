@@ -3,6 +3,7 @@ package agents
 import (
 	"encoding/json"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -389,7 +390,7 @@ func TestBackgroundManager(t *testing.T) {
 	t.Run("RunCompletesAndQueuesNotification", func(t *testing.T) {
 		bm := NewBackgroundManager()
 
-		result := bm.Run("printf 'background-ok'")
+		result := bm.Run("go env GOOS")
 		if !strings.Contains(result, "Background task ") || !strings.Contains(result, "started:") {
 			t.Fatalf("unexpected run result: %s", result)
 		}
@@ -412,7 +413,7 @@ func TestBackgroundManager(t *testing.T) {
 		if notification.Status != "completed" {
 			t.Fatalf("expected completed status, got %s", notification.Status)
 		}
-		if notification.Result != "background-ok" {
+		if notification.Result != runtime.GOOS {
 			t.Fatalf("unexpected notification result: %q", notification.Result)
 		}
 
@@ -429,14 +430,14 @@ func TestBackgroundManager(t *testing.T) {
 		}
 
 		checkOne := bm.Check(notification.TaskID)
-		if !strings.Contains(checkOne, "background-ok") {
+		if !strings.Contains(checkOne, runtime.GOOS) {
 			t.Fatalf("expected task result in check output, got %q", checkOne)
 		}
 	})
 
 	t.Run("PeekAndAckNotifications", func(t *testing.T) {
 		bm := NewBackgroundManager()
-		result := bm.Run("printf 'peek-notify'")
+		result := bm.Run("go env GOARCH")
 		if !strings.Contains(result, "Background task ") {
 			t.Fatalf("unexpected run result: %s", result)
 		}

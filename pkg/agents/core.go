@@ -1783,13 +1783,12 @@ func messageRoleAndContent(message openai.ChatCompletionMessageParamUnion) (stri
 }
 
 func toolResultCompact(output, toolName string) string {
-	if utf8.RuneCountInString(output) > 100 {
-		if toolName == "" {
-			toolName = "tool"
-		}
-		return fmt.Sprintf("Previous: used %s", toolName)
+	const limit = 1200
+	trimmed := strings.TrimSpace(output)
+	if utf8.RuneCountInString(trimmed) > limit {
+		return truncate(trimmed, limit) + "\n... (truncated)"
 	}
-	return output
+	return trimmed
 }
 
 func (a *Agent) executeTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {

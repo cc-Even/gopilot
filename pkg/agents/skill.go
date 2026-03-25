@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -401,21 +400,33 @@ func safePath(baseDir, p string) (string, error) {
 	return resolved, nil
 }
 
-// RunBash executes a shell command safely
-func RunBash(command, dir string) string {
+// RunBashContext executes a shell command safely.
+func RunBashContext(ctx context.Context, command, dir string) string {
 	dangerous := []string{"rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"}
 	for _, d := range dangerous {
 		if strings.Contains(command, d) {
 			return "Error: Dangerous command blocked"
 		}
 	}
-	cmd := exec.Command("bash", "-c", command)
-	cmd.Dir = dir
-	output, err := cmd.CombinedOutput()
+
+	output, err := runCommand(ctx, command, dir)
+	decoded := decodeCommandOutput(output)
 	if err != nil {
-		return string(output)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if strings.TrimSpace(decoded) != "" {
+				return decoded
+			}
+			return "Error: command interrupted"
+		}
+		if strings.TrimSpace(decoded) == "" && isNoMatchSearchResult(command, err) {
+			return "(no output)"
+		}
+		if strings.TrimSpace(decoded) == "" {
+			return formatCommandError(command, err, decoded)
+		}
+		return decoded
 	}
-	out := string(output)
+	out := decoded
 	if len(out) > 50000 {
 		return out[:50000]
 	}
@@ -423,6 +434,11 @@ func RunBash(command, dir string) string {
 		return "(no output)"
 	}
 	return out
+}
+
+// RunBash executes a shell command safely.
+func RunBash(command, dir string) string {
+	return RunBashContext(context.Background(), command, dir)
 }
 
 // RunRead reads a file safely, with optional line limit
@@ -577,12 +593,12 @@ func (c BashTool) Name() string {
 }
 
 func (c BashTool) Description() string {
-	return "Executes a bash command and returns the output. Use this tool to solve coding tasks by running bash commands. be careful Windows command is different to linux"
+	return "Executes a command and returns the output. Simple commands run directly; shell features fall back to the platform shell so the tool works on Windows, Linux, and macOS."
 }
 
-func (c BashTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
+func (c BashTool) Call(ctx context.Context, input string, agent *Agent) (string, error) {
 	log.Printf("[BashTool] agent=%s Executing command: %s", agentLogName(agent), input)
-	result := RunBash(input, agentWorkspaceDir(agent))
+	result := RunBashContext(ctx, input, agentWorkspaceDir(agent))
 	log.Printf("[BashTool] agent=%s Command output (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
 }
@@ -592,7 +608,7 @@ func (c BackgroundRunTool) Name() string {
 }
 
 func (c BackgroundRunTool) Description() string {
-	return "Starts a bash command in the background and returns immediately with a task id. Completed results are queued and surfaced before the next LLM call."
+	return "Starts a command in the background and returns immediately with a task id. Simple commands run directly; shell features fall back to the platform shell."
 }
 
 func (c BackgroundRunTool) Call(_ context.Context, input string, agent *Agent) (string, error) {

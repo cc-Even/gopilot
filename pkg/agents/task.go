@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -132,25 +131,21 @@ func (bm *BackgroundManager) execute(taskID, command string) {
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	cmd.Dir = bm.workDir()
-	rawOutput, err := cmd.CombinedOutput()
-
-	switch {
-	case ctx.Err() == context.DeadlineExceeded:
-		status = "timeout"
-		output = fmt.Sprintf("Error: Timeout (%ds)", int(backgroundTimeout/time.Second))
-	case err != nil:
-		status = "error"
-		if len(rawOutput) > 0 {
-			output = string(rawOutput)
+	rawOutput, err := runCommand(ctx, command, bm.workDir())
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			status = "timeout"
+			output = fmt.Sprintf("Error: Timeout (%ds)", int(backgroundTimeout/time.Second))
 		} else {
-			output = "Error: " + err.Error()
+			status = "error"
+			if len(rawOutput) > 0 {
+				output = decodeCommandOutput(rawOutput)
+			} else {
+				output = formatCommandError(command, err, "")
+			}
 		}
-	default:
-		if len(rawOutput) > 0 {
-			output = string(rawOutput)
-		}
+	} else if len(rawOutput) > 0 {
+		output = decodeCommandOutput(rawOutput)
 	}
 
 	output = truncateForDisplay(strings.TrimSpace(output), backgroundResultLimit)
@@ -158,6 +153,10 @@ func (bm *BackgroundManager) execute(taskID, command string) {
 		output = "(no output)"
 	}
 
+	bm.finishTask(taskID, command, status, output)
+}
+
+func (bm *BackgroundManager) finishTask(taskID, command, status, output string) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 

@@ -532,7 +532,7 @@ func (wm *WorktreeManager) runGitLocked(args ...string) error {
 	cmd.Dir = wm.repoRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		trimmed := strings.TrimSpace(string(output))
+		trimmed := strings.TrimSpace(decodeCommandOutput(output))
 		if trimmed == "" {
 			return fmt.Errorf("git %s failed: %w", strings.Join(args, " "), err)
 		}
@@ -649,7 +649,7 @@ func inferBranch(path, name string) string {
 	cmd.Dir = path
 	output, err := cmd.CombinedOutput()
 	if err == nil {
-		branch := strings.TrimSpace(string(output))
+		branch := strings.TrimSpace(decodeCommandOutput(output))
 		if branch != "" {
 			return branch
 		}
@@ -744,9 +744,9 @@ func gitRepoRoot(dir string) (string, error) {
 	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("failed to detect git repo root: %s", strings.TrimSpace(string(output)))
+		return "", fmt.Errorf("failed to detect git repo root: %s", strings.TrimSpace(decodeCommandOutput(output)))
 	}
-	return strings.TrimSpace(string(output)), nil
+	return strings.TrimSpace(decodeCommandOutput(output)), nil
 }
 
 func intPtr(v int) *int {
