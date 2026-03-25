@@ -21,8 +21,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
       - name: Build
-        run: go build ./...
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: make build
 
       - name: Test
         run: go test ./...

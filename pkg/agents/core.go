@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -82,11 +83,26 @@ type Agent struct {
 	runLoopOverride       func(*Agent, context.Context, []openai.ChatCompletionMessageParamUnion) (string, error)
 	stageOutputReporter   func(stage, content string)
 	liveOutputReporter    func(id, title, content string, done bool)
+	runStage              string
+}
+
+type StructuredRunStatus string
+
+const (
+	RunPaused StructuredRunStatus = "paused"
+)
+
+type StructuredPauseInfo struct {
+	Kind     string
+	Question string
 }
 
 type StructuredRunState struct {
+	Status           StructuredRunStatus
+	Stage            string
 	Plan             string
 	ExecutorMessages []openai.ChatCompletionMessageParamUnion
+	Pause            *StructuredPauseInfo
 }
 
 type StructuredRunError struct {
@@ -134,10 +150,16 @@ type turnEventAcks struct {
 
 type AgentOption func(*AgentOptions)
 
+type PlanningPolicy string
+
 const (
 	autoCompactTriggerChars   = 80000
 	autoCompactSummaryMaxChar = 80000
 	autoCompactSummaryTokens  = 2000
+
+	PlanningPolicyAuto     PlanningPolicy = "auto"
+	PlanningPolicyRequired PlanningPolicy = "required"
+	PlanningPolicySkip     PlanningPolicy = "skip"
 )
 
 var plannerToolAllowlist = map[string]struct{}{
@@ -146,6 +168,23 @@ var plannerToolAllowlist = map[string]struct{}{
 	"task_update": {},
 	"task_list":   {},
 	"task_get":    {},
+}
+
+type runPausedError struct {
+	Stage    string
+	Kind     string
+	Question string
+}
+
+func (e *runPausedError) Error() string {
+	if e == nil {
+		return ""
+	}
+	question := strings.TrimSpace(e.Question)
+	if question == "" {
+		question = "run paused"
+	}
+	return question
 }
 
 func WithDesc(desc string) AgentOption {
@@ -423,6 +462,41 @@ func registerCompactTool(toolMap map[string]ToolDefinition, order []string) []st
 	return order
 }
 
+func registerAskUserTool(toolMap map[string]ToolDefinition, order []string) []string {
+	order = append(order, "ask_user")
+	toolMap["ask_user"] = ToolDefinition{
+		Name:        "ask_user",
+		Description: "Pause execution and ask the user one concise question when critical information is missing. Always pass {\"question\":\"...\"}.",
+		Parameters: map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"question": map[string]any{
+					"type":        "string",
+					"description": "The concise question to ask the user before continuing",
+					"minLength":   1,
+				},
+			},
+			"required": []string{"question"},
+		},
+		Handler: func(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
+			type paramsStruct struct {
+				Question string `json:"question"`
+			}
+			params := paramsStruct{}
+			if err := json.Unmarshal(args, &params); err != nil {
+				return "", fmt.Errorf("invalid ask_user args: %w", err)
+			}
+			params.Question = strings.TrimSpace(params.Question)
+			if params.Question == "" {
+				return "", fmt.Errorf("ask_user args missing question")
+			}
+			return params.Question, nil
+		},
+	}
+	return order
+}
+
 func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption) *Agent {
 	// 初始化选项
 	agentOpts := &AgentOptions{}
@@ -488,6 +562,7 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 	}
 	backgroundManager := NewBackgroundManager()
 	order = registerRouteToSubagentTool(toolMap, order, subAgents)
+	order = registerAskUserTool(toolMap, order)
 	order = registerCompactTool(toolMap, order)
 
 	agent := &Agent{
@@ -526,38 +601,58 @@ func (a *Agent) RunStructured(ctx context.Context, messages []openai.ChatComplet
 }
 
 func (a *Agent) RunStructuredWithState(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, *StructuredRunState, error) {
-	log.Printf("[StructuredRun] agent=%s starting planner stage", agentLogName(a))
-	planner := a.cloneWithTools(a.plannerSystemPrompt(), plannerToolAllowlist)
-	planner.LiveOutputID = fmt.Sprintf("%s:planner", a.Name)
-	planner.LiveOutputTitle = "Planner"
-	plannerMessages := applySystemPrompt(messages, planner.SystemPrompt)
-	plannerMessages = append(plannerMessages, openai.UserMessage(a.plannerContextMessage()))
+	return a.RunStructuredWithPolicyAndState(ctx, messages, PlanningPolicyAuto)
+}
 
-	plan, _, err := planner.runLoopWithState(ctx, plannerMessages)
-	if err != nil {
-		log.Printf("[StructuredRun] agent=%s planner stage failed: %v", agentLogName(a), err)
-		return "", nil, &StructuredRunError{Stage: "planner", Cause: err}
+func (a *Agent) RunStructuredWithPolicyAndState(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, policy PlanningPolicy) (string, *StructuredRunState, error) {
+	policy = normalizePlanningPolicy(policy)
+	plan := ""
+	plannerRan := false
+
+	if a.shouldRunPlanner(messages, policy) {
+		log.Printf("[StructuredRun] agent=%s starting planner stage", agentLogName(a))
+		planner := a.cloneWithTools(a.plannerSystemPrompt(), plannerToolAllowlist)
+		planner.runStage = "planner"
+		planner.LiveOutputID = fmt.Sprintf("%s:planner", a.Name)
+		planner.LiveOutputTitle = "Planner"
+		plannerMessages := applySystemPrompt(messages, planner.SystemPrompt)
+		plannerMessages = append(plannerMessages, openai.UserMessage(a.plannerContextMessage()))
+
+		nextPlan, _, err := planner.runLoopWithState(ctx, plannerMessages)
+		if err != nil {
+			log.Printf("[StructuredRun] agent=%s planner stage failed: %v", agentLogName(a), err)
+			return "", nil, &StructuredRunError{Stage: "planner", Cause: err}
+		}
+		plan = nextPlan
+		plannerRan = true
+		log.Printf("[StructuredRun] agent=%s planner stage completed: plan_size=%d", agentLogName(a), len(strings.TrimSpace(plan)))
+		a.reportStageOutput("planner", plan)
+	} else {
+		log.Printf("[StructuredRun] agent=%s skipping planner stage (policy=%s)", agentLogName(a), policy)
 	}
-	log.Printf("[StructuredRun] agent=%s planner stage completed: plan_size=%d", agentLogName(a), len(strings.TrimSpace(plan)))
-	a.reportStageOutput("planner", plan)
 
 	log.Printf("[StructuredRun] agent=%s starting executor stage", agentLogName(a))
 	executor := a.cloneWithTools(a.executorSystemPrompt(), nil)
+	executor.runStage = "executor"
 	executor.LiveOutputID = fmt.Sprintf("%s:executor", a.Name)
 	executor.LiveOutputTitle = "Executor"
 	executorMessages := applySystemPrompt(messages, executor.SystemPrompt)
-	executorMessages = append(executorMessages, openai.UserMessage(a.executorContextMessage(plan)))
+	executorMessages = append(executorMessages, openai.UserMessage(a.executorContextMessage(plan, plannerRan)))
 
 	result, resumeMessages, err := executor.runLoopWithState(ctx, executorMessages)
 	if err != nil {
+		var pauseErr *runPausedError
+		if errors.As(err, &pauseErr) {
+			log.Printf("[StructuredRun] agent=%s executor stage paused: %s", agentLogName(a), strings.TrimSpace(pauseErr.Question))
+			state := a.buildExecutorState(plan, executorMessages, resumeMessages, &StructuredPauseInfo{
+				Kind:     pauseErr.Kind,
+				Question: pauseErr.Question,
+			})
+			state.Status = RunPaused
+			return pauseErr.Question, state, nil
+		}
 		log.Printf("[StructuredRun] agent=%s executor stage failed: %v", agentLogName(a), err)
-		state := &StructuredRunState{
-			Plan:             plan,
-			ExecutorMessages: cloneChatMessages(executorMessages),
-		}
-		if len(resumeMessages) > 0 {
-			state.ExecutorMessages = cloneChatMessages(resumeMessages)
-		}
+		state := a.buildExecutorState(plan, executorMessages, resumeMessages, nil)
 		return "", state, &StructuredRunError{
 			Stage:  "executor",
 			Cause:  err,
@@ -575,6 +670,7 @@ func (a *Agent) ContinueStructured(ctx context.Context, state *StructuredRunStat
 	log.Printf("[StructuredRun] agent=%s resuming executor stage: input_size=%d", agentLogName(a), len(strings.TrimSpace(input)))
 
 	executor := a.cloneWithTools(a.executorSystemPrompt(), nil)
+	executor.runStage = "executor"
 	executor.LiveOutputID = fmt.Sprintf("%s:executor", a.Name)
 	executor.LiveOutputTitle = "Executor"
 
@@ -585,14 +681,18 @@ func (a *Agent) ContinueStructured(ctx context.Context, state *StructuredRunStat
 
 	result, resumeMessages, err := executor.runLoopWithState(ctx, messages)
 	if err != nil {
+		var pauseErr *runPausedError
+		if errors.As(err, &pauseErr) {
+			log.Printf("[StructuredRun] agent=%s resumed executor paused: %s", agentLogName(a), strings.TrimSpace(pauseErr.Question))
+			next := a.buildExecutorState(state.Plan, messages, resumeMessages, &StructuredPauseInfo{
+				Kind:     pauseErr.Kind,
+				Question: pauseErr.Question,
+			})
+			next.Status = RunPaused
+			return pauseErr.Question, next, nil
+		}
 		log.Printf("[StructuredRun] agent=%s resumed executor failed: %v", agentLogName(a), err)
-		next := &StructuredRunState{
-			Plan:             state.Plan,
-			ExecutorMessages: cloneChatMessages(messages),
-		}
-		if len(resumeMessages) > 0 {
-			next.ExecutorMessages = cloneChatMessages(resumeMessages)
-		}
+		next := a.buildExecutorState(state.Plan, messages, resumeMessages, nil)
 		return "", next, &StructuredRunError{
 			Stage:  "executor",
 			Cause:  err,
@@ -677,6 +777,13 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 
 				// 回填 tool 消息，关联 tool_call_id
 				messages = append(messages, openai.ToolMessage(output, tc.ID))
+				if toolName == "ask_user" && callErr == nil {
+					return output, cloneChatMessages(messages), &runPausedError{
+						Stage:    strings.TrimSpace(a.runStage),
+						Kind:     "ask_user",
+						Question: strings.TrimSpace(output),
+					}
+				}
 				if toolName == "todo" {
 					usedTodo = true
 				}
@@ -764,6 +871,125 @@ func cloneChatMessages(messages []openai.ChatCompletionMessageParamUnion) []open
 	cloned := make([]openai.ChatCompletionMessageParamUnion, len(messages))
 	copy(cloned, messages)
 	return cloned
+}
+
+func normalizePlanningPolicy(policy PlanningPolicy) PlanningPolicy {
+	switch policy {
+	case PlanningPolicyRequired, PlanningPolicySkip, PlanningPolicyAuto:
+		return policy
+	default:
+		return PlanningPolicyAuto
+	}
+}
+
+func (a *Agent) buildExecutorState(plan string, baseMessages []openai.ChatCompletionMessageParamUnion, resumeMessages []openai.ChatCompletionMessageParamUnion, pause *StructuredPauseInfo) *StructuredRunState {
+	state := &StructuredRunState{
+		Stage:            "executor",
+		Plan:             plan,
+		ExecutorMessages: cloneChatMessages(baseMessages),
+		Pause:            pause,
+	}
+	if len(resumeMessages) > 0 {
+		state.ExecutorMessages = cloneChatMessages(resumeMessages)
+	}
+	return state
+}
+
+func (a *Agent) shouldRunPlanner(messages []openai.ChatCompletionMessageParamUnion, policy PlanningPolicy) bool {
+	switch normalizePlanningPolicy(policy) {
+	case PlanningPolicyRequired:
+		return true
+	case PlanningPolicySkip:
+		return false
+	}
+
+	if a.hasUnfinishedTasks() {
+		return true
+	}
+
+	latest := strings.TrimSpace(lastUserMessageContent(messages))
+	if latest == "" {
+		return true
+	}
+	return !isSimpleDirectExecutionRequest(latest)
+}
+
+func (a *Agent) hasUnfinishedTasks() bool {
+	if a == nil || a.TaskManager == nil {
+		return false
+	}
+	tasks, err := a.TaskManager.Snapshot()
+	if err != nil {
+		return true
+	}
+	for _, task := range tasks {
+		if task != nil && task.Status != taskStatusCompleted {
+			return true
+		}
+	}
+	return false
+}
+
+func lastUserMessageContent(messages []openai.ChatCompletionMessageParamUnion) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		role, content, err := messageRoleAndContent(messages[i])
+		if err == nil && role == "user" {
+			return content
+		}
+	}
+	return ""
+}
+
+func isSimpleDirectExecutionRequest(input string) bool {
+	trimmed := strings.TrimSpace(strings.ToLower(input))
+	if trimmed == "" {
+		return false
+	}
+	if utf8.RuneCountInString(trimmed) > 120 {
+		return false
+	}
+	if strings.Contains(trimmed, "\n") {
+		return false
+	}
+
+	planningMarkers := []string{
+		"plan",
+		"planner",
+		"roadmap",
+		"step by step",
+		"todo",
+		"task list",
+		"break down",
+		"拆分",
+		"规划",
+		"计划",
+		"步骤",
+		"方案",
+	}
+	for _, marker := range planningMarkers {
+		if strings.Contains(trimmed, marker) {
+			return false
+		}
+	}
+
+	complexityMarkers := []string{
+		" and then ",
+		" then ",
+		" meanwhile ",
+		"同时",
+		"然后",
+		"并且",
+		"另外",
+		"顺便",
+		"分别",
+	}
+	for _, marker := range complexityMarkers {
+		if strings.Contains(trimmed, marker) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (a *Agent) reportLiveOutput(id, title, content string, done bool) {
@@ -904,9 +1130,10 @@ func (a *Agent) plannerSystemPrompt() string {
 func (a *Agent) executorSystemPrompt() string {
 	rules := strings.Join([]string{
 		"You are in Executor stage.",
-		"The planner stage has already produced the task list. Use it as the source of truth unless execution proves it is stale or blocked.",
-		"Work through the current unfinished tasks in order, one task at a time.",
-		"Keep todo/task status aligned with real progress, and only re-plan when blocked by new information.",
+		"If the planner stage already produced a task list, use it as the source of truth unless execution proves it is stale or blocked.",
+		"If execution is blocked on missing user input, call ask_user instead of guessing.",
+		"Work through the current unfinished tasks in order when a plan exists.",
+		"Keep todo/task status aligned with real progress, and only re-plan when blocked by new information or the work expands beyond a simple request.",
 	}, " ")
 	return appendPromptSection(a.SystemPrompt, rules)
 }
@@ -955,21 +1182,41 @@ func (a *Agent) plannerContextMessage() string {
 	return strings.Join(lines, "\n")
 }
 
-func (a *Agent) executorContextMessage(plan string) string {
+func (a *Agent) executorContextMessage(plan string, plannerRan bool) string {
 	lines := []string{
-		"<planner_output>",
-		strings.TrimSpace(plan),
-		"</planner_output>",
+		"<planning_status>",
+		map[bool]string{true: "planner_completed", false: "planner_skipped"}[plannerRan],
+		"</planning_status>",
+	}
+	if plannerRan {
+		lines = append(lines,
+			"<planner_output>",
+			strings.TrimSpace(plan),
+			"</planner_output>",
+		)
+	}
+	lines = append(lines,
 		"<current_task_board>",
 		a.currentTaskBoardSummary(),
 		"</current_task_board>",
-		"<unfinished_tasks>",
-		a.unfinishedTaskSummary(),
-		"</unfinished_tasks>",
-		"<execution_rule>",
-		"Start from the first unfinished task above and complete tasks sequentially.",
-		"If a task is blocked, explain the blocker and update the task state before moving on.",
-		"</execution_rule>",
+	)
+	if plannerRan {
+		lines = append(lines,
+			"<unfinished_tasks>",
+			a.unfinishedTaskSummary(),
+			"</unfinished_tasks>",
+			"<execution_rule>",
+			"Start from the first unfinished task above and complete tasks sequentially.",
+			"If a task is blocked, explain the blocker and update the task state before moving on.",
+			"</execution_rule>",
+		)
+	} else {
+		lines = append(lines,
+			"<execution_rule>",
+			"This request skipped formal planning because it appears simple.",
+			"Proceed directly. If the work becomes multi-step, blocked, or needs missing input, pause with ask_user or trigger a fresh structured run later.",
+			"</execution_rule>",
+		)
 	}
 	return strings.Join(lines, "\n")
 }

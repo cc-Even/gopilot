@@ -209,7 +209,7 @@ func (s *cliSession) handleInput(input string) {
 
 	s.appendLine("[purple]User:[white] %s", tview.Escape(input))
 	if s.resumeState != nil {
-		s.appendLine("[green]Gopilot:[white] 正在从中断的 executor 继续...")
+		s.appendLine("[green]Gopilot:[white] 正在继续等待输入的 executor...")
 		s.output.ScrollToEnd()
 		s.runResume(input)
 		return
@@ -380,6 +380,13 @@ func (s *cliSession) runStructured(snapshot []openai.ChatCompletionMessageParamU
 				s.reportRunError(err)
 				return
 			}
+			if state != nil && state.Status == agents.RunPaused {
+				pausedHistory := append(copyMessages(historySnapshot), openai.AssistantMessage(response))
+				s.captureResumeState(pausedHistory, state)
+				s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+				s.appendLine("[yellow]System:[white] 已暂停等待你的补充，直接回复即可从当前 executor 继续；如需放弃本次现场可使用 /clear。")
+				return
+			}
 
 			s.clearResumeState()
 			s.history = append(copyMessages(historySnapshot), openai.AssistantMessage(response))
@@ -413,6 +420,13 @@ func (s *cliSession) runResume(input string) {
 			}
 
 			updatedHistory := append(copyMessages(historySnapshot), openai.UserMessage(resumeInput))
+			if nextState != nil && nextState.Status == agents.RunPaused {
+				pausedHistory := append(copyMessages(updatedHistory), openai.AssistantMessage(response))
+				s.captureResumeState(pausedHistory, nextState)
+				s.appendLine("[green]Gopilot:[white] %s", tview.Escape(response))
+				s.appendLine("[yellow]System:[white] 仍在等待补充信息，直接回复即可继续当前 executor；如需放弃本次现场可使用 /clear。")
+				return
+			}
 			updatedHistory = append(updatedHistory, openai.AssistantMessage(response))
 			s.clearResumeState()
 			s.history = updatedHistory
@@ -436,8 +450,11 @@ func (s *cliSession) captureResumeState(history []openai.ChatCompletionMessagePa
 		return
 	}
 	s.resumeState = &agents.StructuredRunState{
+		Status:           state.Status,
+		Stage:            state.Stage,
 		Plan:             state.Plan,
 		ExecutorMessages: copyMessages(state.ExecutorMessages),
+		Pause:            state.Pause,
 	}
 	s.resumeHistory = copyMessages(history)
 }
@@ -560,7 +577,7 @@ func copyMessages(messages []openai.ChatCompletionMessageParamUnion) []openai.Ch
 }
 
 func buildSystemPrompt(skillLoader *agents.SkillLoader, subAgentLoader *agents.SubAgentLoader) string {
-	return fmt.Sprintf("You are a coding agent at %s. Use tools to solve tasks and summarize results. ", agents.WORKDIR) +
+	return fmt.Sprintf("You are a coding agent at %s.Use tools, create teammates to divide tasks and cooperate to solve problems, and summarize the results.", agents.WORKDIR) +
 		"The runtime may invoke you in planner or executor stage; obey the current stage instructions exactly. " +
 		"For complex tasks, use the task board to keep the plan and execution state explicit. " +
 		"When you need to inspect a group of related files, prefer read_files so you can batch reads under one budgeted call; use read_file when you are drilling into a single file or rereading a narrow slice. " +

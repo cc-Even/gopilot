@@ -138,6 +138,73 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	}
 }
 
+func TestRunStructuredAutoSkipsPlannerForSimpleRequest(t *testing.T) {
+	taskManager, err := NewTaskManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+
+	toolNames := []string{"bash", "ask_user"}
+	type stageCall struct {
+		systemPrompt string
+		lastUser     string
+	}
+	var calls []stageCall
+	agent := &Agent{
+		SystemPrompt: "base prompt",
+		TaskManager:  taskManager,
+		order:        toolNames,
+		tools: map[string]ToolDefinition{
+			"bash": {
+				Name: "bash",
+				Handler: func(context.Context, json.RawMessage, *Agent) (string, error) {
+					return "", nil
+				},
+			},
+			"ask_user": {
+				Name: "ask_user",
+				Handler: func(context.Context, json.RawMessage, *Agent) (string, error) {
+					return "", nil
+				},
+			},
+		},
+		runLoopOverride: func(current *Agent, _ context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+			lastUser := ""
+			for i := len(messages) - 1; i >= 0; i-- {
+				role, content, err := messageRoleAndContent(messages[i])
+				if err == nil && role == "user" {
+					lastUser = content
+					break
+				}
+			}
+			calls = append(calls, stageCall{
+				systemPrompt: current.SystemPrompt,
+				lastUser:     lastUser,
+			})
+			return "executor finished", nil
+		},
+	}
+
+	result, err := agent.RunStructured(context.Background(), []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage("read the README"),
+	})
+	if err != nil {
+		t.Fatalf("RunStructured failed: %v", err)
+	}
+	if result != "executor finished" {
+		t.Fatalf("unexpected executor result: %q", result)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected only executor call, got %d", len(calls))
+	}
+	if strings.Contains(calls[0].systemPrompt, "Planner stage") {
+		t.Fatalf("auto policy unexpectedly ran planner: %q", calls[0].systemPrompt)
+	}
+	if !strings.Contains(calls[0].lastUser, "planner_skipped") {
+		t.Fatalf("executor context missing skipped-planner marker: %q", calls[0].lastUser)
+	}
+}
+
 func TestRunStructuredExecutorFailureReturnsResumeState(t *testing.T) {
 	taskManager, err := NewTaskManager(t.TempDir())
 	if err != nil {
@@ -157,10 +224,10 @@ func TestRunStructuredExecutorFailureReturnsResumeState(t *testing.T) {
 		},
 	}
 
-	_, state, err := agent.RunStructuredWithState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+	_, state, err := agent.RunStructuredWithPolicyAndState(context.Background(), []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage("old system prompt"),
 		openai.UserMessage("fix flaky executor"),
-	})
+	}, PlanningPolicyRequired)
 	if err == nil {
 		t.Fatal("expected structured run to fail")
 	}
@@ -193,6 +260,58 @@ func TestRunStructuredExecutorFailureReturnsResumeState(t *testing.T) {
 	}
 	if lastRole != "user" || !strings.Contains(lastContent, "<planner_output>") {
 		t.Fatalf("unexpected executor resume context: role=%s content=%q", lastRole, lastContent)
+	}
+}
+
+func TestRunStructuredAskUserReturnsPausedState(t *testing.T) {
+	taskManager, err := NewTaskManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+
+	calls := 0
+	agent := &Agent{
+		SystemPrompt: "base prompt",
+		TaskManager:  taskManager,
+		runLoopOverride: func(current *Agent, _ context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+			calls++
+			if strings.Contains(current.SystemPrompt, "Planner stage") {
+				return "1. Inspect file\nCurrent unfinished task: Inspect file", nil
+			}
+			return "", &runPausedError{
+				Stage:    "executor",
+				Kind:     "ask_user",
+				Question: "Which file should I inspect?",
+			}
+		},
+	}
+
+	response, state, err := agent.RunStructuredWithState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage("inspect the config"),
+	})
+	if err != nil {
+		t.Fatalf("RunStructuredWithState returned error: %v", err)
+	}
+	if response != "Which file should I inspect?" {
+		t.Fatalf("unexpected pause question: %q", response)
+	}
+	if calls != 1 {
+		t.Fatalf("expected auto policy to skip planner for simple request, got %d calls", calls)
+	}
+	if state == nil {
+		t.Fatal("expected paused state")
+	}
+	if state.Status != RunPaused {
+		t.Fatalf("unexpected state status: %q", state.Status)
+	}
+	if state.Stage != "executor" {
+		t.Fatalf("unexpected paused stage: %q", state.Stage)
+	}
+	if state.Pause == nil || state.Pause.Question != "Which file should I inspect?" {
+		t.Fatalf("unexpected pause info: %+v", state.Pause)
+	}
+	if len(state.ExecutorMessages) == 0 {
+		t.Fatal("expected executor messages to be preserved")
 	}
 }
 
@@ -237,9 +356,9 @@ func TestContinueStructuredResumesExecutorWithoutPlanner(t *testing.T) {
 		},
 	}
 
-	_, state, err := agent.RunStructuredWithState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+	_, state, err := agent.RunStructuredWithPolicyAndState(context.Background(), []openai.ChatCompletionMessageParamUnion{
 		openai.UserMessage("recover from executor interruption"),
-	})
+	}, PlanningPolicyRequired)
 	if err == nil {
 		t.Fatal("expected first executor run to fail")
 	}
@@ -268,6 +387,80 @@ func TestContinueStructuredResumesExecutorWithoutPlanner(t *testing.T) {
 	}
 	if strings.Contains(calls[1].lastUser, "continue") {
 		t.Fatalf("initial executor attempt should not see resume input: %q", calls[1].lastUser)
+	}
+}
+
+func TestContinueStructuredResumesPausedExecutorWithoutPlanner(t *testing.T) {
+	taskManager, err := NewTaskManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+
+	type stageCall struct {
+		systemPrompt string
+		lastUser     string
+	}
+	var calls []stageCall
+	executorAttempts := 0
+	agent := &Agent{
+		SystemPrompt: "base prompt",
+		TaskManager:  taskManager,
+		runLoopOverride: func(current *Agent, _ context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+			lastUser := ""
+			for i := len(messages) - 1; i >= 0; i-- {
+				role, content, err := messageRoleAndContent(messages[i])
+				if err == nil && role == "user" {
+					lastUser = content
+					break
+				}
+			}
+			calls = append(calls, stageCall{
+				systemPrompt: current.SystemPrompt,
+				lastUser:     lastUser,
+			})
+			executorAttempts++
+			if executorAttempts == 1 {
+				return "", &runPausedError{
+					Stage:    "executor",
+					Kind:     "ask_user",
+					Question: "Need the exact file path.",
+				}
+			}
+			return "executor resumed", nil
+		},
+	}
+
+	response, state, err := agent.RunStructuredWithState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage("inspect the config"),
+	})
+	if err != nil {
+		t.Fatalf("RunStructuredWithState failed: %v", err)
+	}
+	if response != "Need the exact file path." {
+		t.Fatalf("unexpected pause response: %q", response)
+	}
+	if state == nil || state.Status != RunPaused {
+		t.Fatalf("expected paused state, got %+v", state)
+	}
+
+	result, nextState, err := agent.ContinueStructured(context.Background(), state, "pkg/agents/core.go")
+	if err != nil {
+		t.Fatalf("ContinueStructured failed: %v", err)
+	}
+	if result != "executor resumed" {
+		t.Fatalf("unexpected resume result: %q", result)
+	}
+	if nextState != nil {
+		t.Fatalf("expected cleared resume state after success, got %+v", nextState)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected paused executor + resumed executor, got %d calls", len(calls))
+	}
+	if strings.Contains(calls[1].systemPrompt, "Planner stage") {
+		t.Fatalf("resume unexpectedly reran planner: %q", calls[1].systemPrompt)
+	}
+	if calls[1].lastUser != "pkg/agents/core.go" {
+		t.Fatalf("expected resume input to reach executor, got %q", calls[1].lastUser)
 	}
 }
 
