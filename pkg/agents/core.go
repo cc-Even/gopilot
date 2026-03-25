@@ -163,7 +163,6 @@ const (
 )
 
 var plannerToolAllowlist = map[string]struct{}{
-	"todo":        {},
 	"task_create": {},
 	"task_update": {},
 	"task_list":   {},
