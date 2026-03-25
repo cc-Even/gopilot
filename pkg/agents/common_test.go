@@ -44,6 +44,8 @@ func TestSetWorkspaceDirUpdatesRuntimeState(t *testing.T) {
 	originalTeamDir := TEAM_DIR
 	originalWorktreeDir := WORKTREE_DIR
 	originalTalkLogPath := TALK_LOG_PATH
+	originalTokenLogPath := TOKEN_LOG_PATH
+	root := t.TempDir()
 
 	t.Cleanup(func() {
 		WORKDIR = originalWorkdir
@@ -54,10 +56,10 @@ func TestSetWorkspaceDirUpdatesRuntimeState(t *testing.T) {
 		TEAM_DIR = originalTeamDir
 		WORKTREE_DIR = originalWorktreeDir
 		TALK_LOG_PATH = originalTalkLogPath
+		TOKEN_LOG_PATH = originalTokenLogPath
 		_ = os.Chdir(originalWD)
 	})
 
-	root := t.TempDir()
 	child := filepath.Join(root, "child")
 	if err := os.Mkdir(child, 0o755); err != nil {
 		t.Fatalf("mkdir child failed: %v", err)
@@ -112,5 +114,8 @@ func TestSetWorkspaceDirUpdatesRuntimeState(t *testing.T) {
 	}
 	if TALK_LOG_PATH != filepath.Join(STATE_DIR, "talk.txt") {
 		t.Fatalf("unexpected talk log path: %q", TALK_LOG_PATH)
+	}
+	if TOKEN_LOG_PATH != filepath.Join(TOOLDIR, "token.log") {
+		t.Fatalf("unexpected token log path: %q", TOKEN_LOG_PATH)
 	}
 }

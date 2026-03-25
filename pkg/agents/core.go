@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -168,6 +169,8 @@ var plannerToolAllowlist = map[string]struct{}{
 	"task_list":   {},
 	"task_get":    {},
 }
+
+var tokenLogMu sync.Mutex
 
 type runPausedError struct {
 	Stage    string
@@ -955,7 +958,7 @@ func useModelToDetermineSimpleRequest(ctx context.Context, client openai.Client,
 	systemPrompt := `你是一个简单请求判断器。你的任务是根据用户输入判断该请求是否足够简单，可以直接执行而无需详细的计划。
 
 判断标准：
-- 简单请求：单一任务、明确目标、不需要多步骤处理
+- 简单请求：单一任务、明确目标、不需要多步骤处理、只是询问不要求行动
 - 复杂请求：需要多个步骤、涉及多个文件、包含复杂逻辑、或者明确提到需要计划/规划
 
 请只回答 "yes" 或 "no"：
@@ -978,6 +981,7 @@ func useModelToDetermineSimpleRequest(ctx context.Context, client openai.Client,
 	if len(resp.Choices) == 0 {
 		return false
 	}
+	recordTokenUsage(nil, model, "simple_request_classifier", -1, resp.Choices[0].FinishReason, resp.Usage)
 
 	answer := strings.TrimSpace(strings.ToLower(resp.Choices[0].Message.Content))
 	log.Printf("[isSimpleDirectExecutionRequest] model response: %s for input: %s", answer, truncate(userInput, 50))
@@ -1056,6 +1060,78 @@ func (a *Agent) reportLiveOutput(id, title, content string, done bool) {
 	a.liveOutputReporter(id, title, content, done)
 }
 
+func recordTokenUsage(agent *Agent, model, kind string, turn int, finishReason string, usage openai.CompletionUsage) {
+	stage := ""
+	agentName := agentLogName(agent)
+	if agent != nil {
+		stage = strings.TrimSpace(agent.runStage)
+		if strings.TrimSpace(model) == "" {
+			model = agent.Model
+		}
+	}
+	if strings.TrimSpace(model) == "" {
+		model = "unknown"
+	}
+	if strings.TrimSpace(kind) == "" {
+		kind = "chat_completion"
+	}
+	if strings.TrimSpace(finishReason) == "" {
+		finishReason = "unknown"
+	}
+
+	line := fmt.Sprintf(
+		"[TokenUsage] agent=%s stage=%s kind=%s turn=%s model=%s finish_reason=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d reasoning_tokens=%d cached_tokens=%d input_audio_tokens=%d output_audio_tokens=%d accepted_prediction_tokens=%d rejected_prediction_tokens=%d",
+		agentName,
+		stage,
+		kind,
+		formatTokenUsageTurn(turn),
+		strings.TrimSpace(model),
+		strings.TrimSpace(finishReason),
+		usage.PromptTokens,
+		usage.CompletionTokens,
+		usage.TotalTokens,
+		usage.CompletionTokensDetails.ReasoningTokens,
+		usage.PromptTokensDetails.CachedTokens,
+		usage.PromptTokensDetails.AudioTokens,
+		usage.CompletionTokensDetails.AudioTokens,
+		usage.CompletionTokensDetails.AcceptedPredictionTokens,
+		usage.CompletionTokensDetails.RejectedPredictionTokens,
+	)
+	log.Print(line)
+	if err := appendTokenUsageLine(line); err != nil {
+		log.Printf("[TokenUsage] failed to append token log %q: %v", TOKEN_LOG_PATH, err)
+	}
+}
+
+func formatTokenUsageTurn(turn int) string {
+	if turn < 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", turn+1)
+}
+
+func appendTokenUsageLine(line string) error {
+	path := strings.TrimSpace(TOKEN_LOG_PATH)
+	if path == "" {
+		return fmt.Errorf("token log path is empty")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	tokenLogMu.Lock()
+	defer tokenLogMu.Unlock()
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = fmt.Fprintf(file, "%s %s\n", time.Now().Format(time.RFC3339Nano), line)
+	return err
+}
+
 func (a *Agent) displayTitle() string {
 	if a == nil {
 		return "Agent"
@@ -1089,6 +1165,9 @@ func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.Chat
 		Model:    a.Model,
 		Messages: messages,
 		Tools:    a.openAITools(),
+		StreamOptions: openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		},
 	})
 	acc := openai.ChatCompletionAccumulator{}
 	liveID, liveTitle := a.liveOutputIdentity()
@@ -1121,6 +1200,7 @@ func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.Chat
 		return nil, fmt.Errorf("empty choices from model")
 	}
 	resp := acc.ChatCompletion
+	recordTokenUsage(a, a.Model, "stream_chat_completion", turn, resp.Choices[0].FinishReason, resp.Usage)
 	return &resp, nil
 }
 
@@ -1165,7 +1245,7 @@ func (a *Agent) plannerSystemPrompt() string {
 	rules := strings.Join([]string{
 		"You are in Planner stage.",
 		"Your only job in this stage is to produce or update the execution plan.",
-		"Only use todo and task tools. Do not edit files, run shell commands, create worktrees, or delegate work.",
+		"Only use task tools. Do not edit files, run shell commands, create worktrees, or delegate work.",
 		"Prefer task_list/task_get before creating or updating tasks so you reuse the current board when possible.",
 		"When the plan is ready, return a concise ordered plan and clearly identify the current unfinished task.",
 	}, " ")
@@ -1510,6 +1590,7 @@ func (a *Agent) summarizeForAutoCompact(ctx context.Context, prompt string) (str
 	if len(resp.Choices) == 0 {
 		return "", fmt.Errorf("empty summary choices from model")
 	}
+	recordTokenUsage(a, a.Model, "auto_compact_summary", -1, resp.Choices[0].FinishReason, resp.Usage)
 
 	return resp.Choices[0].Message.Content, nil
 }

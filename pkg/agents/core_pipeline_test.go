@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -107,7 +109,7 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	if !strings.Contains(planner.systemPrompt, "Planner stage") {
 		t.Fatalf("planner system prompt missing planner instructions: %q", planner.systemPrompt)
 	}
-	expectedPlannerTools := []string{"todo", "task_create", "task_update", "task_list", "task_get"}
+	expectedPlannerTools := []string{"task_create", "task_update", "task_list", "task_get"}
 	if strings.Join(planner.tools, ",") != strings.Join(expectedPlannerTools, ",") {
 		t.Fatalf("unexpected planner tools: got %v want %v", planner.tools, expectedPlannerTools)
 	}
@@ -496,5 +498,53 @@ func TestStageAndLiveOutputAreLogged(t *testing.T) {
 	}
 	if !strings.Contains(logged, "[LiveOutput] agent=supervisor id=supervisor:executor title=Executor state=final content=executor finished") {
 		t.Fatalf("missing final live log entry: %q", logged)
+	}
+}
+
+func TestRecordTokenUsageLogsAndAppendsFile(t *testing.T) {
+	var buf bytes.Buffer
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	originalTokenLogPath := TOKEN_LOG_PATH
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	TOKEN_LOG_PATH = filepath.Join(t.TempDir(), "token.log")
+	defer log.SetOutput(originalWriter)
+	defer log.SetFlags(originalFlags)
+	defer func() {
+		TOKEN_LOG_PATH = originalTokenLogPath
+	}()
+
+	agent := &Agent{
+		Name:     "supervisor",
+		Model:    "gpt-4o-mini",
+		runStage: "executor",
+	}
+	usage := openai.CompletionUsage{
+		PromptTokens:     120,
+		CompletionTokens: 45,
+		TotalTokens:      165,
+	}
+	usage.CompletionTokensDetails.ReasoningTokens = 9
+	usage.CompletionTokensDetails.AudioTokens = 2
+	usage.CompletionTokensDetails.AcceptedPredictionTokens = 7
+	usage.CompletionTokensDetails.RejectedPredictionTokens = 1
+	usage.PromptTokensDetails.CachedTokens = 30
+	usage.PromptTokensDetails.AudioTokens = 3
+
+	recordTokenUsage(agent, "", "stream_chat_completion", 2, "stop", usage)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "[TokenUsage] agent=supervisor stage=executor kind=stream_chat_completion turn=3 model=gpt-4o-mini finish_reason=stop prompt_tokens=120 completion_tokens=45 total_tokens=165") {
+		t.Fatalf("missing token usage log entry: %q", logged)
+	}
+
+	raw, err := os.ReadFile(TOKEN_LOG_PATH)
+	if err != nil {
+		t.Fatalf("read token log failed: %v", err)
+	}
+	tokenLog := string(raw)
+	if !strings.Contains(tokenLog, "[TokenUsage] agent=supervisor stage=executor kind=stream_chat_completion turn=3 model=gpt-4o-mini finish_reason=stop prompt_tokens=120 completion_tokens=45 total_tokens=165") {
+		t.Fatalf("missing token usage file entry: %q", tokenLog)
 	}
 }
