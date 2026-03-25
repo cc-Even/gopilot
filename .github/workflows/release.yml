@@ -24,9 +24,10 @@ jobs:
       - name: Run Tests
         run: go test ./...
 
-  # --- 阶段 2: 多平台编译并发布 ---
-  # 只有推送到 tag 且测试通过后才执行
+  # --- 阶段 2: 多平台编译并打包 ---
   release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -45,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 关键：拉取全部历史，否则拿不到 commit log
+          fetch-depth: 0 # 必须拉取全部历史才能生成 Changelog
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -58,17 +59,19 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
         run: |
-          # 1. 统一编译二进制名为 gopilot
+          # 1. 设置二进制文件名为 gopilot
           BINARY_NAME="gopilot"
-          [ "${{ matrix.goos }}" = "windows" ] && BINARY_NAME="gopilot.exe"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="gopilot.exe"
+          fi
           
+          # 2. 编译
           go build -v -ldflags "-X main.version=$VERSION" -o "$BINARY_NAME" .
           
-          # 2. 定义打包文件名
+          # 3. 定义外部压缩包名称
           PACKAGE_NAME="gopilot-${{ matrix.goos }}-${{ matrix.goarch }}"
           
-          # 3. 打包二进制 + 文件夹 + .env.example
-          # 这里的 skills/ subagents/ .env.example 必须存在于仓库根目录
+          # 4. 打包二进制文件 + 目录 + 配置文件
           if [ "${{ matrix.goos }}" = "windows" ]; then
             zip -r "${PACKAGE_NAME}.zip" "$BINARY_NAME" skills subagents .env.example
             echo "ASSET_PATH=${PACKAGE_NAME}.zip" >> $GITHUB_ENV
@@ -83,55 +86,53 @@ jobs:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ${{ env.ASSET_PATH }}
 
-    publish:
-      needs: release
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v4
-          with:
-            fetch-depth: 0 # 同样需要拉取历史来对比 tag
+  # --- 阶段 3: 汇总发布 (这个 Job 必须和上面的 release 对齐) ---
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-        - name: Download all artifacts
-          uses: actions/download-artifact@v4
-          with:
-            path: ./assets
-            pattern: binaries-*
-            merge-multiple: true
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./assets
+          pattern: binaries-*
+          merge-multiple: true
 
-        - name: Generate Release Notes
-          id: changelog
-          run: |
-            echo "## 🚀 Gopilot $GITHUB_REF_NAME" > release_notes.md
-            echo "" >> release_notes.md
+      - name: Generate Release Notes
+        id: changelog
+        run: |
+          echo "## 🚀 Gopilot $GITHUB_REF_NAME" > release_notes.md
+          echo "" >> release_notes.md
+          echo "### 📦 包含内容" >> release_notes.md
+          echo "- \`gopilot\` 执行文件" >> release_notes.md
+          echo "- \`skills/\` 技能文件夹" >> release_notes.md
+          echo "- \`subagents/\` 子智能体文件夹" >> release_notes.md
+          echo "- \`.env.example\` 配置模板" >> release_notes.md
+          echo "" >> release_notes.md
 
-            echo "### 📦 包含内容" >> release_notes.md
-            echo "- \`gopilot\` 执行文件" >> release_notes.md
-            echo "- \`skills/\` 技能文件夹" >> release_notes.md
-            echo "- \`subagents/\` 子智能体文件夹" >> release_notes.md
-            echo "- \`.env.example\` 环境变量配置模板" >> release_notes.md
-            echo "" >> release_notes.md
+          echo "### 📝 更新日志 (Changelog)" >> release_notes.md
+          PREVIOUS_TAG=$(git tag --sort=-v:refname | sed -n '2p')
+          if [ -z "$PREVIOUS_TAG" ]; then
+            git log --oneline --no-merges -n 20 | sed 's/^/* /' >> release_notes.md
+          else
+            git log --oneline --no-merges $PREVIOUS_TAG..${{ github.ref_name }} | sed 's/^/* /' >> release_notes.md
+          fi
+          
+          echo "" >> release_notes.md
+          echo "### 🔒 校验和 (SHA256)" >> release_notes.md
+          echo "\`\`\`" >> release_notes.md
+          cd assets && sha256sum * >> ../release_notes.md
+          echo "\`\`\`" >> release_notes.md
 
-            echo "### 📝 更新日志 (Changelog)" >> release_notes.md
-            # 提取两个 Tag 之间的 commit 信息
-            PREVIOUS_TAG=$(git tag --sort=-v:refname | sed -n '2p')
-            if [ -z "$PREVIOUS_TAG" ]; then
-              # 如果是第一个版本，则取最近 20 条
-              git log --oneline --no-merges -n 20 | sed 's/^/* /' >> release_notes.md
-            else
-              # 获取当前 tag 和上一个 tag 之间的差异
-              git log --oneline --no-merges $PREVIOUS_TAG..${{ github.ref_name }} | sed 's/^/* /' >> release_notes.md
-            fi
-
-            echo "" >> release_notes.md
-            echo "### 🔒 校验和 (SHA256)" >> release_notes.md
-            echo "\`\`\`" >> release_notes.md
-            cd assets && sha256sum * >> ../release_notes.md
-            echo "\`\`\`" >> release_notes.md
-
-        - name: Upload to Release
-          uses: softprops/action-gh-release@v2
-          with:
-            body_path: release_notes.md
-            files: assets/*
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          files: assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
