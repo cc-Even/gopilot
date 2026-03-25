@@ -467,6 +467,7 @@ func main() {
 	session.showStartupLogo()
 	inputArea := newComposerInput(session.handleInput)
 	commandSuggestions := []string{
+		"/cd",
 		"/model",
 		"/tasks",
 		"/team",
@@ -630,8 +631,15 @@ func (s *cliSession) executeCommand(input string) {
 	if len(parts) == 0 {
 		return
 	}
+	rawArgs := strings.TrimSpace(strings.TrimPrefix(input, parts[0]))
 
 	switch parts[0] {
+	case "/cd":
+		if s.running {
+			s.appendLine("[red]System:[white] 主 agent 运行中，暂时不能切换工作目录。")
+			return
+		}
+		s.handleChangeDirCommand(rawArgs)
 	case "/model":
 		if s.running {
 			s.appendLine("[red]System:[white] 主 agent 运行中，暂时不能切换模型。")
@@ -656,6 +664,26 @@ func (s *cliSession) executeCommand(input string) {
 	default:
 		s.appendLinef("[red]System:[white] 未知命令: %s", tview.Escape(parts[0]))
 	}
+}
+
+func (s *cliSession) handleChangeDirCommand(rawArgs string) {
+	target := strings.TrimSpace(rawArgs)
+	if target == "" {
+		s.appendLinef("[yellow]System:[white] 用法: /cd <path>  当前目录: %s", tview.Escape(currentDir))
+		return
+	}
+
+	nextDir, err := agents.SetWorkspaceDir(target)
+	if err != nil {
+		s.appendLinef("[red]System:[white] 切换工作目录失败: %s", tview.Escape(err.Error()))
+		return
+	}
+
+	s.resetConversation()
+	s.appendLinef(
+		"[green]System:[white] 已切换工作目录到 %s，并重置当前会话上下文。",
+		tview.Escape(nextDir),
+	)
 }
 
 func (s *cliSession) handleModelCommand(args []string) {
@@ -730,6 +758,7 @@ func (s *cliSession) resetConversation() {
 
 func (s *cliSession) rebuildAgent() {
 	currentModel = getenvOrDefault("MODEL", "gpt-4o-mini")
+	s.systemPrompt = buildSystemPrompt(s.skillLoader, s.subAgentLoader)
 	subAgents := s.subAgentLoader.BuildAgents(currentModel, agents.DefaultToolDefinitions(), s.skillLoader)
 	s.agent = agents.NewOpenAIAgent(
 		"supervisor",

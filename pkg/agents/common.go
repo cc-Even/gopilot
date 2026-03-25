@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,6 +37,50 @@ var TEAM_DIR = filepath.Join(STATE_DIR, "teams")
 var WORKTREE_DIR = filepath.Join(STATE_DIR, "worktrees")
 
 var TALK_LOG_PATH = filepath.Join(STATE_DIR, "talk.txt")
+
+func SetWorkspaceDir(dir string) (string, error) {
+	clean := strings.TrimSpace(dir)
+	if clean == "" {
+		return "", errors.New("workspace path is empty")
+	}
+
+	if !filepath.IsAbs(clean) {
+		base := WORKDIR
+		if strings.TrimSpace(base) == "" {
+			if wd, err := os.Getwd(); err == nil {
+				base = wd
+			}
+		}
+		clean = filepath.Join(base, clean)
+	}
+
+	resolved, err := filepath.Abs(clean)
+	if err != nil {
+		return "", err
+	}
+
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", resolved)
+	}
+	if err := os.Chdir(resolved); err != nil {
+		return "", err
+	}
+
+	WORKDIR = resolved
+	REPO_ROOT = detectRepoRoot(resolved)
+	REPO_STATE_DIR = filepath.Join(resolveStateBaseDir(), repoStateNamespace(REPO_ROOT))
+	STATE_DIR = sessionStateDir(REPO_STATE_DIR, SESSION_ID)
+	TASK_DIR = filepath.Join(STATE_DIR, "tasks")
+	TEAM_DIR = filepath.Join(STATE_DIR, "teams")
+	WORKTREE_DIR = filepath.Join(STATE_DIR, "worktrees")
+	TALK_LOG_PATH = filepath.Join(STATE_DIR, "talk.txt")
+
+	return resolved, nil
+}
 
 func detectRepoRoot(dir string) string {
 	clean := strings.TrimSpace(dir)
