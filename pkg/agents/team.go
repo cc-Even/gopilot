@@ -850,7 +850,7 @@ func (m *TeammateManager) defaultRunner(ctx context.Context, agent *Agent, promp
 		openai.UserMessage(prompt),
 	}
 
-	const maxTurns = 50
+	const maxTurns = 999
 	var pendingIdleEvent *idleEvent
 	for turn := 0; turn < maxTurns; {
 		nextMessages, enterIdle, err := m.runWorkPhase(ctx, agent, messages, turn)

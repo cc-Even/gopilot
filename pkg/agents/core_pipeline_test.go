@@ -31,6 +31,7 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 		"task_update",
 		"task_list",
 		"task_get",
+		"list_file",
 		"read_file",
 		"write_file",
 		"edit_file",
@@ -120,6 +121,11 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 		t.Fatalf("planner system prompt missing planner instructions: %q", planner.systemPrompt)
 	}
 	for _, required := range []string{"task_create", "task_update", "task_list", "task_get"} {
+		if !containsString(planner.tools, required) {
+			t.Fatalf("planner tools missing %s: %v", required, planner.tools)
+		}
+	}
+	for _, required := range []string{"list_file", "read_file"} {
 		if !containsString(planner.tools, required) {
 			t.Fatalf("planner tools missing %s: %v", required, planner.tools)
 		}

@@ -178,6 +178,7 @@ type BashTool struct{}
 type BackgroundRunTool struct{}
 type BackgroundCheckTool struct{}
 type ReadFileTool struct{}
+type ListFileTool struct{}
 type BatchReadFileTool struct{}
 type WriteFileTool struct{}
 type EditFileTool struct{}
@@ -225,6 +226,7 @@ func DefaultToolDefinitions() []ToolDefinition {
 	backgroundRun := BackgroundRunTool{}
 	backgroundCheck := BackgroundCheckTool{}
 	read := ReadFileTool{}
+	list := ListFileTool{}
 	batchRead := BatchReadFileTool{}
 	write := WriteFileTool{}
 	edit := EditFileTool{}
@@ -255,6 +257,12 @@ func DefaultToolDefinitions() []ToolDefinition {
 			read.Description(),
 			ObjectSchema(map[string]any{"path": NonEmptyStringParam(), "limit": IntegerParam()}, "path"),
 			read.Call,
+		),
+		ToolFromJSONString(
+			list.Name(),
+			list.Description(),
+			ObjectSchema(map[string]any{"path": StringParam()}),
+			list.Call,
 		),
 		ToolFromJSONString(
 			batchRead.Name(),
@@ -460,6 +468,79 @@ func RunRead(baseDir, path string, limit int) string {
 		return result[:maxReadOutputChars]
 	}
 	return result
+}
+
+type listFileEntry struct {
+	Path  string `json:"path"`
+	IsDir bool   `json:"is_dir,omitempty"`
+}
+
+type listFileResponse struct {
+	Path    string          `json:"path"`
+	Entries []listFileEntry `json:"entries"`
+}
+
+func workspaceRelativePath(baseDir, target string) string {
+	workdirAbs, err := filepath.Abs(baseDir)
+	if err != nil {
+		return filepath.ToSlash(target)
+	}
+	targetAbs, err := filepath.Abs(target)
+	if err != nil {
+		return filepath.ToSlash(target)
+	}
+	relative, err := filepath.Rel(workdirAbs, targetAbs)
+	if err != nil {
+		return filepath.ToSlash(targetAbs)
+	}
+	relative = filepath.ToSlash(relative)
+	if relative == "." {
+		return "."
+	}
+	return relative
+}
+
+// RunList returns the direct children under a directory in the workspace.
+func RunList(baseDir, path string) string {
+	resolved := baseDir
+	cleanPath := strings.TrimSpace(path)
+	if cleanPath != "" {
+		var err error
+		resolved, err = safePath(baseDir, cleanPath)
+		if err != nil {
+			return "Error: " + err.Error()
+		}
+	}
+
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	if !info.IsDir() {
+		return "Error: not a directory: " + cleanPath
+	}
+
+	entries, err := os.ReadDir(resolved)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+
+	response := listFileResponse{
+		Path:    workspaceRelativePath(baseDir, resolved),
+		Entries: make([]listFileEntry, 0, len(entries)),
+	}
+	for _, entry := range entries {
+		response.Entries = append(response.Entries, listFileEntry{
+			Path:  workspaceRelativePath(baseDir, filepath.Join(resolved, entry.Name())),
+			IsDir: entry.IsDir(),
+		})
+	}
+
+	data, err := json.MarshalIndent(response, "", "  ")
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	return string(data)
 }
 
 type batchReadFileRequest struct {
@@ -672,6 +753,30 @@ func (r ReadFileTool) Call(_ context.Context, input string, agent *Agent) (strin
 	log.Printf("[ReadFileTool] agent=%s Reading file: path=%s, limit=%d", agentLogName(agent), params.Path, params.Limit)
 	result := RunRead(agentWorkspaceDir(agent), params.Path, params.Limit)
 	log.Printf("[ReadFileTool] agent=%s File read completed (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
+	return result, nil
+}
+
+func (l ListFileTool) Name() string {
+	return "list_file"
+}
+
+func (l ListFileTool) Description() string {
+	return "List files and directories directly under a workspace path. Input must be a JSON object with optional path; when omitted, lists the current workspace directory."
+}
+
+func (l ListFileTool) Call(_ context.Context, input string, agent *Agent) (string, error) {
+	var params struct {
+		Path string `json:"path"`
+	}
+	if strings.TrimSpace(input) != "" && input != "null" {
+		if err := json.Unmarshal([]byte(input), &params); err != nil {
+			log.Printf("[ListFileTool] agent=%s Error parsing input: %v", agentLogName(agent), err)
+			return "", fmt.Errorf("invalid input: %v", err)
+		}
+	}
+	log.Printf("[ListFileTool] agent=%s Listing path: path=%s", agentLogName(agent), params.Path)
+	result := RunList(agentWorkspaceDir(agent), params.Path)
+	log.Printf("[ListFileTool] agent=%s File list completed (first 20 chars): %s", agentLogName(agent), truncate(result, 20))
 	return result, nil
 }
 

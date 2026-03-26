@@ -146,6 +146,14 @@ func TestDefaultToolDefinitionsUseStrictObjectSchemas(t *testing.T) {
 		t.Fatalf("read_file additionalProperties = %v, want false", readSchema["additionalProperties"])
 	}
 
+	listSchema := toolByName["list_file"].Parameters
+	if listSchema["type"] != "object" {
+		t.Fatalf("list_file schema type = %v, want object", listSchema["type"])
+	}
+	if listSchema["additionalProperties"] != false {
+		t.Fatalf("list_file additionalProperties = %v, want false", listSchema["additionalProperties"])
+	}
+
 	readFilesSchema := toolByName["read_files"].Parameters
 	if readFilesSchema["type"] != "object" {
 		t.Fatalf("read_files schema type = %v, want object", readFilesSchema["type"])
@@ -255,5 +263,68 @@ func TestBatchReadFileToolPreservesRemainingLineLimit(t *testing.T) {
 	}
 	if response.Remaining[0].StartLine != 3 || response.Remaining[0].Limit != 1 {
 		t.Fatalf("unexpected remaining request after partial limited read: %+v", response.Remaining[0])
+	}
+}
+
+func TestListFileToolListsWorkspaceRootWhenPathOmitted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "root.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := ListFileTool{}
+	output, err := tool.Call(context.Background(), `{}`, &Agent{WorkDir: root})
+	if err != nil {
+		t.Fatalf("list_file failed: %v", err)
+	}
+
+	var response listFileResponse
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if response.Path != "." {
+		t.Fatalf("response path = %q, want .", response.Path)
+	}
+	if len(response.Entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(response.Entries))
+	}
+	if response.Entries[0].Path != "nested" || !response.Entries[0].IsDir {
+		t.Fatalf("unexpected first entry: %+v", response.Entries[0])
+	}
+	if response.Entries[1].Path != "root.txt" || response.Entries[1].IsDir {
+		t.Fatalf("unexpected second entry: %+v", response.Entries[1])
+	}
+}
+
+func TestListFileToolListsSpecifiedDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "pkg", "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pkg", "agents", "core.go"), []byte("package agents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := ListFileTool{}
+	output, err := tool.Call(context.Background(), `{"path":"pkg"}`, &Agent{WorkDir: root})
+	if err != nil {
+		t.Fatalf("list_file failed: %v", err)
+	}
+
+	var response listFileResponse
+	if err := json.Unmarshal([]byte(output), &response); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if response.Path != "pkg" {
+		t.Fatalf("response path = %q, want pkg", response.Path)
+	}
+	if len(response.Entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(response.Entries))
+	}
+	if response.Entries[0].Path != "pkg/agents" || !response.Entries[0].IsDir {
+		t.Fatalf("unexpected entry: %+v", response.Entries[0])
 	}
 }

@@ -67,10 +67,10 @@ func TestMaybeAutoCompact_WithMockSummary(t *testing.T) {
 		},
 	}
 
-	oldUser := strings.Repeat("u", 25000)
-	oldAssistant := strings.Repeat("a", 25000)
-	recentUser := strings.Repeat("r", 20000)
-	recentAssistant := strings.Repeat("s", 20000)
+	oldUser := strings.Repeat("u", 30000)
+	oldAssistant := strings.Repeat("a", 30000)
+	recentUser := strings.Repeat("r", 25000)
+	recentAssistant := strings.Repeat("s", 25000)
 	messages := []openai.ChatCompletionMessageParamUnion{
 		openai.SystemMessage("system"),
 		openai.UserMessage(oldUser),

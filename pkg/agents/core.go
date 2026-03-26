@@ -156,7 +156,7 @@ type AgentOption func(*AgentOptions)
 type PlanningPolicy string
 
 const (
-	autoCompactTriggerChars   = 80000
+	autoCompactTriggerChars   = 100000
 	autoCompactSummaryMaxChar = 80000
 	autoCompactSummaryTokens  = 2000
 	openAIRateLimitRetryEnv   = "OPENAI_RATE_LIMIT_RETRY_SECONDS"
@@ -172,6 +172,7 @@ var plannerToolAllowlist = map[string]struct{}{
 	"task_update": {},
 	"task_list":   {},
 	"task_get":    {},
+	"list_file":   {},
 	"read_file":   {},
 	"bash":        {},
 }
@@ -793,7 +794,7 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 		return result, nil, nil
 	}
 
-	const maxTurns = 40
+	const maxTurns = 999
 	roundsSinceTodo := 0
 	for turn := 0; turn < maxTurns; turn++ {
 		var err error
@@ -840,7 +841,7 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 				toolArgs := json.RawMessage(tc.Function.Arguments)
 				a.reportStageOutput(
 					fmt.Sprintf("%s Tool %s", a.displayTitle(), toolName),
-					fmt.Sprintf("开始执行:\n%s", strings.TrimSpace(tc.Function.Arguments)),
+					fmt.Sprintf("开始执行:\n%s", compactToolDisplay(tc.Function.Arguments, toolName)),
 				)
 				output, callErr := a.executeTool(ctx, toolName, toolArgs)
 				if callErr != nil {
@@ -1338,7 +1339,7 @@ func formatToolCallPreview(toolCalls []openai.ChatCompletionMessageToolCallUnion
 		if name == "" {
 			name = "(pending)"
 		}
-		args := strings.TrimSpace(tc.Function.Arguments)
+		args := compactToolDisplay(strings.TrimSpace(tc.Function.Arguments), name)
 		if args == "" {
 			lines = append(lines, fmt.Sprintf("- %s", name))
 			continue
@@ -1346,6 +1347,56 @@ func formatToolCallPreview(toolCalls []openai.ChatCompletionMessageToolCallUnion
 		lines = append(lines, fmt.Sprintf("- %s %s", name, args))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func compactToolDisplay(payload, toolName string) string {
+	trimmed := strings.TrimSpace(payload)
+	if trimmed == "" {
+		return ""
+	}
+
+	switch toolName {
+	case "write_file":
+		return compactWriteFileDisplay(trimmed)
+	default:
+		return trimmed
+	}
+}
+
+func compactWriteFileDisplay(payload string) string {
+	var params struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(payload), &params); err != nil {
+		return payload
+	}
+
+	type writeFileDisplay struct {
+		Path           string `json:"path,omitempty"`
+		ContentBytes   int    `json:"content_bytes"`
+		ContentPreview string `json:"content_preview,omitempty"`
+	}
+
+	display := writeFileDisplay{
+		Path:         strings.TrimSpace(params.Path),
+		ContentBytes: len(params.Content),
+	}
+
+	const previewLimit = 200
+	preview := params.Content
+	if utf8.RuneCountInString(preview) > previewLimit {
+		preview = truncateByRunes(preview, previewLimit) + "... (truncated)"
+	}
+	if strings.TrimSpace(preview) != "" {
+		display.ContentPreview = preview
+	}
+
+	data, err := json.MarshalIndent(display, "", "  ")
+	if err != nil {
+		return payload
+	}
+	return string(data)
 }
 
 func (a *Agent) plannerSystemPrompt() string {
@@ -1781,6 +1832,9 @@ func messageRoleAndContent(message openai.ChatCompletionMessageParamUnion) (stri
 func toolResultCompact(output, toolName string) string {
 	const limit = 1200
 	trimmed := strings.TrimSpace(output)
+	if toolName == "read_file" {
+		return trimmed
+	}
 	if utf8.RuneCountInString(trimmed) > limit {
 		return truncate(trimmed, limit) + "\n... (truncated)"
 	}
