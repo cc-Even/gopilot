@@ -1,7 +1,7 @@
 package main
 
 import (
-	"claude-go/pkg/agents"
+	"gopilot/pkg/agents"
 	"testing"
 )
 

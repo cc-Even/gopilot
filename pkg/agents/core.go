@@ -172,6 +172,8 @@ var plannerToolAllowlist = map[string]struct{}{
 	"task_update": {},
 	"task_list":   {},
 	"task_get":    {},
+	"read_file":   {},
+	"bash":        {},
 }
 
 var tokenLogMu sync.Mutex
@@ -1348,13 +1350,12 @@ func formatToolCallPreview(toolCalls []openai.ChatCompletionMessageToolCallUnion
 
 func (a *Agent) plannerSystemPrompt() string {
 	rules := strings.Join([]string{
-		"You are in Planner stage.",
-		"Your only job in this stage is to produce or update the execution plan.",
-		"Only use task tools. Do not edit files, run shell commands, create worktrees, or delegate work.",
+		"You are an experienced software architect. Your only job is to design the architecture and break down tasks.",
+		"Do not edit the file or attempt any implementation work.",
 		"Prefer task_list/task_get before creating or updating tasks so you reuse the current board when possible.",
 		"When the plan is ready, return a concise ordered plan and clearly identify the current unfinished task.",
 	}, " ")
-	return appendPromptSection(a.SystemPrompt, rules)
+	return rules
 }
 
 func (a *Agent) executorSystemPrompt() string {

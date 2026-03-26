@@ -47,6 +47,7 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	}
 
 	type stageCall struct {
+		stage        string
 		systemPrompt string
 		tools        []string
 		lastUser     string
@@ -71,6 +72,7 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 			}
 
 			calls = append(calls, stageCall{
+				stage:        current.runStage,
 				systemPrompt: current.SystemPrompt,
 				tools:        append([]string(nil), current.order...),
 				lastUser:     lastUser,
@@ -108,12 +110,24 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	}
 
 	planner := calls[0]
-	if !strings.Contains(planner.systemPrompt, "Planner stage") {
+	if planner.stage != "planner" {
+		t.Fatalf("unexpected planner stage: %q", planner.stage)
+	}
+	if strings.Contains(planner.systemPrompt, "base prompt") {
+		t.Fatalf("planner system prompt should not include base prompt: %q", planner.systemPrompt)
+	}
+	if !strings.Contains(planner.systemPrompt, "design the architecture and break down tasks") {
 		t.Fatalf("planner system prompt missing planner instructions: %q", planner.systemPrompt)
 	}
-	expectedPlannerTools := []string{"task_create", "task_update", "task_list", "task_get"}
-	if strings.Join(planner.tools, ",") != strings.Join(expectedPlannerTools, ",") {
-		t.Fatalf("unexpected planner tools: got %v want %v", planner.tools, expectedPlannerTools)
+	for _, required := range []string{"task_create", "task_update", "task_list", "task_get"} {
+		if !containsString(planner.tools, required) {
+			t.Fatalf("planner tools missing %s: %v", required, planner.tools)
+		}
+	}
+	for _, forbidden := range []string{"write_file", "edit_file"} {
+		if containsString(planner.tools, forbidden) {
+			t.Fatalf("planner tools should not include %s: %v", forbidden, planner.tools)
+		}
 	}
 	if !strings.Contains(planner.lastUser, "<planning_rule>") {
 		t.Fatalf("planner context missing planning rule: %q", planner.lastUser)
@@ -123,6 +137,9 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	}
 
 	executor := calls[1]
+	if executor.stage != "executor" {
+		t.Fatalf("unexpected executor stage: %q", executor.stage)
+	}
 	if !strings.Contains(executor.systemPrompt, "Executor stage") {
 		t.Fatalf("executor system prompt missing executor instructions: %q", executor.systemPrompt)
 	}
@@ -150,6 +167,7 @@ func TestRunStructuredSkipPolicySkipsPlannerForSimpleRequest(t *testing.T) {
 
 	toolNames := []string{"bash", "ask_user"}
 	type stageCall struct {
+		stage        string
 		systemPrompt string
 		lastUser     string
 	}
@@ -182,6 +200,7 @@ func TestRunStructuredSkipPolicySkipsPlannerForSimpleRequest(t *testing.T) {
 				}
 			}
 			calls = append(calls, stageCall{
+				stage:        current.runStage,
 				systemPrompt: current.SystemPrompt,
 				lastUser:     lastUser,
 			})
@@ -201,8 +220,8 @@ func TestRunStructuredSkipPolicySkipsPlannerForSimpleRequest(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected only executor call, got %d", len(calls))
 	}
-	if strings.Contains(calls[0].systemPrompt, "Planner stage") {
-		t.Fatalf("skip policy unexpectedly ran planner: %q", calls[0].systemPrompt)
+	if calls[0].stage != "executor" {
+		t.Fatalf("skip policy unexpectedly ran non-executor stage: %q", calls[0].stage)
 	}
 	if !strings.Contains(calls[0].lastUser, "planner_skipped") {
 		t.Fatalf("executor context missing skipped-planner marker: %q", calls[0].lastUser)
@@ -221,7 +240,7 @@ func TestRunStructuredExecutorFailureReturnsResumeState(t *testing.T) {
 		TaskManager:  taskManager,
 		runLoopOverride: func(current *Agent, _ context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
 			calls++
-			if strings.Contains(current.SystemPrompt, "Planner stage") {
+			if current.runStage == "planner" {
 				return "1. Edit code\nCurrent unfinished task: Edit code", nil
 			}
 			return "", errors.New("model interrupted with finish reason: network_error")
@@ -279,7 +298,7 @@ func TestRunStructuredAskUserReturnsPausedState(t *testing.T) {
 		TaskManager:  taskManager,
 		runLoopOverride: func(current *Agent, _ context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
 			calls++
-			if strings.Contains(current.SystemPrompt, "Planner stage") {
+			if current.runStage == "planner" {
 				return "1. Inspect file\nCurrent unfinished task: Inspect file", nil
 			}
 			return "", &runPausedError{
@@ -326,6 +345,7 @@ func TestContinueStructuredResumesExecutorWithoutPlanner(t *testing.T) {
 	}
 
 	type stageCall struct {
+		stage        string
 		systemPrompt string
 		lastUser     string
 	}
@@ -344,11 +364,12 @@ func TestContinueStructuredResumesExecutorWithoutPlanner(t *testing.T) {
 				}
 			}
 			calls = append(calls, stageCall{
+				stage:        current.runStage,
 				systemPrompt: current.SystemPrompt,
 				lastUser:     lastUser,
 			})
 
-			if strings.Contains(current.SystemPrompt, "Planner stage") {
+			if current.runStage == "planner" {
 				return "1. Retry executor\nCurrent unfinished task: Retry executor", nil
 			}
 
@@ -383,8 +404,8 @@ func TestContinueStructuredResumesExecutorWithoutPlanner(t *testing.T) {
 	if len(calls) != 3 {
 		t.Fatalf("expected planner + executor + resumed executor, got %d calls", len(calls))
 	}
-	if strings.Contains(calls[2].systemPrompt, "Planner stage") {
-		t.Fatalf("resume unexpectedly reran planner: %q", calls[2].systemPrompt)
+	if calls[2].stage != "executor" {
+		t.Fatalf("resume unexpectedly reran non-executor stage: %q", calls[2].stage)
 	}
 	if calls[2].lastUser != "continue" {
 		t.Fatalf("expected resume input to reach executor, got %q", calls[2].lastUser)
@@ -401,6 +422,7 @@ func TestContinueStructuredResumesPausedExecutorWithoutPlanner(t *testing.T) {
 	}
 
 	type stageCall struct {
+		stage        string
 		systemPrompt string
 		lastUser     string
 	}
@@ -419,6 +441,7 @@ func TestContinueStructuredResumesPausedExecutorWithoutPlanner(t *testing.T) {
 				}
 			}
 			calls = append(calls, stageCall{
+				stage:        current.runStage,
 				systemPrompt: current.SystemPrompt,
 				lastUser:     lastUser,
 			})
@@ -460,8 +483,8 @@ func TestContinueStructuredResumesPausedExecutorWithoutPlanner(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("expected paused executor + resumed executor, got %d calls", len(calls))
 	}
-	if strings.Contains(calls[1].systemPrompt, "Planner stage") {
-		t.Fatalf("resume unexpectedly reran planner: %q", calls[1].systemPrompt)
+	if calls[1].stage != "executor" {
+		t.Fatalf("resume unexpectedly reran non-executor stage: %q", calls[1].stage)
 	}
 	if calls[1].lastUser != "pkg/agents/core.go" {
 		t.Fatalf("expected resume input to reach executor, got %q", calls[1].lastUser)
