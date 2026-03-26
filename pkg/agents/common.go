@@ -40,6 +40,8 @@ var TALK_LOG_PATH = filepath.Join(STATE_DIR, "talk.txt")
 
 var TOKEN_LOG_PATH = filepath.Join(TOOLDIR, "token.log")
 
+var TRANSCRIPT_DIR = filepath.Join(TOOLDIR, "transcripts")
+
 func SetWorkspaceDir(dir string) (string, error) {
 	clean := strings.TrimSpace(dir)
 	if clean == "" {

@@ -3,7 +3,6 @@ package agents
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -49,15 +48,10 @@ func TestSplitMessagesForAutoCompact_PreservesSystemPrefixAndRecentTail(t *testi
 
 func TestMaybeAutoCompact_WithMockSummary(t *testing.T) {
 	tmp := t.TempDir()
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd failed: %v", err)
-	}
-	if err := os.Chdir(tmp); err != nil {
-		t.Fatalf("chdir temp failed: %v", err)
-	}
+	originalTranscriptDir := TRANSCRIPT_DIR
+	TRANSCRIPT_DIR = filepath.Join(tmp, "transcripts")
 	t.Cleanup(func() {
-		_ = os.Chdir(wd)
+		TRANSCRIPT_DIR = originalTranscriptDir
 	})
 
 	mockSummary := "mock summary: state preserved"
@@ -135,7 +129,7 @@ func TestMaybeAutoCompact_WithMockSummary(t *testing.T) {
 		t.Fatalf("summarize prompt should exclude preserved recent messages: %q", summarizePrompt)
 	}
 
-	matches, err := filepath.Glob(filepath.Join(tmp, "transcripts", "transcript_*.jsonl"))
+	matches, err := filepath.Glob(filepath.Join(TRANSCRIPT_DIR, "transcript_*.jsonl"))
 	if err != nil {
 		t.Fatalf("glob transcript failed: %v", err)
 	}

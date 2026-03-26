@@ -1618,16 +1618,11 @@ func (a *Agent) identityBlock() string {
 }
 
 func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, focus string) ([]openai.ChatCompletionMessageParamUnion, error) {
-	workdir, err := os.Getwd()
-	if err != nil {
-		return nil, fmt.Errorf("get working directory failed: %w", err)
-	}
-	transcriptDir := filepath.Join(workdir, "transcripts")
-	if err := os.MkdirAll(transcriptDir, 0o755); err != nil {
+	if err := os.MkdirAll(TRANSCRIPT_DIR, 0o755); err != nil {
 		return nil, fmt.Errorf("create transcript dir failed: %w", err)
 	}
 
-	transcriptPath := filepath.Join(transcriptDir, fmt.Sprintf("transcript_%d.jsonl", time.Now().Unix()))
+	transcriptPath := filepath.Join(TRANSCRIPT_DIR, fmt.Sprintf("transcript_%d.jsonl", time.Now().Unix()))
 	file, err := os.Create(transcriptPath)
 	if err != nil {
 		return nil, fmt.Errorf("create transcript file failed: %w", err)

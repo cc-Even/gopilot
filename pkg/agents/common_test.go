@@ -45,6 +45,7 @@ func TestSetWorkspaceDirUpdatesRuntimeState(t *testing.T) {
 	originalWorktreeDir := WORKTREE_DIR
 	originalTalkLogPath := TALK_LOG_PATH
 	originalTokenLogPath := TOKEN_LOG_PATH
+	originalTranscriptDir := TRANSCRIPT_DIR
 	root := t.TempDir()
 
 	t.Cleanup(func() {
@@ -57,6 +58,7 @@ func TestSetWorkspaceDirUpdatesRuntimeState(t *testing.T) {
 		WORKTREE_DIR = originalWorktreeDir
 		TALK_LOG_PATH = originalTalkLogPath
 		TOKEN_LOG_PATH = originalTokenLogPath
+		TRANSCRIPT_DIR = originalTranscriptDir
 		_ = os.Chdir(originalWD)
 	})
 
@@ -117,5 +119,8 @@ func TestSetWorkspaceDirUpdatesRuntimeState(t *testing.T) {
 	}
 	if TOKEN_LOG_PATH != filepath.Join(TOOLDIR, "token.log") {
 		t.Fatalf("unexpected token log path: %q", TOKEN_LOG_PATH)
+	}
+	if TRANSCRIPT_DIR != filepath.Join(TOOLDIR, "transcripts") {
+		t.Fatalf("unexpected transcript dir: %q", TRANSCRIPT_DIR)
 	}
 }
