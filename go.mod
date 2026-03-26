@@ -1,4 +1,4 @@
-module claude-go
+module gopilot
 
 go 1.25
 

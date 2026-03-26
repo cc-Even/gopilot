@@ -2,12 +2,12 @@ package main
 
 import (
 	"bufio"
-	"claude-go/pkg/agents"
-	"claude-go/pkg/version"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"gopilot/pkg/agents"
+	"gopilot/pkg/version"
 	"log"
 	"os"
 	"path/filepath"
