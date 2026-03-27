@@ -156,11 +156,15 @@ type AgentOption func(*AgentOptions)
 type PlanningPolicy string
 
 const (
-	autoCompactTriggerChars   = 100000
-	autoCompactSummaryMaxChar = 80000
-	autoCompactSummaryTokens  = 2000
-	openAIRateLimitRetryEnv   = "OPENAI_RATE_LIMIT_RETRY_SECONDS"
-	planningReminderTurns     = 6
+	openAIRateLimitRetryEnv     = "OPENAI_RATE_LIMIT_RETRY_SECONDS"
+	planningReminderTurns       = 6
+	agentMaxTurnsEnv            = "AGENT_MAX_TURNS"
+	autoCompactTriggerCharsEnv  = "AUTO_COMPACT_TRIGGER_CHARS"
+	autoCompactSummaryTokensEnv = "AUTO_COMPACT_SUMMARY_MAX_TOKENS"
+
+	agentMaxTurnsDefault            = 999
+	autoCompactTriggerCharsDefault  = 100000
+	autoCompactSummaryTokensDefault = 20000
 
 	PlanningPolicyAuto     PlanningPolicy = "auto"
 	PlanningPolicyRequired PlanningPolicy = "required"
@@ -263,6 +267,36 @@ func openAIRateLimitRetryDelay() time.Duration {
 		return 0
 	}
 	return time.Duration(seconds * float64(time.Second))
+}
+
+func intEnvOrDefault(name string, defaultValue int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultValue
+	}
+
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("[EnvConfig] invalid %s value %q: %v (using default %d)", name, raw, err, defaultValue)
+		return defaultValue
+	}
+	if value <= 0 {
+		log.Printf("[EnvConfig] invalid %s value %q: must be > 0 (using default %d)", name, raw, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+func maxTurnsLimit() int {
+	return intEnvOrDefault(agentMaxTurnsEnv, agentMaxTurnsDefault)
+}
+
+func autoCompactTriggerThreshold() int {
+	return intEnvOrDefault(autoCompactTriggerCharsEnv, autoCompactTriggerCharsDefault)
+}
+
+func autoCompactSummaryMaxTokens() int {
+	return intEnvOrDefault(autoCompactSummaryTokensEnv, autoCompactSummaryTokensDefault)
 }
 
 func isOpenAIRateLimitError(err error) bool {
@@ -794,7 +828,7 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 		return result, nil, nil
 	}
 
-	const maxTurns = 999
+	maxTurns := maxTurnsLimit()
 	roundsSinceTodo := 0
 	for turn := 0; turn < maxTurns; turn++ {
 		var err error
@@ -1624,7 +1658,7 @@ func (a *Agent) maybeAutoCompact(ctx context.Context, messages []openai.ChatComp
 	if err != nil {
 		return nil, err
 	}
-	if utf8.RuneCountInString(conversationText) <= autoCompactTriggerChars {
+	if utf8.RuneCountInString(conversationText) <= autoCompactTriggerThreshold() {
 		return messages, nil
 	}
 	return a.autoCompact(ctx, messages, "")
@@ -1704,7 +1738,6 @@ func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletio
 	if err != nil {
 		return nil, err
 	}
-	conversationText = truncateByRunes(conversationText, autoCompactSummaryMaxChar)
 	prompt := "Summarize the older portion of this conversation for continuity while newer messages remain verbatim. Include: " +
 		"1) What was accomplished, 2) Current state and pending work, 3) Key decisions, constraints, and important metadata. " +
 		"Be concise but preserve critical details.\n\n" + conversationText
@@ -1735,7 +1768,7 @@ func (a *Agent) summarizeForAutoCompact(ctx context.Context, prompt string) (str
 		return a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 			Model:               a.Model,
 			Messages:            []openai.ChatCompletionMessageParamUnion{openai.UserMessage(prompt)},
-			MaxCompletionTokens: openai.Int(autoCompactSummaryTokens),
+			MaxCompletionTokens: openai.Int(int64(autoCompactSummaryMaxTokens())),
 		})
 	})
 	if err != nil {

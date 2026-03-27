@@ -164,6 +164,73 @@ func TestInjectIdentityBlockIfCompacted(t *testing.T) {
 	}
 }
 
+func TestEnvBackedCompactConfigDefaultsAndOverrides(t *testing.T) {
+	t.Setenv(agentMaxTurnsEnv, "")
+	t.Setenv(autoCompactTriggerCharsEnv, "")
+	t.Setenv(autoCompactSummaryTokensEnv, "")
+
+	if got := maxTurnsLimit(); got != agentMaxTurnsDefault {
+		t.Fatalf("maxTurnsLimit default = %d, want %d", got, agentMaxTurnsDefault)
+	}
+	if got := autoCompactTriggerThreshold(); got != autoCompactTriggerCharsDefault {
+		t.Fatalf("autoCompactTriggerThreshold default = %d, want %d", got, autoCompactTriggerCharsDefault)
+	}
+	if got := autoCompactSummaryMaxTokens(); got != autoCompactSummaryTokensDefault {
+		t.Fatalf("autoCompactSummaryMaxTokens default = %d, want %d", got, autoCompactSummaryTokensDefault)
+	}
+
+	t.Setenv(agentMaxTurnsEnv, "123")
+	t.Setenv(autoCompactTriggerCharsEnv, "456")
+	t.Setenv(autoCompactSummaryTokensEnv, "789")
+
+	if got := maxTurnsLimit(); got != 123 {
+		t.Fatalf("maxTurnsLimit override = %d, want 123", got)
+	}
+	if got := autoCompactTriggerThreshold(); got != 456 {
+		t.Fatalf("autoCompactTriggerThreshold override = %d, want 456", got)
+	}
+	if got := autoCompactSummaryMaxTokens(); got != 789 {
+		t.Fatalf("autoCompactSummaryMaxTokens override = %d, want 789", got)
+	}
+}
+
+func TestAutoCompactPromptDoesNotCharTruncate(t *testing.T) {
+	t.Setenv(autoCompactTriggerCharsEnv, "10")
+
+	tmp := t.TempDir()
+	originalTranscriptDir := TRANSCRIPT_DIR
+	TRANSCRIPT_DIR = filepath.Join(tmp, "transcripts")
+	t.Cleanup(func() {
+		TRANSCRIPT_DIR = originalTranscriptDir
+	})
+
+	tailMarker := "TAIL_MARKER_12345"
+	oldUser := strings.Repeat("u", 80500) + tailMarker
+	var summarizePrompt string
+	agent := &Agent{
+		Model: "gpt-4o-mini",
+		autoCompactSummarizer: func(ctx context.Context, prompt string) (string, error) {
+			summarizePrompt = prompt
+			return "summary", nil
+		},
+	}
+
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.SystemMessage("system"),
+		openai.UserMessage(oldUser),
+		openai.AssistantMessage("older-assistant"),
+		openai.UserMessage("recent-user"),
+		openai.AssistantMessage("recent-assistant"),
+	}
+
+	if _, err := agent.maybeAutoCompact(context.Background(), messages); err != nil {
+		t.Fatalf("maybeAutoCompact failed: %v", err)
+	}
+	if !strings.Contains(summarizePrompt, tailMarker) {
+		t.Fatalf("summarize prompt should preserve tail marker, got prompt without %q", tailMarker)
+	}
+}
+
 func mustRoleAndContent(t *testing.T, msg openai.ChatCompletionMessageParamUnion) (string, string) {
 	t.Helper()
 	raw, err := json.Marshal(msg)
