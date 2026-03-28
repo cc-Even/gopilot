@@ -43,11 +43,42 @@ func TestCheckTypesToolGoUsesModuleBuild(t *testing.T) {
 	if gotName != "go" {
 		t.Fatalf("name = %q, want go", gotName)
 	}
-	if strings.Join(gotArgs, " ") != "build ./..." {
-		t.Fatalf("args = %q, want %q", strings.Join(gotArgs, " "), "build ./...")
+	if strings.Join(gotArgs, " ") != "build -buildvcs=false ./..." {
+		t.Fatalf("args = %q, want %q", strings.Join(gotArgs, " "), "build -buildvcs=false ./...")
 	}
-	if !strings.Contains(output, "Type check passed for main.go using go build ./...") {
+	if !strings.Contains(output, "Type check passed for main.go using go build -buildvcs=false ./...") {
 		t.Fatalf("unexpected output: %s", output)
+	}
+}
+
+func TestCheckTypesToolGoFailureIncludesCompilerOutput(t *testing.T) {
+	root := t.TempDir()
+	writeCheckTypesFile(t, root, "go.mod", "module example.com/test\n\ngo 1.25\n")
+	writeCheckTypesFile(t, root, "main.go", "package main\n\nfunc main() {}\n")
+
+	restore := stubCheckTypesDeps(t)
+	defer restore()
+
+	checkTypesLookPath = func(file string) (string, error) {
+		if file == "go" {
+			return "go", nil
+		}
+		return "", exec.ErrNotFound
+	}
+	checkTypesExec = func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte("error obtaining VCS status: exit status 128\n\tUse -buildvcs=false to disable VCS stamping.\n"), &exec.ExitError{}
+	}
+
+	tool := CheckTypesTool{}
+	output, err := tool.Call(context.Background(), `{"path":"main.go"}`, &Agent{WorkDir: root})
+	if err != nil {
+		t.Fatalf("check_types failed: %v", err)
+	}
+	if !strings.Contains(output, "Type check failed for main.go using go build -buildvcs=false ./...") {
+		t.Fatalf("unexpected output header: %s", output)
+	}
+	if !strings.Contains(output, "error obtaining VCS status") {
+		t.Fatalf("expected compiler output in failure: %s", output)
 	}
 }
 

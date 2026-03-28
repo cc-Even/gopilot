@@ -115,7 +115,7 @@ func resolveGoTypeCheck(baseDir, filePath string) (*typeCheckCommand, string) {
 		return &typeCheckCommand{
 			Dir:  moduleDir,
 			Name: goCmd,
-			Args: []string{"build", "./..."},
+			Args: []string{"build", "-buildvcs=false", "./..."},
 		}, ""
 	}
 
