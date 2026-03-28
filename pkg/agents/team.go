@@ -790,6 +790,8 @@ func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 		"Use idle only after you have finished the current work item or are blocked waiting for new instructions.",
 		"You may auto-claim tasks.",
 		"When you are woken up, inspect inbox messages and act on them.",
+		"After you write or edit code, run check_types on a relevant changed file before you report completion.",
+		"If check_types fails, keep fixing the code and rerun it until the relevant checks pass or you can report a concrete toolchain blocker.",
 	}
 	if supervisor != "" {
 		sysLines = append(sysLines, fmt.Sprintf("Supervisor: %s.", supervisor))

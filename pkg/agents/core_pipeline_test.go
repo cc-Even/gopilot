@@ -157,6 +157,9 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	if !strings.Contains(executor.systemPrompt, "Executor stage") {
 		t.Fatalf("executor system prompt missing executor instructions: %q", executor.systemPrompt)
 	}
+	if !strings.Contains(executor.systemPrompt, "run check_types") {
+		t.Fatalf("executor system prompt missing type-check workflow: %q", executor.systemPrompt)
+	}
 	for _, required := range []string{"write_file", "edit_file", "bash"} {
 		if !containsString(executor.tools, required) {
 			t.Fatalf("executor tools missing %s: %v", required, executor.tools)

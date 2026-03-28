@@ -231,6 +231,7 @@ func DefaultToolDefinitions() []ToolDefinition {
 	write := WriteFileTool{}
 	edit := EditFileTool{}
 	repoMap := NewRepoMapTool()
+	checkTypes := CheckTypesTool{}
 
 	return []ToolDefinition{
 		ToolFromStringArg(
@@ -299,6 +300,12 @@ func DefaultToolDefinitions() []ToolDefinition {
 			repoMap.Description(),
 			ObjectSchema(map[string]any{"path": NonEmptyStringParam()}, "path"),
 			repoMap.Call,
+		),
+		ToolFromJSONString(
+			checkTypes.Name(),
+			checkTypes.Description(),
+			ObjectSchema(map[string]any{"path": NonEmptyStringParam()}, "path"),
+			checkTypes.Call,
 		),
 		ToolFromJSONString(
 			"todo",

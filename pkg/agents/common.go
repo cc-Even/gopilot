@@ -190,6 +190,7 @@ var TEAM_AGENTS_TOOLS = map[string]struct{}{
 	"repo_map":                 {},
 	"read_file":                {},
 	"read_files":               {},
+	"check_types":              {},
 	"write_file":               {},
 	"edit_file":                {},
 	"task_list":                {},

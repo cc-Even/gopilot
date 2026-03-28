@@ -1654,6 +1654,8 @@ func (a *Agent) executorSystemPrompt() string {
 		"If execution is blocked on missing user input, call ask_user instead of guessing.",
 		"Work through the current unfinished tasks in order when a plan exists.",
 		"Keep todo/task status aligned with real progress, and only re-plan when blocked by new information or the work expands beyond a simple request.",
+		"After you write or edit code, run check_types on a relevant changed file for each edited language or project before you finish.",
+		"If check_types reports errors, keep fixing the code and rerun it until the relevant checks pass or you have a concrete toolchain blocker to report.",
 	}, " ")
 	return appendPromptSection(a.SystemPrompt, rules)
 }

@@ -866,6 +866,34 @@ func TestCompleteTaskAndReportToolKeepsWorktreeWhenRequested(t *testing.T) {
 	})
 }
 
+func TestCloneAgentIncludesTypeCheckWorkflowAndTool(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools: map[string]ToolDefinition{
+			"check_types": {Name: "check_types"},
+			"read_file":   {Name: "read_file"},
+		},
+		order: []string{"read_file", "check_types"},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	worker := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
+	if worker == nil {
+		t.Fatal("expected cloned worker")
+	}
+	if !strings.Contains(worker.SystemPrompt, "run check_types") {
+		t.Fatalf("worker system prompt missing type-check workflow: %q", worker.SystemPrompt)
+	}
+	if _, ok := worker.tools["check_types"]; !ok {
+		t.Fatalf("worker tools missing check_types: %+v", worker.tools)
+	}
+}
+
 func TestTeammateManagerNextIdleEventPrefersInbox(t *testing.T) {
 	tempDir := t.TempDir()
 	teamDir := filepath.Join(tempDir, ".teams")
