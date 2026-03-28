@@ -179,6 +179,7 @@ var plannerToolAllowlist = map[string]struct{}{
 	"task_list":           {},
 	"task_get":            {},
 	"list_file":           {},
+	"repo_map":            {},
 	"read_file":           {},
 	"bash":                {},
 	"ask_user":            {},

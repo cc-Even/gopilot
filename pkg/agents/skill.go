@@ -230,6 +230,7 @@ func DefaultToolDefinitions() []ToolDefinition {
 	batchRead := BatchReadFileTool{}
 	write := WriteFileTool{}
 	edit := EditFileTool{}
+	repoMap := NewRepoMapTool()
 
 	return []ToolDefinition{
 		ToolFromStringArg(
@@ -292,6 +293,12 @@ func DefaultToolDefinitions() []ToolDefinition {
 			edit.Description(),
 			ObjectSchema(map[string]any{"path": NonEmptyStringParam(), "old_text": StringParam(), "new_text": StringParam()}, "path", "old_text", "new_text"),
 			edit.Call,
+		),
+		ToolFromJSONString(
+			repoMap.Name(),
+			repoMap.Description(),
+			ObjectSchema(map[string]any{"path": NonEmptyStringParam()}, "path"),
+			repoMap.Call,
 		),
 		ToolFromJSONString(
 			"todo",

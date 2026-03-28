@@ -154,6 +154,14 @@ func TestDefaultToolDefinitionsUseStrictObjectSchemas(t *testing.T) {
 		t.Fatalf("list_file additionalProperties = %v, want false", listSchema["additionalProperties"])
 	}
 
+	repoMapSchema := toolByName["repo_map"].Parameters
+	if repoMapSchema["type"] != "object" {
+		t.Fatalf("repo_map schema type = %v, want object", repoMapSchema["type"])
+	}
+	if repoMapSchema["additionalProperties"] != false {
+		t.Fatalf("repo_map additionalProperties = %v, want false", repoMapSchema["additionalProperties"])
+	}
+
 	readFilesSchema := toolByName["read_files"].Parameters
 	if readFilesSchema["type"] != "object" {
 		t.Fatalf("read_files schema type = %v, want object", readFilesSchema["type"])

@@ -16,3 +16,4 @@ gopilot.exe
 coverage.out
 dist/
 .DS_Store
+.codex
