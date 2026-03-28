@@ -28,20 +28,25 @@ jobs:
   release:
     needs: test
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - goos: linux
             goarch: amd64
+            os: ubuntu-latest
           - goos: linux
             goarch: arm64
+            os: ubuntu-latest
           - goos: windows
             goarch: amd64
+            os: windows-latest
           - goos: darwin
             goarch: amd64
+            os: macos-latest
           - goos: darwin
             goarch: arm64
+            os: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -53,19 +58,31 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install cross-compiler for Linux arm64
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
       - name: Build and Package
+        shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
+          CGO_ENABLED: 1
         run: |
+          # 设置跨平台 CGO 编译器 (针对 Linux arm64)
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
+            export CC=aarch64-linux-gnu-gcc
+            export CXX=aarch64-linux-gnu-g++
+          fi
+
           # 1. 设置二进制文件名为 gopilot
           BINARY_NAME="gopilot"
           if [ "${{ matrix.goos }}" = "windows" ]; then
             BINARY_NAME="gopilot.exe"
           fi
           
-          # 2. 编译
+          # 2. 编译 (启用 CGO)
           go build -v -ldflags "-X main.version=$VERSION" -o "$BINARY_NAME" .
           
           # 3. 定义外部压缩包名称
@@ -73,7 +90,9 @@ jobs:
           
           # 4. 打包二进制文件 + 目录 + 配置文件
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip -r "${PACKAGE_NAME}.zip" "$BINARY_NAME" skills subagents .env.example
+            # Windows 下可能没有 zip 命令，如果需要可以使用 powershell 或者 7z
+            # 但 GitHub Actions windows-latest 一般预装了 7z / tar
+            7z a "${PACKAGE_NAME}.zip" "$BINARY_NAME" skills subagents .env.example
             echo "ASSET_PATH=${PACKAGE_NAME}.zip" >> $GITHUB_ENV
           else
             tar -czvf "${PACKAGE_NAME}.tar.gz" "$BINARY_NAME" skills subagents .env.example
