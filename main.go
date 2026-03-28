@@ -626,7 +626,7 @@ func (s *cliSession) handleInput(input string) {
 
 	s.appendLinef("[purple]User:[white] %s", tview.Escape(input))
 	if s.resumeState != nil {
-		s.appendLine("[green]Gopilot:[white] 正在继续等待输入的 executor...")
+		s.appendLinef("[green]Gopilot:[white] 正在继续等待输入的 %s...", tview.Escape(structuredStageLabel(s.resumeState.Stage)))
 		s.output.ScrollToEnd()
 		s.runResume(input)
 		return
@@ -756,8 +756,9 @@ func (s *cliSession) handlePlanCommand(args []string) {
 
 	if s.resumeState != nil {
 		s.appendLinef(
-			"[green]System:[white] 已切换 plan 模式为 %s。当前暂停中的 executor 恢复时仍会继续原现场；新任务将使用新模式。",
+			"[green]System:[white] 已切换 plan 模式为 %s。当前暂停中的 %s 恢复时仍会继续原现场；新任务将使用新模式。",
 			tview.Escape(agents.PlanningPolicyLabel(policy)),
+			tview.Escape(structuredStageLabel(s.resumeState.Stage)),
 		)
 		return
 	}
@@ -868,7 +869,7 @@ func (s *cliSession) runStructured(snapshot []openai.ChatCompletionMessageParamU
 				pausedHistory := append(copyMessages(historySnapshot), openai.AssistantMessage(response))
 				s.captureResumeState(pausedHistory, state)
 				s.appendLinef("[green]Gopilot:[white] %s", tview.Escape(response))
-				s.appendLine("[yellow]System:[white] 已暂停等待你的补充，直接回复即可从当前 executor 继续；如需放弃本次现场可使用 /clear。")
+				s.appendLinef("[yellow]System:[white] 已暂停等待你的补充，直接回复即可从当前 %s 继续；如需放弃本次现场可使用 /clear。", tview.Escape(structuredStageLabel(state.Stage)))
 				return
 			}
 
@@ -908,7 +909,7 @@ func (s *cliSession) runResume(input string) {
 				pausedHistory := append(copyMessages(updatedHistory), openai.AssistantMessage(response))
 				s.captureResumeState(pausedHistory, nextState)
 				s.appendLinef("[green]Gopilot:[white] %s", tview.Escape(response))
-				s.appendLine("[yellow]System:[white] 仍在等待补充信息，直接回复即可继续当前 executor；如需放弃本次现场可使用 /clear。")
+				s.appendLinef("[yellow]System:[white] 仍在等待补充信息，直接回复即可继续当前 %s；如需放弃本次现场可使用 /clear。", tview.Escape(structuredStageLabel(nextState.Stage)))
 				return
 			}
 			updatedHistory = append(updatedHistory, openai.AssistantMessage(response))
@@ -937,6 +938,8 @@ func (s *cliSession) captureResumeState(history []openai.ChatCompletionMessagePa
 		Status:           state.Status,
 		Stage:            state.Stage,
 		Plan:             state.Plan,
+		BaseMessages:     copyMessages(state.BaseMessages),
+		PlannerMessages:  copyMessages(state.PlannerMessages),
 		ExecutorMessages: copyMessages(state.ExecutorMessages),
 		Pause:            state.Pause,
 	}
@@ -953,7 +956,18 @@ func (s *cliSession) reportRunError(err error) {
 
 	var runErr *agents.StructuredRunError
 	if errors.As(err, &runErr) && runErr.Resume != nil {
-		s.appendLine("[yellow]System:[white] 可输入 continue 或补充说明，从中断的 executor 位置继续；如需放弃本次现场可使用 /clear。")
+		s.appendLinef("[yellow]System:[white] 可输入 continue 或补充说明，从中断的 %s 位置继续；如需放弃本次现场可使用 /clear。", tview.Escape(structuredStageLabel(runErr.Resume.Stage)))
+	}
+}
+
+func structuredStageLabel(stage string) string {
+	switch strings.TrimSpace(stage) {
+	case "planner":
+		return "planner"
+	case "executor", "":
+		return "executor"
+	default:
+		return stage
 	}
 }
 

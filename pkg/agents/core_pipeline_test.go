@@ -33,6 +33,8 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 		"task_get",
 		"list_file",
 		"read_file",
+		"ask_user",
+		"handoff_to_executor",
 		"write_file",
 		"edit_file",
 		"bash",
@@ -120,12 +122,15 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	if !strings.Contains(planner.systemPrompt, "design the architecture and break down tasks") {
 		t.Fatalf("planner system prompt missing planner instructions: %q", planner.systemPrompt)
 	}
+	if !strings.Contains(planner.systemPrompt, "handoff_to_executor") {
+		t.Fatalf("planner system prompt missing handoff instructions: %q", planner.systemPrompt)
+	}
 	for _, required := range []string{"task_create", "task_update", "task_list", "task_get"} {
 		if !containsString(planner.tools, required) {
 			t.Fatalf("planner tools missing %s: %v", required, planner.tools)
 		}
 	}
-	for _, required := range []string{"list_file", "read_file"} {
+	for _, required := range []string{"list_file", "read_file", "ask_user", "handoff_to_executor"} {
 		if !containsString(planner.tools, required) {
 			t.Fatalf("planner tools missing %s: %v", required, planner.tools)
 		}
@@ -137,6 +142,9 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	}
 	if !strings.Contains(planner.lastUser, "<planning_rule>") {
 		t.Fatalf("planner context missing planning rule: %q", planner.lastUser)
+	}
+	if !strings.Contains(planner.lastUser, "each meaningful execution step exists on the task board") {
+		t.Fatalf("planner context missing task board reminder: %q", planner.lastUser)
 	}
 	if !strings.Contains(planner.lastUser, "existing task") {
 		t.Fatalf("planner context missing current task board: %q", planner.lastUser)
@@ -344,6 +352,56 @@ func TestRunStructuredAskUserReturnsPausedState(t *testing.T) {
 	}
 }
 
+func TestRunStructuredPlannerAskUserReturnsPausedState(t *testing.T) {
+	taskManager, err := NewTaskManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+
+	agent := &Agent{
+		SystemPrompt: "base prompt",
+		TaskManager:  taskManager,
+		runLoopOverride: func(current *Agent, _ context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+			if current.runStage != "planner" {
+				t.Fatalf("expected planner stage, got %q", current.runStage)
+			}
+			return "", &runPausedError{
+				Stage:    "planner",
+				Kind:     "ask_user",
+				Question: "Which module should this plan target?",
+			}
+		},
+	}
+
+	response, state, err := agent.RunStructuredWithPolicyAndState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage("plan the refactor"),
+	}, PlanningPolicyRequired)
+	if err != nil {
+		t.Fatalf("RunStructuredWithPolicyAndState returned error: %v", err)
+	}
+	if response != "Which module should this plan target?" {
+		t.Fatalf("unexpected pause question: %q", response)
+	}
+	if state == nil {
+		t.Fatal("expected paused state")
+	}
+	if state.Status != RunPaused {
+		t.Fatalf("unexpected state status: %q", state.Status)
+	}
+	if state.Stage != "planner" {
+		t.Fatalf("unexpected paused stage: %q", state.Stage)
+	}
+	if state.Pause == nil || state.Pause.Question != "Which module should this plan target?" {
+		t.Fatalf("unexpected pause info: %+v", state.Pause)
+	}
+	if len(state.PlannerMessages) == 0 {
+		t.Fatal("expected planner messages to be preserved")
+	}
+	if len(state.BaseMessages) == 0 {
+		t.Fatal("expected base messages to be preserved")
+	}
+}
+
 func TestContinueStructuredResumesExecutorWithoutPlanner(t *testing.T) {
 	taskManager, err := NewTaskManager(t.TempDir())
 	if err != nil {
@@ -494,6 +552,94 @@ func TestContinueStructuredResumesPausedExecutorWithoutPlanner(t *testing.T) {
 	}
 	if calls[1].lastUser != "pkg/agents/core.go" {
 		t.Fatalf("expected resume input to reach executor, got %q", calls[1].lastUser)
+	}
+}
+
+func TestContinueStructuredResumesPausedPlannerThenRunsExecutor(t *testing.T) {
+	taskManager, err := NewTaskManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("create task manager failed: %v", err)
+	}
+
+	type stageCall struct {
+		stage    string
+		lastUser string
+	}
+	var calls []stageCall
+	plannerAttempts := 0
+	agent := &Agent{
+		SystemPrompt: "base prompt",
+		TaskManager:  taskManager,
+		runLoopOverride: func(current *Agent, _ context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
+			lastUser := ""
+			for i := len(messages) - 1; i >= 0; i-- {
+				role, content, err := messageRoleAndContent(messages[i])
+				if err == nil && role == "user" {
+					lastUser = content
+					break
+				}
+			}
+			calls = append(calls, stageCall{
+				stage:    current.runStage,
+				lastUser: lastUser,
+			})
+
+			if current.runStage == "planner" {
+				plannerAttempts++
+				if plannerAttempts == 1 {
+					return "", &runPausedError{
+						Stage:    "planner",
+						Kind:     "ask_user",
+						Question: "Which package should I plan for?",
+					}
+				}
+				return "<planner_handoff>\n<plan_summary>\n1. Inspect package\n2. Edit package\n</plan_summary>\n<current_task>\nInspect package\n</current_task>\n<task_board_updated>true</task_board_updated>\n</planner_handoff>", nil
+			}
+
+			return "executor finished", nil
+		},
+	}
+
+	response, state, err := agent.RunStructuredWithPolicyAndState(context.Background(), []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage("plan the package update"),
+	}, PlanningPolicyRequired)
+	if err != nil {
+		t.Fatalf("RunStructuredWithPolicyAndState failed: %v", err)
+	}
+	if response != "Which package should I plan for?" {
+		t.Fatalf("unexpected pause response: %q", response)
+	}
+	if state == nil || state.Stage != "planner" || state.Status != RunPaused {
+		t.Fatalf("expected paused planner state, got %+v", state)
+	}
+
+	result, nextState, err := agent.ContinueStructured(context.Background(), state, "pkg/agents")
+	if err != nil {
+		t.Fatalf("ContinueStructured failed: %v", err)
+	}
+	if result != "executor finished" {
+		t.Fatalf("unexpected resume result: %q", result)
+	}
+	if nextState != nil {
+		t.Fatalf("expected cleared resume state after success, got %+v", nextState)
+	}
+	if len(calls) != 3 {
+		t.Fatalf("expected paused planner + resumed planner + executor, got %d calls", len(calls))
+	}
+	if calls[1].stage != "planner" {
+		t.Fatalf("expected resumed planner call, got %q", calls[1].stage)
+	}
+	if calls[1].lastUser != "pkg/agents" {
+		t.Fatalf("expected resume input to reach planner, got %q", calls[1].lastUser)
+	}
+	if calls[2].stage != "executor" {
+		t.Fatalf("expected executor after planner handoff, got %q", calls[2].stage)
+	}
+	if !strings.Contains(calls[2].lastUser, "<planner_output>") {
+		t.Fatalf("executor context missing planner output after resume: %q", calls[2].lastUser)
+	}
+	if !strings.Contains(calls[2].lastUser, "<planner_handoff>") {
+		t.Fatalf("executor context missing planner handoff after resume: %q", calls[2].lastUser)
 	}
 }
 
