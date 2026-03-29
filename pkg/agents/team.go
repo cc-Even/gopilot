@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,13 @@ const (
 
 	teammateIdlePollInterval = 5 * time.Second
 	teammateIdleTimeout      = 60 * time.Second
+
+	teammateFailureKindNetwork   = "network"
+	teammateFailureKindTimeout   = "timeout"
+	teammateFailureKindCancelled = "cancelled"
+	teammateFailureKindProtocol  = "protocol"
+	teammateFailureKindInternal  = "internal"
+	teammateFailureKindReported  = "reported_failed"
 )
 
 var validMessageTypes = map[string]struct{}{
@@ -103,15 +111,15 @@ func (b *MessageBus) appendInboxMessage(name string, msg TeamMessage) error {
 	return err
 }
 
-func (b *MessageBus) Send(sender, to, content, msgType string, extra map[string]any) string {
+func (b *MessageBus) Send(sender, to, content, msgType string, extra map[string]any) (string, error) {
 	if b == nil {
-		return "Error: message bus not initialized"
+		return "", fmt.Errorf("message bus not initialized")
 	}
 	if msgType == "" {
 		msgType = "message"
 	}
 	if _, ok := validMessageTypes[msgType]; !ok {
-		return fmt.Sprintf("Error: Invalid type %q. Valid: %s", msgType, strings.Join(validMessageTypeList(), ", "))
+		return "", fmt.Errorf("invalid type %q. Valid: %s", msgType, strings.Join(validMessageTypeList(), ", "))
 	}
 	now := time.Now()
 	metadata := cloneTeamMetadata(extra)
@@ -128,12 +136,12 @@ func (b *MessageBus) Send(sender, to, content, msgType string, extra map[string]
 	defer b.mu.Unlock()
 
 	if err := b.appendInboxMessage(to, msg); err != nil {
-		return fmt.Sprintf("Error: persist inbox for %q failed: %v", to, err)
+		return "", fmt.Errorf("persist inbox for %q failed: %w", to, err)
 	}
 	if err := b.appendTalkLog(now, sender, to, content); err != nil {
 		log.Printf("[MessageBus] failed to append talk log: %v", err)
 	}
-	return fmt.Sprintf("Sent %s to %s", msgType, to)
+	return fmt.Sprintf("Sent %s to %s", msgType, to), nil
 }
 
 func (b *MessageBus) appendTalkLog(ts time.Time, sender, receiver, content string) error {
@@ -340,21 +348,21 @@ func (b *MessageBus) rewriteInboxLocked(file *os.File, messages []TeamMessage) e
 	return nil
 }
 
-func (b *MessageBus) Broadcast(sender, content string, teammates []string) string {
+func (b *MessageBus) Broadcast(sender, content string, teammates []string) (string, error) {
 	if b == nil {
-		return "Error: message bus not initialized"
+		return "", fmt.Errorf("message bus not initialized")
 	}
 	count := 0
 	for _, name := range teammates {
 		if name == "" || name == sender {
 			continue
 		}
-		result := b.Send(sender, name, content, "broadcast", nil)
-		if strings.HasPrefix(result, "Sent ") {
-			count++
+		if _, err := b.Send(sender, name, content, "broadcast", nil); err != nil {
+			return "", fmt.Errorf("broadcast to %q failed: %w", name, err)
 		}
+		count++
 	}
-	return fmt.Sprintf("Broadcast to %d teammates", count)
+	return fmt.Sprintf("Broadcast to %d teammates", count), nil
 }
 
 type TeamMember struct {
@@ -375,19 +383,23 @@ const (
 	teammateRunStatusRunning   = "running"
 	teammateRunStatusCompleted = "completed"
 	teammateRunStatusFailed    = "failed"
+	teammateRunStatusTimedOut  = "timed_out"
 )
 
 type TeammateRun struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Role        string  `json:"role"`
-	Supervisor  string  `json:"supervisor,omitempty"`
-	Prompt      string  `json:"prompt"`
-	Status      string  `json:"status"`
-	Result      string  `json:"result,omitempty"`
-	Error       string  `json:"error,omitempty"`
-	StartedAt   float64 `json:"started_at"`
-	CompletedAt float64 `json:"completed_at,omitempty"`
+	ID              string  `json:"id"`
+	Name            string  `json:"name"`
+	Role            string  `json:"role"`
+	Supervisor      string  `json:"supervisor,omitempty"`
+	Prompt          string  `json:"prompt"`
+	Status          string  `json:"status"`
+	Result          string  `json:"result,omitempty"`
+	Error           string  `json:"error,omitempty"`
+	FailureKind     string  `json:"failure_kind,omitempty"`
+	Retryable       bool    `json:"retryable,omitempty"`
+	LastKnownStatus string  `json:"last_known_status,omitempty"`
+	StartedAt       float64 `json:"started_at"`
+	CompletedAt     float64 `json:"completed_at,omitempty"`
 }
 
 type teammateRunner func(context.Context, *Agent, string) error
@@ -475,28 +487,28 @@ func (m *TeammateManager) findMemberLocked(name string) *TeamMember {
 	return nil
 }
 
-func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) string {
+func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) (string, error) {
 	if m == nil {
-		return "Error: teammate manager not initialized"
+		return "", fmt.Errorf("teammate manager not initialized")
 	}
 	if strings.TrimSpace(name) == "" {
-		return "Error: teammate name is required"
+		return "", fmt.Errorf("teammate name is required")
 	}
 	if strings.TrimSpace(taskPrompt) == "" {
-		return "Error: teammate prompt is required"
+		return "", fmt.Errorf("teammate prompt is required")
 	}
 
 	m.mu.Lock()
 	if _, running := m.threads[name]; running {
 		m.mu.Unlock()
-		return fmt.Sprintf("Error: %q is already running", name)
+		return "", fmt.Errorf("%q is already running", name)
 	}
 	member := m.findMemberLocked(name)
 	if member != nil {
 		if member.Status != teammateStatusIdle && member.Status != teammateStatusShutdown {
 			status := member.Status
 			m.mu.Unlock()
-			return fmt.Sprintf("Error: %q is currently %s", name, status)
+			return "", fmt.Errorf("%q is currently %s", name, status)
 		}
 		member.Status = teammateStatusWorking
 		member.Role = role
@@ -520,39 +532,39 @@ func (m *TeammateManager) Spawn(name, role, taskPrompt, supervisor string) strin
 			member.RunID = ""
 		}
 		m.mu.Unlock()
-		return fmt.Sprintf("Error: save config failed: %v", err)
+		return "", fmt.Errorf("save config failed: %w", err)
 	}
 	m.startThreadLocked(name, role, taskPrompt)
 	m.mu.Unlock()
 
 	_ = supervisor
-	return fmt.Sprintf("Spawned %q (role: %s, run_id: %s)", name, role, run.ID)
+	return fmt.Sprintf("Spawned %q (role: %s, run_id: %s)", name, role, run.ID), nil
 }
 
-func (m *TeammateManager) Wake(name string) string {
+func (m *TeammateManager) Wake(name string) (string, error) {
 	if m == nil {
-		return "Error: teammate manager not initialized"
+		return "", fmt.Errorf("teammate manager not initialized")
 	}
 	if strings.TrimSpace(name) == "" {
-		return "Error: teammate name is required"
+		return "", fmt.Errorf("teammate name is required")
 	}
 
 	m.mu.Lock()
 	member := m.findMemberLocked(name)
 	if member == nil {
 		m.mu.Unlock()
-		return fmt.Sprintf("Error: unknown teammate %q", name)
+		return "", fmt.Errorf("unknown teammate %q", name)
 	}
 	if _, running := m.threads[name]; running {
 		m.mu.Unlock()
-		return fmt.Sprintf("Teammate %q already running", name)
+		return fmt.Sprintf("Teammate %q already running", name), nil
 	}
 
 	member.Status = teammateStatusWorking
 	taskPrompt := "You have new inbox activity. Read your inbox, follow the latest instructions, and use send_message if you need context or need to report results."
 	if err := m.saveConfigLocked(); err != nil {
 		m.mu.Unlock()
-		return fmt.Sprintf("Error: save config failed: %v", err)
+		return "", fmt.Errorf("save config failed: %w", err)
 	}
 
 	role := member.Role
@@ -560,7 +572,7 @@ func (m *TeammateManager) Wake(name string) string {
 	m.mu.Unlock()
 
 	log.Printf("[TeammateManager] Waking teammate: name=%s, role=%s, task_prompt_size=%d", name, role, len(taskPrompt))
-	return fmt.Sprintf("Woke %q", name)
+	return fmt.Sprintf("Woke %q", name), nil
 }
 
 func (m *TeammateManager) startThreadLocked(name, role, taskPrompt string) {
@@ -579,9 +591,8 @@ func (m *TeammateManager) teammateLoop(ctx context.Context, name, role, taskProm
 		log.Printf("[TeammateManager] Teammate loop ended: name=%s", name)
 	}
 
+	var failedRun *TeammateRun
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	delete(m.threads, name)
 	member := m.findMemberLocked(name)
 	if member != nil && member.Status != teammateStatusShutdown {
@@ -594,12 +605,19 @@ func (m *TeammateManager) teammateLoop(ctx context.Context, name, role, taskProm
 				if runErr != nil {
 					errMsg = runErr.Error()
 				}
-				m.completeRunLocked(runID, teammateRunStatusFailed, "", errMsg)
+				failureKind, retryable := classifyTeammateFailure(runErr)
+				m.completeRunLocked(runID, teammateRunStatusFailed, "", errMsg, failureKind, retryable)
+				failedRun = cloneTeammateRun(run)
 			}
 		}
 		member.RunID = ""
 	}
 	_ = m.saveConfigLocked()
+	m.mu.Unlock()
+
+	if failedRun != nil {
+		m.notifySupervisorOfFailure(failedRun)
+	}
 }
 
 func (m *TeammateManager) WaitUntilIdle(ctx context.Context) error {
@@ -664,7 +682,16 @@ func (m *TeammateManager) WaitForRun(ctx context.Context, runID string, timeout 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-timer:
-		return nil, fmt.Errorf("wait for run %q timed out after %s", runID, timeout)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		run = m.runs[runID]
+		if run == nil {
+			return nil, fmt.Errorf("run %q disappeared", runID)
+		}
+		snapshot := cloneTeammateRun(run)
+		snapshot.LastKnownStatus = snapshot.Status
+		snapshot.Status = teammateRunStatusTimedOut
+		return snapshot, nil
 	case <-signal:
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -738,13 +765,18 @@ func (m *TeammateManager) ReportRun(runID, status, result string) error {
 	if !validTeammateRunTerminalStatus(status) {
 		return fmt.Errorf("invalid run status %q", status)
 	}
-	if !m.completeRunLocked(runID, status, result, "") {
+	failureKind := ""
+	retryable := false
+	if status == teammateRunStatusFailed {
+		failureKind = teammateFailureKindReported
+	}
+	if !m.completeRunLocked(runID, status, result, "", failureKind, retryable) {
 		return fmt.Errorf("unknown run_id %q", runID)
 	}
 	return nil
 }
 
-func (m *TeammateManager) completeRunLocked(runID, status, result, errMsg string) bool {
+func (m *TeammateManager) completeRunLocked(runID, status, result, errMsg, failureKind string, retryable bool) bool {
 	runID = strings.TrimSpace(runID)
 	if runID == "" {
 		return false
@@ -759,6 +791,14 @@ func (m *TeammateManager) completeRunLocked(runID, status, result, errMsg string
 	run.Status = status
 	run.Result = result
 	run.Error = errMsg
+	run.FailureKind = failureKind
+	run.Retryable = retryable
+	run.LastKnownStatus = ""
+	if status == teammateRunStatusCompleted {
+		run.Error = ""
+		run.FailureKind = ""
+		run.Retryable = false
+	}
 	run.CompletedAt = float64(time.Now().UnixNano()) / float64(time.Second)
 	if signal := m.signals[runID]; signal != nil {
 		close(signal)
@@ -960,6 +1000,8 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 			}
 		}
 		return messages, idleRequested, nil
+	case "network_error":
+		return nil, false, fmt.Errorf("model interrupted with finish reason: %s", choice.FinishReason)
 	default:
 		return nil, false, fmt.Errorf("unsupported finish reason: %s", choice.FinishReason)
 	}
@@ -1142,6 +1184,42 @@ func (m *TeammateManager) supervisorFor(name string) string {
 	return strings.TrimSpace(member.Supervisor)
 }
 
+func (m *TeammateManager) notifySupervisorOfFailure(run *TeammateRun) {
+	if m == nil || m.bus == nil || run == nil || strings.TrimSpace(run.Supervisor) == "" {
+		return
+	}
+	if !m.knowsParticipant(run.Supervisor) {
+		return
+	}
+
+	metadata := map[string]any{
+		"run_id":       run.ID,
+		"status":       teammateRunStatusFailed,
+		"failure_kind": run.FailureKind,
+		"retryable":    run.Retryable,
+	}
+	content := fmt.Sprintf(
+		"Teammate %s failed.\nrole=%s\nrun_id=%s\nfailure_kind=%s\nretryable=%t\nerror=%s",
+		run.Name,
+		run.Role,
+		run.ID,
+		run.FailureKind,
+		run.Retryable,
+		strings.TrimSpace(run.Error),
+	)
+	if _, err := m.bus.Send(run.Name, run.Supervisor, content, "message", metadata); err != nil {
+		log.Printf("[TeammateManager] failed to notify supervisor %s about run %s: %v", run.Supervisor, run.ID, err)
+		return
+	}
+	if m.isManagedTeammate(run.Supervisor) {
+		if wakeResult, err := m.Wake(run.Supervisor); err != nil {
+			log.Printf("[TeammateManager] failed to wake supervisor %s after run %s failure: %v", run.Supervisor, run.ID, err)
+		} else {
+			log.Printf("[TeammateManager] Wake result for supervisor %s after run %s failure: %s", run.Supervisor, run.ID, wakeResult)
+		}
+	}
+}
+
 func (m *TeammateManager) ListAll() string {
 	if m == nil {
 		return "No teammates."
@@ -1220,6 +1298,37 @@ func cloneTeammateRun(run *TeammateRun) *TeammateRun {
 	return &cloned
 }
 
+func classifyTeammateFailure(err error) (string, bool) {
+	if err == nil {
+		return teammateFailureKindProtocol, false
+	}
+	if errors.Is(err, context.Canceled) {
+		return teammateFailureKindCancelled, false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return teammateFailureKindTimeout, true
+	}
+	if isOpenAITransientError(nil, err) {
+		return teammateFailureKindNetwork, true
+	}
+
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "without explicit completion report"):
+		return teammateFailureKindProtocol, false
+	case strings.Contains(msg, "network_error"),
+		strings.Contains(msg, "chat completion failed"),
+		strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "unexpected eof"):
+		return teammateFailureKindNetwork, true
+	default:
+		return teammateFailureKindInternal, false
+	}
+}
+
 func validTeammateRunTerminalStatus(status string) bool {
 	switch status {
 	case teammateRunStatusCompleted, teammateRunStatusFailed:
@@ -1240,6 +1349,12 @@ func formatTeamMessageMetadata(metadata map[string]any) string {
 	}
 	if status, _ := metadata["status"].(string); strings.TrimSpace(status) != "" {
 		parts = append(parts, "status="+status)
+	}
+	if failureKind, _ := metadata["failure_kind"].(string); strings.TrimSpace(failureKind) != "" {
+		parts = append(parts, "failure_kind="+failureKind)
+	}
+	if retryable, ok := metadata["retryable"].(bool); ok {
+		parts = append(parts, fmt.Sprintf("retryable=%t", retryable))
 	}
 	if taskID, ok := metadata["task_id"]; ok {
 		parts = append(parts, fmt.Sprintf("task_id=%v", taskID))
@@ -1450,7 +1565,10 @@ func spawnTeammateTool(ctx context.Context, args json.RawMessage, agent *Agent) 
 		return "", fmt.Errorf("invalid spawn_teammate args: %w", err)
 	}
 	log.Printf("[SpawnTeammateTool] agent=%s Spawning teammate: name=%s, role=%s, prompt_size=%d", agentLogName(agent), params.Name, params.Role, len(params.TaskPrompt))
-	result := agent.TeamManager.Spawn(params.Name, params.Role, params.TaskPrompt, agent.Name)
+	result, err := agent.TeamManager.Spawn(params.Name, params.Role, params.TaskPrompt, agent.Name)
+	if err != nil {
+		return "", err
+	}
 	log.Printf("[SpawnTeammateTool] agent=%s Spawn completed: %s", agentLogName(agent), result)
 	return result, nil
 }
@@ -1478,6 +1596,26 @@ func waitTeammateTool(ctx context.Context, args json.RawMessage, agent *Agent) (
 		return "", err
 	}
 	data, err := json.MarshalIndent(run, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func marshalSendOutcome(message string, extras map[string]any, warnings []string) (string, error) {
+	result := map[string]any{
+		"message": message,
+	}
+	for key, value := range extras {
+		if value == nil {
+			continue
+		}
+		result[key] = value
+	}
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
+	}
+	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return "", err
 	}
@@ -1563,18 +1701,26 @@ func completeTaskAndReportTool(ctx context.Context, args json.RawMessage, agent 
 	}
 
 	log.Printf("[CompleteTaskAndReportTool] agent=%s Completing task_id=%d keep_worktree=%t", agentLogName(agent), finalTask.ID, keepWorktree)
-	sendResult := agent.TeamManager.bus.Send(agent.Name, to, params.Content, "message", metadata)
-	if strings.HasPrefix(sendResult, "Error:") {
-		return "", fmt.Errorf("%s", sendResult)
+	sendResult, err := agent.TeamManager.bus.Send(agent.Name, to, params.Content, "message", metadata)
+	if err != nil {
+		return "", err
 	}
+	warnings := make([]string, 0, 2)
+	wakeResult := ""
 	if runID != "" {
 		if err := agent.TeamManager.ReportRun(runID, teammateRunStatusCompleted, params.Content); err != nil {
-			return "", err
+			warnings = append(warnings, fmt.Sprintf("run status not recorded after send: %v", err))
+			log.Printf("[CompleteTaskAndReportTool] agent=%s report run warning for %s: %v", agentLogName(agent), runID, err)
 		}
 	}
 	if agent.TeamManager.isManagedTeammate(to) {
-		wakeResult := agent.TeamManager.Wake(to)
-		log.Printf("[CompleteTaskAndReportTool] agent=%s Wake result for %s: %s", agentLogName(agent), to, wakeResult)
+		wakeResult, err = agent.TeamManager.Wake(to)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("recipient wake failed after send: %v", err))
+			log.Printf("[CompleteTaskAndReportTool] agent=%s wake warning for %s: %v", agentLogName(agent), to, err)
+		} else {
+			log.Printf("[CompleteTaskAndReportTool] agent=%s Wake result for %s: %s", agentLogName(agent), to, wakeResult)
+		}
 	}
 
 	result := map[string]any{
@@ -1586,6 +1732,12 @@ func completeTaskAndReportTool(ctx context.Context, args json.RawMessage, agent 
 	}
 	if worktreeRecord != nil {
 		result["worktree"] = worktreeRecord
+	}
+	if strings.TrimSpace(wakeResult) != "" {
+		result["wake_result"] = wakeResult
+	}
+	if len(warnings) > 0 {
+		result["warnings"] = warnings
 	}
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
@@ -1636,18 +1788,39 @@ func sendMessageTool(ctx context.Context, args json.RawMessage, agent *Agent) (s
 	}
 
 	log.Printf("[SendMessageTool] agent=%s Sending message: from=%s, to=%s, content_size=%d", agentLogName(agent), agent.Name, params.To, len(params.Content))
-	result := agent.TeamManager.bus.Send(agent.Name, params.To, params.Content, "message", metadata)
-	if !strings.HasPrefix(result, "Error:") && status != "" {
+	result, err := agent.TeamManager.bus.Send(agent.Name, params.To, params.Content, "message", metadata)
+	if err != nil {
+		return "", err
+	}
+	warnings := make([]string, 0, 2)
+	wakeResult := ""
+	if status != "" {
 		if err := agent.TeamManager.ReportRun(runID, status, params.Content); err != nil {
-			return "", err
+			warnings = append(warnings, fmt.Sprintf("run status not recorded after send: %v", err))
+			log.Printf("[SendMessageTool] agent=%s report run warning for %s: %v", agentLogName(agent), runID, err)
 		}
 	}
-	if !strings.HasPrefix(result, "Error:") && agent.TeamManager.isManagedTeammate(params.To) {
-		wakeResult := agent.TeamManager.Wake(params.To)
-		log.Printf("[SendMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), params.To, wakeResult)
+	if agent.TeamManager.isManagedTeammate(params.To) {
+		wakeResult, err = agent.TeamManager.Wake(params.To)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("recipient wake failed after send: %v", err))
+			log.Printf("[SendMessageTool] agent=%s wake warning for %s: %v", agentLogName(agent), params.To, err)
+		} else {
+			log.Printf("[SendMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), params.To, wakeResult)
+		}
 	}
 	log.Printf("[SendMessageTool] agent=%s Send completed: %s", agentLogName(agent), result)
-	return result, nil
+	extras := map[string]any{}
+	if runID != "" {
+		extras["run_id"] = runID
+	}
+	if strings.TrimSpace(status) != "" {
+		extras["status"] = status
+	}
+	if strings.TrimSpace(wakeResult) != "" {
+		extras["wake_result"] = wakeResult
+	}
+	return marshalSendOutcome(result, extras, warnings)
 }
 
 func claimTaskTool(ctx context.Context, args json.RawMessage, agent *Agent) (string, error) {
@@ -1712,12 +1885,18 @@ func broadcastMessageTool(ctx context.Context, args json.RawMessage, agent *Agen
 	}
 	log.Printf("[BroadcastMessageTool] agent=%s Broadcasting message: from=%s, content_size=%d", agentLogName(agent), agent.Name, len(params.Content))
 	names := agent.TeamManager.MemberNames()
-	result := agent.TeamManager.bus.Broadcast(agent.Name, params.Content, names)
+	result, err := agent.TeamManager.bus.Broadcast(agent.Name, params.Content, names)
+	if err != nil {
+		return "", err
+	}
 	for _, name := range names {
 		if name == "" || name == agent.Name {
 			continue
 		}
-		wakeResult := agent.TeamManager.Wake(name)
+		wakeResult, err := agent.TeamManager.Wake(name)
+		if err != nil {
+			return "", err
+		}
 		log.Printf("[BroadcastMessageTool] agent=%s Wake result for %s: %s", agentLogName(agent), name, wakeResult)
 	}
 	log.Printf("[BroadcastMessageTool] agent=%s Broadcast completed: %s", agentLogName(agent), result)

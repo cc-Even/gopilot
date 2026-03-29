@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,7 +18,10 @@ func TestMessageBusSendReadAndBroadcast(t *testing.T) {
 	talkPath := filepath.Join(t.TempDir(), "talk.txt")
 	bus := NewMessageBus(talkPath)
 
-	result := bus.Send("alice", "bob", "hello", "message", map[string]any{"topic": "test"})
+	result, err := bus.Send("alice", "bob", "hello", "message", map[string]any{"topic": "test"})
+	if err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
 	if !strings.Contains(result, "Sent message to bob") {
 		t.Fatalf("unexpected send result: %s", result)
 	}
@@ -35,7 +39,10 @@ func TestMessageBusSendReadAndBroadcast(t *testing.T) {
 		t.Fatalf("expected inbox to be drained, got %d messages", len(drained))
 	}
 
-	broadcastResult := bus.Broadcast("alice", "team update", []string{"alice", "bob", "carol"})
+	broadcastResult, err := bus.Broadcast("alice", "team update", []string{"alice", "bob", "carol"})
+	if err != nil {
+		t.Fatalf("broadcast failed: %v", err)
+	}
 	if !strings.Contains(broadcastResult, "Broadcast to 2 teammates") {
 		t.Fatalf("unexpected broadcast result: %s", broadcastResult)
 	}
@@ -66,7 +73,10 @@ func TestMessageBusPersistsUnreadAcrossRestart(t *testing.T) {
 	talkPath := filepath.Join(t.TempDir(), "talk.txt")
 
 	bus := NewMessageBus(talkPath)
-	result := bus.Send("alice", "bob", "persist me", "message", nil)
+	result, err := bus.Send("alice", "bob", "persist me", "message", nil)
+	if err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
 	if !strings.Contains(result, "Sent message to bob") {
 		t.Fatalf("unexpected send result: %s", result)
 	}
@@ -89,7 +99,9 @@ func TestMessageBusPersistsUnreadAcrossRestart(t *testing.T) {
 func TestMessageBusPeekAndAck(t *testing.T) {
 	talkPath := filepath.Join(t.TempDir(), "talk.txt")
 	bus := NewMessageBus(talkPath)
-	if result := bus.Send("alice", "bob", "peek me", "message", nil); !strings.Contains(result, "Sent message to bob") {
+	if result, err := bus.Send("alice", "bob", "peek me", "message", nil); err != nil {
+		t.Fatalf("send failed: %v", err)
+	} else if !strings.Contains(result, "Sent message to bob") {
 		t.Fatalf("unexpected send result: %s", result)
 	}
 
@@ -133,14 +145,21 @@ func TestMessageBusSendWaitsForInboxFileLock(t *testing.T) {
 		t.Fatalf("lock inbox file failed: %v", err)
 	}
 
-	done := make(chan string, 1)
+	done := make(chan struct {
+		result string
+		err    error
+	}, 1)
 	go func() {
-		done <- bus.Send("alice", "bob", "wait for lock", "message", nil)
+		result, err := bus.Send("alice", "bob", "wait for lock", "message", nil)
+		done <- struct {
+			result string
+			err    error
+		}{result: result, err: err}
 	}()
 
 	select {
-	case result := <-done:
-		t.Fatalf("send should block on locked inbox file, got %s", result)
+	case send := <-done:
+		t.Fatalf("send should block on locked inbox file, got result=%q err=%v", send.result, send.err)
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -149,7 +168,11 @@ func TestMessageBusSendWaitsForInboxFileLock(t *testing.T) {
 	}
 
 	select {
-	case result := <-done:
+	case send := <-done:
+		if send.err != nil {
+			t.Fatalf("send failed after unlock: %v", send.err)
+		}
+		result := send.result
 		if !strings.Contains(result, "Sent message to bob") {
 			t.Fatalf("unexpected send result after unlock: %s", result)
 		}
@@ -166,7 +189,9 @@ func TestMessageBusSendWaitsForInboxFileLock(t *testing.T) {
 func TestMessageBusReadWaitsForInboxFileLock(t *testing.T) {
 	talkPath := filepath.Join(t.TempDir(), "talk.txt")
 	bus := NewMessageBus(talkPath)
-	if result := bus.Send("alice", "bob", "block reader", "message", nil); !strings.Contains(result, "Sent message to bob") {
+	if result, err := bus.Send("alice", "bob", "block reader", "message", nil); err != nil {
+		t.Fatalf("send failed: %v", err)
+	} else if !strings.Contains(result, "Sent message to bob") {
 		t.Fatalf("unexpected send result: %s", result)
 	}
 
@@ -228,7 +253,10 @@ func TestTeammateManagerSpawnPersistsConfigAndResetsStatus(t *testing.T) {
 		}
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
@@ -312,7 +340,10 @@ func TestTeammateManagerWakeStartsInboxDrivenLoop(t *testing.T) {
 		}
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
@@ -333,7 +364,10 @@ func TestTeammateManagerWakeStartsInboxDrivenLoop(t *testing.T) {
 		return len(manager.threads) == 0
 	})
 
-	wakeResult := manager.Wake("worker-1")
+	wakeResult, err := manager.Wake("worker-1")
+	if err != nil {
+		t.Fatalf("wake failed: %v", err)
+	}
 	if !strings.Contains(wakeResult, `Woke "worker-1"`) {
 		t.Fatalf("unexpected wake result: %s", wakeResult)
 	}
@@ -372,7 +406,10 @@ func TestSpawnTeammateAssignsRunID(t *testing.T) {
 		return nil
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) || !strings.Contains(result, "run_id: run_") {
 		t.Fatalf("spawn should include run_id, got %s", result)
 	}
@@ -443,7 +480,10 @@ func TestSendMessageToolAllowsSupervisorAndLeadReadsInbox(t *testing.T) {
 		return nil
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
@@ -512,7 +552,10 @@ func TestSendMessageToolReportsRunCompletionAndWaitTeammateReturnsResult(t *test
 		return nil
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
@@ -567,6 +610,58 @@ func TestSendMessageToolReportsRunCompletionAndWaitTeammateReturnsResult(t *test
 	})
 }
 
+func TestWaitForRunReturnsTimedOutSnapshot(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
+	if !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	manager.mu.Lock()
+	runID := manager.findMemberLocked("worker-1").RunID
+	stopRunner := manager.threads["worker-1"]
+	manager.mu.Unlock()
+	if runID == "" {
+		t.Fatal("expected run_id to be assigned")
+	}
+
+	run, err := manager.WaitForRun(context.Background(), runID, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitForRun failed: %v", err)
+	}
+	if run == nil || run.Status != teammateRunStatusTimedOut || run.LastKnownStatus != teammateRunStatusRunning {
+		t.Fatalf("expected timed out running snapshot, got %+v", run)
+	}
+
+	if stopRunner != nil {
+		stopRunner()
+	}
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+}
+
 func TestLeadInboxSurvivesManagerRestart(t *testing.T) {
 	tempDir := t.TempDir()
 	teamDir := filepath.Join(tempDir, ".teams")
@@ -585,7 +680,10 @@ func TestLeadInboxSurvivesManagerRestart(t *testing.T) {
 		return nil
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
@@ -651,7 +749,10 @@ func TestTeammateLoopFailsRunWithoutExplicitCompletionReport(t *testing.T) {
 		return nil
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
@@ -682,6 +783,85 @@ func TestTeammateLoopFailsRunWithoutExplicitCompletionReport(t *testing.T) {
 	}
 	if !strings.Contains(run.Error, "without explicit completion report") {
 		t.Fatalf("expected missing report failure, got %+v", run)
+	}
+	if run.FailureKind != teammateFailureKindProtocol || run.Retryable {
+		t.Fatalf("expected protocol non-retryable failure, got %+v", run)
+	}
+
+	inbox := manager.bus.ReadInbox("lead")
+	if len(inbox) != 1 {
+		t.Fatalf("expected supervisor failure notification, got %d messages", len(inbox))
+	}
+	if inbox[0].Metadata["status"] != teammateRunStatusFailed || inbox[0].Metadata["failure_kind"] != teammateFailureKindProtocol {
+		t.Fatalf("unexpected failure notification metadata: %+v", inbox[0].Metadata)
+	}
+	if retryable, ok := inbox[0].Metadata["retryable"].(bool); !ok || retryable {
+		t.Fatalf("expected non-retryable failure notification, got %+v", inbox[0].Metadata)
+	}
+}
+
+func TestTeammateLoopClassifiesRetryableFailureAndNotifiesSupervisor(t *testing.T) {
+	tempDir := t.TempDir()
+	teamDir := filepath.Join(tempDir, ".teams")
+
+	base := &Agent{
+		Name:         "lead",
+		SystemPrompt: "You are the lead agent.",
+		Model:        "test-model",
+		tools:        map[string]ToolDefinition{},
+	}
+
+	manager := NewTeammateManager(teamDir, base)
+	base.TeamManager = manager
+	manager.runner = func(ctx context.Context, agent *Agent, prompt string) error {
+		return errors.New("chat completion failed (turn=0): i/o timeout")
+	}
+
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "lead")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
+	if !strings.Contains(result, `Spawned "worker-1"`) {
+		t.Fatalf("unexpected spawn result: %s", result)
+	}
+
+	manager.mu.Lock()
+	runID := manager.findMemberLocked("worker-1").RunID
+	manager.mu.Unlock()
+	waitForCondition(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return len(manager.threads) == 0
+	})
+
+	waitResult, err := waitTeammateTool(context.Background(), json.RawMessage(fmt.Sprintf(`{"run_id":%q,"timeout_seconds":1}`, runID)), base)
+	if err != nil {
+		t.Fatalf("waitTeammateTool failed: %v", err)
+	}
+
+	var run TeammateRun
+	if err := json.Unmarshal([]byte(waitResult), &run); err != nil {
+		t.Fatalf("parse wait result failed: %v", err)
+	}
+	if run.Status != teammateRunStatusFailed {
+		t.Fatalf("expected failed run status, got %+v", run)
+	}
+	if run.FailureKind != teammateFailureKindNetwork || !run.Retryable {
+		t.Fatalf("expected network retryable failure, got %+v", run)
+	}
+
+	inbox := manager.bus.ReadInbox("lead")
+	if len(inbox) != 1 {
+		t.Fatalf("expected supervisor failure notification, got %d messages", len(inbox))
+	}
+	if inbox[0].Metadata["run_id"] != runID || inbox[0].Metadata["failure_kind"] != teammateFailureKindNetwork {
+		t.Fatalf("unexpected failure notification metadata: %+v", inbox[0].Metadata)
+	}
+	if retryable, ok := inbox[0].Metadata["retryable"].(bool); !ok || !retryable {
+		t.Fatalf("expected retryable failure notification, got %+v", inbox[0].Metadata)
+	}
+	if !strings.Contains(inbox[0].Content, "Teammate worker-1 failed.") || !strings.Contains(inbox[0].Content, "retryable=true") {
+		t.Fatalf("unexpected failure notification content: %+v", inbox[0])
 	}
 }
 
@@ -720,7 +900,10 @@ func TestCompleteTaskAndReportToolCompletesTaskAndReportsRun(t *testing.T) {
 		return nil
 	}
 
-	result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "supervisor")
+	result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "supervisor")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 	if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
@@ -817,7 +1000,9 @@ func TestCompleteTaskAndReportToolKeepsWorktreeWhenRequested(t *testing.T) {
 		return nil
 	}
 
-	if result := manager.Spawn("worker-1", "reviewer", "inspect core changes", "supervisor"); !strings.Contains(result, `Spawned "worker-1"`) {
+	if result, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", "supervisor"); err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	} else if !strings.Contains(result, `Spawned "worker-1"`) {
 		t.Fatalf("unexpected spawn result: %s", result)
 	}
 
@@ -918,7 +1103,9 @@ func TestTeammateManagerNextIdleEventPrefersInbox(t *testing.T) {
 	manager := NewTeammateManager(teamDir, base)
 	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
 
-	manager.bus.Send("lead", "worker-1", "check inbox first", "message", nil)
+	if _, err := manager.bus.Send("lead", "worker-1", "check inbox first", "message", nil); err != nil {
+		t.Fatalf("seed inbox failed: %v", err)
+	}
 	message, err := manager.nextIdleEvent(agent)
 	if err != nil {
 		t.Fatalf("nextIdleEvent failed: %v", err)
@@ -1008,7 +1195,9 @@ func TestClaimTaskToolClaimsTaskEvenWithInboxMessages(t *testing.T) {
 
 	manager := NewTeammateManager(teamDir, base)
 	agent := manager.cloneAgent("worker-1", "reviewer", "inspect core changes")
-	manager.bus.Send("lead", "worker-1", "please read later", "message", nil)
+	if _, err := manager.bus.Send("lead", "worker-1", "please read later", "message", nil); err != nil {
+		t.Fatalf("seed inbox failed: %v", err)
+	}
 
 	result, err := claimTaskTool(context.Background(), json.RawMessage(`{}`), agent)
 	if err != nil {
@@ -1142,7 +1331,9 @@ func TestTeammateManagerWaitUntilIdleReturnsForIdleThreads(t *testing.T) {
 		<-ctx.Done()
 		return nil
 	}
-	manager.Spawn("worker-1", "reviewer", "inspect core changes", "")
+	if _, err := manager.Spawn("worker-1", "reviewer", "inspect core changes", ""); err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
 
 	manager.mu.Lock()
 	stopRunner := manager.threads["worker-1"]

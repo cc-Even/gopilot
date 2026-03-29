@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -167,6 +169,7 @@ const (
 	agentMaxTurnsDefault            = 999
 	autoCompactTriggerCharsDefault  = 100000
 	autoCompactSummaryTokensDefault = 20000
+	openAITransientRetryMaxAttempts = 3
 
 	PlanningPolicyAuto     PlanningPolicy = "auto"
 	PlanningPolicyRequired PlanningPolicy = "required"
@@ -312,25 +315,89 @@ func isOpenAIRateLimitError(err error) bool {
 	return false
 }
 
-func withOpenAIRateLimitRetry[T any](ctx context.Context, label string, fn func() (T, error)) (T, error) {
-	var zero T
-	delay := openAIRateLimitRetryDelay()
-	if delay <= 0 {
-		return fn()
+func isOpenAITransientError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
 	}
 
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusRequestTimeout || apiErr.StatusCode >= http.StatusInternalServerError
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) && (ctx == nil || ctx.Err() == nil) {
+		return true
+	}
+
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "temporary failure"),
+		strings.Contains(msg, "temporarily unavailable"),
+		strings.Contains(msg, "unexpected eof"):
+		return true
+	default:
+		return false
+	}
+}
+
+func openAITransientRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	return time.Duration(1<<(attempt-1)) * time.Second
+}
+
+func withOpenAIRateLimitRetry[T any](ctx context.Context, label string, fn func() (T, error)) (T, error) {
+	var zero T
 	attempt := 1
 	for {
 		result, err := fn()
-		if err == nil || !isOpenAIRateLimitError(err) {
+		if err == nil {
+			return result, nil
+		}
+
+		if isOpenAIRateLimitError(err) {
+			delay := openAIRateLimitRetryDelay()
+			if delay <= 0 {
+				return result, err
+			}
+
+			log.Printf(
+				"[OpenAI429Retry] call=%s attempt=%d wait_seconds=%.3f",
+				strings.TrimSpace(label),
+				attempt,
+				delay.Seconds(),
+			)
+			if sleepErr := rateLimitSleep(ctx, delay); sleepErr != nil {
+				return zero, sleepErr
+			}
+			attempt++
+			continue
+		}
+
+		if !isOpenAITransientError(ctx, err) || attempt >= openAITransientRetryMaxAttempts {
 			return result, err
 		}
 
+		delay := openAITransientRetryDelay(attempt)
 		log.Printf(
-			"[OpenAI429Retry] call=%s attempt=%d wait_seconds=%.3f",
+			"[OpenAITransientRetry] call=%s attempt=%d wait_seconds=%.3f err=%v",
 			strings.TrimSpace(label),
 			attempt,
 			delay.Seconds(),
+			err,
 		)
 		if sleepErr := rateLimitSleep(ctx, delay); sleepErr != nil {
 			return zero, sleepErr
@@ -478,16 +545,36 @@ func registerRouteToSubagentTool(toolMap map[string]ToolDefinition, order []stri
 					fmt.Sprintf("SubAgent %s", resolvedName),
 					fmt.Sprintf("执行失败:\n%s", err.Error()),
 				)
-				return "", err
+				return marshalSubagentOutcome(resolvedName, "failed", "", err)
 			}
 			agent.reportStageOutput(
 				fmt.Sprintf("SubAgent %s", resolvedName),
 				fmt.Sprintf("输出结果:\n%s", strings.TrimSpace(result)),
 			)
-			return result, err
+			return marshalSubagentOutcome(resolvedName, "completed", result, nil)
 		},
 	}
 	return order
+}
+
+func marshalSubagentOutcome(name, status, result string, err error) (string, error) {
+	outcome := map[string]any{
+		"sub_agent_name": strings.TrimSpace(name),
+		"status":         strings.TrimSpace(status),
+		"retryable":      false,
+	}
+	if trimmed := strings.TrimSpace(result); trimmed != "" {
+		outcome["result"] = trimmed
+	}
+	if err != nil {
+		outcome["error"] = err.Error()
+		outcome["retryable"] = isOpenAITransientError(nil, err)
+	}
+	data, marshalErr := json.MarshalIndent(outcome, "", "  ")
+	if marshalErr != nil {
+		return "", marshalErr
+	}
+	return string(data), nil
 }
 
 func resolveSubAgent(subAgents map[string]*Agent, requested string) (string, *Agent, bool) {
@@ -617,7 +704,7 @@ func registerHandoffToExecutorTool(toolMap map[string]ToolDefinition, order []st
 	order = append(order, "handoff_to_executor")
 	toolMap["handoff_to_executor"] = ToolDefinition{
 		Name:        "handoff_to_executor",
-		Description: "Finish planner stage and transfer a concise execution brief to the executor after the task board has been created or refreshed. Always pass {\"plan_summary\":\"...\",\"current_task\":\"...\",\"task_board_updated\":true} and optionally notes.",
+		Description: "Finish planner stage and transfer a concise execution brief to the executor after the task board has been created or refreshed. Always pass {\"plan_summary\":\"...\",\"current_task\":\"...\",\"task_board_updated\":true} and optionally notes. Use notes for blockers, sequencing, and any recommended spawn_teammate parallelization.",
 		Parameters: map[string]any{
 			"type":                 "object",
 			"additionalProperties": false,
@@ -638,7 +725,7 @@ func registerHandoffToExecutorTool(toolMap map[string]ToolDefinition, order []st
 				},
 				"notes": map[string]any{
 					"type":        "string",
-					"description": "Optional blockers, assumptions, or sequencing notes for the executor",
+					"description": "Optional blockers, assumptions, sequencing notes, or recommended teammate parallelization for the executor",
 				},
 			},
 			"required": []string{"plan_summary", "current_task", "task_board_updated"},
@@ -1640,6 +1727,8 @@ func (a *Agent) plannerSystemPrompt() string {
 		"Do not edit the file or attempt any implementation work.",
 		"Prefer task_list/task_get before creating or updating tasks so you reuse the current board when possible.",
 		"Do not stop at prose only: create or update task board entries for the concrete execution steps you want the executor to follow.",
+		"If the work has substantial independent subtasks, explicitly mark which tasks can run in parallel and recommend where the executor should use spawn_teammate, including a suggested teammate role and expected deliverable.",
+		"Do not invent parallelism for tightly coupled or trivial steps; only recommend teammate delegation when it will materially reduce wall-clock time or unblock the main thread.",
 		"If critical information is missing, call ask_user with one concise blocking question instead of guessing.",
 		"When you have enough information and the task board is up to date, call handoff_to_executor to transfer a concise execution brief and the current unfinished task.",
 		"Do not return a normal final answer to end planning; use handoff_to_executor once planning is complete.",
@@ -1696,6 +1785,7 @@ func (a *Agent) plannerContextMessage() string {
 		"<planning_rule>",
 		"Create or refresh the execution plan before any implementation work starts.",
 		"Use the available todo/task tools to capture the plan, and ensure each meaningful execution step exists on the task board.",
+		"When multiple substantial tasks are independent, split them into separate runnable tasks, record their dependencies, and state which ones the executor should consider delegating to teammates in parallel.",
 		"If you are blocked on missing user information, pause with ask_user.",
 		"When the plan and task board are ready, call handoff_to_executor with the concise handoff summary and current unfinished task.",
 		"</planning_rule>",

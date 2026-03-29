@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -125,6 +126,9 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	if !strings.Contains(planner.systemPrompt, "handoff_to_executor") {
 		t.Fatalf("planner system prompt missing handoff instructions: %q", planner.systemPrompt)
 	}
+	if !strings.Contains(planner.systemPrompt, "spawn_teammate") {
+		t.Fatalf("planner system prompt missing teammate parallelization guidance: %q", planner.systemPrompt)
+	}
 	for _, required := range []string{"task_create", "task_update", "task_list", "task_get"} {
 		if !containsString(planner.tools, required) {
 			t.Fatalf("planner tools missing %s: %v", required, planner.tools)
@@ -145,6 +149,9 @@ func TestRunStructuredUsesPlannerThenExecutor(t *testing.T) {
 	}
 	if !strings.Contains(planner.lastUser, "each meaningful execution step exists on the task board") {
 		t.Fatalf("planner context missing task board reminder: %q", planner.lastUser)
+	}
+	if !strings.Contains(planner.lastUser, "delegating to teammates in parallel") {
+		t.Fatalf("planner context missing parallel delegation guidance: %q", planner.lastUser)
 	}
 	if !strings.Contains(planner.lastUser, "existing task") {
 		t.Fatalf("planner context missing current task board: %q", planner.lastUser)
@@ -771,6 +778,48 @@ func TestWithOpenAIRateLimitRetryRetries429WhenConfigured(t *testing.T) {
 		t.Fatalf("expected 2 attempts, got %d", attempts)
 	}
 	if len(slept) != 1 || slept[0] != 2500*time.Millisecond {
+		t.Fatalf("unexpected sleep durations: %v", slept)
+	}
+}
+
+type mockTimeoutError struct{}
+
+func (mockTimeoutError) Error() string   { return "i/o timeout" }
+func (mockTimeoutError) Timeout() bool   { return true }
+func (mockTimeoutError) Temporary() bool { return true }
+
+var _ net.Error = mockTimeoutError{}
+
+func TestWithOpenAIRateLimitRetryRetriesTransientTimeouts(t *testing.T) {
+	originalSleep := rateLimitSleep
+	defer func() {
+		rateLimitSleep = originalSleep
+	}()
+
+	var slept []time.Duration
+	rateLimitSleep = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return nil
+	}
+
+	attempts := 0
+	result, err := withOpenAIRateLimitRetry(context.Background(), "unit_test", func() (string, error) {
+		attempts++
+		if attempts < 3 {
+			return "", mockTimeoutError{}
+		}
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("withOpenAIRateLimitRetry failed: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("unexpected result: %q", result)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+	if len(slept) != 2 || slept[0] != time.Second || slept[1] != 2*time.Second {
 		t.Fatalf("unexpected sleep durations: %v", slept)
 	}
 }

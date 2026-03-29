@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -43,8 +44,16 @@ func TestRouteToSubagentUsesParentModelWhenSubagentModelUnset(t *testing.T) {
 		t.Fatalf("marshal args failed: %v", err)
 	}
 
-	if _, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent); err != nil {
+	output, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent)
+	if err != nil {
 		t.Fatalf("route_to_subagent failed: %v", err)
+	}
+	var outcome map[string]any
+	if err := json.Unmarshal([]byte(output), &outcome); err != nil {
+		t.Fatalf("parse subagent output failed: %v", err)
+	}
+	if outcome["status"] != "completed" || outcome["result"] != "ok" {
+		t.Fatalf("unexpected subagent outcome: %+v", outcome)
 	}
 	if subAgentModel != "parent-model" {
 		t.Fatalf("expected inherited parent model, got %q", subAgentModel)
@@ -83,8 +92,16 @@ func TestRouteToSubagentKeepsExplicitModel(t *testing.T) {
 		t.Fatalf("marshal args failed: %v", err)
 	}
 
-	if _, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent); err != nil {
+	output, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent)
+	if err != nil {
 		t.Fatalf("route_to_subagent failed: %v", err)
+	}
+	var outcome map[string]any
+	if err := json.Unmarshal([]byte(output), &outcome); err != nil {
+		t.Fatalf("parse subagent output failed: %v", err)
+	}
+	if outcome["status"] != "completed" || outcome["result"] != "ok" {
+		t.Fatalf("unexpected subagent outcome: %+v", outcome)
 	}
 	if subAgentModel != "explicit-model" {
 		t.Fatalf("expected explicit model to win, got %q", subAgentModel)
@@ -124,8 +141,16 @@ func TestRouteToSubagentReportsOutput(t *testing.T) {
 		t.Fatalf("marshal args failed: %v", err)
 	}
 
-	if _, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent); err != nil {
+	output, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent)
+	if err != nil {
 		t.Fatalf("route_to_subagent failed: %v", err)
+	}
+	var outcome map[string]any
+	if err := json.Unmarshal([]byte(output), &outcome); err != nil {
+		t.Fatalf("parse subagent output failed: %v", err)
+	}
+	if outcome["status"] != "completed" || outcome["result"] != "found one bug" {
+		t.Fatalf("unexpected subagent outcome: %+v", outcome)
 	}
 	if len(stages) != 2 {
 		t.Fatalf("expected 2 reported events, got %d", len(stages))
@@ -170,11 +195,66 @@ func TestRouteToSubagentMatchesNormalizedName(t *testing.T) {
 		t.Fatalf("marshal args failed: %v", err)
 	}
 
-	if _, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent); err != nil {
+	output, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent)
+	if err != nil {
 		t.Fatalf("route_to_subagent failed: %v", err)
+	}
+	var outcome map[string]any
+	if err := json.Unmarshal([]byte(output), &outcome); err != nil {
+		t.Fatalf("parse subagent output failed: %v", err)
+	}
+	if outcome["status"] != "completed" || outcome["sub_agent_name"] != "code-reviewer" {
+		t.Fatalf("unexpected subagent outcome: %+v", outcome)
 	}
 	if !called {
 		t.Fatal("expected normalized sub-agent name to match")
+	}
+}
+
+func TestRouteToSubagentReturnsStructuredFailure(t *testing.T) {
+	subAgent := &Agent{
+		Name:         "reviewer",
+		SystemPrompt: "review changes",
+		Model:        "explicit-model",
+		runLoopOverride: func(current *Agent, _ context.Context, _ []openai.ChatCompletionMessageParamUnion) (string, error) {
+			return "", errors.New("chat completion failed (turn=0): i/o timeout")
+		},
+	}
+
+	parent := &Agent{
+		Name:      "supervisor",
+		Model:     "parent-model",
+		SubAgents: map[string]*Agent{"reviewer": subAgent},
+	}
+
+	toolMap := map[string]ToolDefinition{}
+	registerRouteToSubagentTool(toolMap, nil, parent.SubAgents)
+
+	args, err := json.Marshal(map[string]string{
+		"sub_agent_name": "reviewer",
+		"input":          "check this patch",
+	})
+	if err != nil {
+		t.Fatalf("marshal args failed: %v", err)
+	}
+
+	output, err := toolMap["route_to_subagent"].Handler(context.Background(), args, parent)
+	if err != nil {
+		t.Fatalf("route_to_subagent should return structured failure, got error: %v", err)
+	}
+
+	var outcome map[string]any
+	if err := json.Unmarshal([]byte(output), &outcome); err != nil {
+		t.Fatalf("parse subagent output failed: %v", err)
+	}
+	if outcome["status"] != "failed" || outcome["sub_agent_name"] != "reviewer" {
+		t.Fatalf("unexpected subagent outcome: %+v", outcome)
+	}
+	if outcome["retryable"] != true {
+		t.Fatalf("expected retryable structured failure, got %+v", outcome)
+	}
+	if !strings.Contains(outcome["error"].(string), "i/o timeout") {
+		t.Fatalf("unexpected structured error: %+v", outcome)
 	}
 }
 
