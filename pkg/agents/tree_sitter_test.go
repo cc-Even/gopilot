@@ -29,7 +29,7 @@ func (w Widget) Name() string {
 	tool := NewRepoMapTool()
 	output, err := tool.Call(context.Background(), `{"path":"sample.go"}`, &Agent{WorkDir: root})
 	if err != nil {
-		t.Fatalf("repo_map failed for %s: %v", path, err)
+		t.Fatalf("code_outline failed for %s: %v", path, err)
 	}
 
 	for _, want := range []string{
@@ -39,7 +39,7 @@ func (w Widget) Name() string {
 		"[method] Name (line 12) - Name returns the widget name.",
 	} {
 		if !strings.Contains(output, want) {
-			t.Fatalf("repo_map output missing %q:\n%s", want, output)
+			t.Fatalf("code_outline output missing %q:\n%s", want, output)
 		}
 	}
 }
@@ -58,7 +58,7 @@ def build():
 	tool := NewRepoMapTool()
 	output, err := tool.Call(context.Background(), `{"path":"sample.py"}`, &Agent{WorkDir: root})
 	if err != nil {
-		t.Fatalf("repo_map failed: %v", err)
+		t.Fatalf("code_outline failed: %v", err)
 	}
 
 	for _, want := range []string{
@@ -67,7 +67,7 @@ def build():
 		"[func] build (line 6) - build creates a service.",
 	} {
 		if !strings.Contains(output, want) {
-			t.Fatalf("repo_map output missing %q:\n%s", want, output)
+			t.Fatalf("code_outline output missing %q:\n%s", want, output)
 		}
 	}
 }
@@ -106,7 +106,7 @@ enum Mode {
 	tool := NewRepoMapTool()
 	output, err := tool.Call(context.Background(), `{"path":"Sample.java"}`, &Agent{WorkDir: root})
 	if err != nil {
-		t.Fatalf("repo_map failed: %v", err)
+		t.Fatalf("code_outline failed: %v", err)
 	}
 
 	for _, want := range []string{
@@ -122,7 +122,7 @@ enum Mode {
 		"[enum] Mode (line 25) - Mode lists operating modes.",
 	} {
 		if !strings.Contains(output, want) {
-			t.Fatalf("repo_map output missing %q:\n%s", want, output)
+			t.Fatalf("code_outline output missing %q:\n%s", want, output)
 		}
 	}
 }

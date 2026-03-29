@@ -154,12 +154,12 @@ func TestDefaultToolDefinitionsUseStrictObjectSchemas(t *testing.T) {
 		t.Fatalf("list_file additionalProperties = %v, want false", listSchema["additionalProperties"])
 	}
 
-	repoMapSchema := toolByName["repo_map"].Parameters
-	if repoMapSchema["type"] != "object" {
-		t.Fatalf("repo_map schema type = %v, want object", repoMapSchema["type"])
+	codeOutlineSchema := toolByName["code_outline"].Parameters
+	if codeOutlineSchema["type"] != "object" {
+		t.Fatalf("code_outline schema type = %v, want object", codeOutlineSchema["type"])
 	}
-	if repoMapSchema["additionalProperties"] != false {
-		t.Fatalf("repo_map additionalProperties = %v, want false", repoMapSchema["additionalProperties"])
+	if codeOutlineSchema["additionalProperties"] != false {
+		t.Fatalf("code_outline additionalProperties = %v, want false", codeOutlineSchema["additionalProperties"])
 	}
 
 	checkTypesSchema := toolByName["check_types"].Parameters

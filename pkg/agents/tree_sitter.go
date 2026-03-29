@@ -98,7 +98,7 @@ func NewRepoMapTool() *RepoMapTool {
 }
 
 func (r *RepoMapTool) Name() string {
-	return "repo_map"
+	return "code_outline"
 }
 
 func (r *RepoMapTool) Description() string {

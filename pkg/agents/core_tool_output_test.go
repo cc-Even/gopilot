@@ -32,6 +32,18 @@ func TestToolResultCompactDoesNotTruncateReadFile(t *testing.T) {
 	}
 }
 
+func TestToolResultCompactDoesNotTruncateCodeOutline(t *testing.T) {
+	longOutput := "outline\n" + strings.Repeat("x", 1400)
+
+	compacted := toolResultCompact(longOutput, "code_outline")
+	if compacted != longOutput {
+		t.Fatalf("expected code_outline output to remain unchanged")
+	}
+	if strings.Contains(compacted, "(truncated)") {
+		t.Fatalf("code_outline output should not be truncated: %q", compacted)
+	}
+}
+
 func TestCompactToolDisplaySummarizesWriteFileArguments(t *testing.T) {
 	compacted := compactToolDisplay(`{"path":"notes.txt","content":"`+strings.Repeat("x", 400)+`"}`, "write_file")
 	if !strings.Contains(compacted, `"path": "notes.txt"`) {

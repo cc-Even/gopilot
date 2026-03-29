@@ -182,7 +182,7 @@ var plannerToolAllowlist = map[string]struct{}{
 	"task_list":           {},
 	"task_get":            {},
 	"list_file":           {},
-	"repo_map":            {},
+	"code_outline":        {},
 	"read_file":           {},
 	"bash":                {},
 	"ask_user":            {},
@@ -2163,7 +2163,7 @@ func messageRoleAndContent(message openai.ChatCompletionMessageParamUnion) (stri
 func toolResultCompact(output, toolName string) string {
 	const limit = 1200
 	trimmed := strings.TrimSpace(output)
-	if toolName == "read_file" {
+	if toolName == "read_file" || toolName == "code_outline" {
 		return trimmed
 	}
 	if utf8.RuneCountInString(trimmed) > limit {
