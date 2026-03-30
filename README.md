@@ -53,8 +53,21 @@ vim setting.env
 ```dotenv
 OPENAI_API_KEY=your_api_key_here
 MODEL=gpt-4o-mini
+# 可选：显式指定 provider，支持 `openai` / `gemini`
+LLM_PROVIDER=openai
+# 可选：显式指定 Gemini 后端，支持 `developer` / `vertex`
+GEMINI_BACKEND=developer
+# 可选：Gemini Developer API Key
+GEMINI_API_KEY=your_gemini_api_key
+# 可选：Gemini Developer API Base URL
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com
 # 可选：自定义 OpenAI 兼容接口地址
 OPENAI_BASE_URL=https://api.openai.com/v1
+# 可选：Vertex AI Gemini 配置。不填 Access Token 时会回退到 ADC / 默认凭据
+VERTEX_AI_ACCESS_TOKEN=your_google_oauth_access_token
+VERTEX_AI_PROJECT_ID=your-gcp-project-id
+VERTEX_AI_LOCATION=global
+VERTEX_AI_BASE_URL=https://aiplatform.googleapis.com
 # 可选：遇到 HTTP 429 时等待多少秒后重试，支持浮点数
 OPENAI_RATE_LIMIT_RETRY_SECONDS=2.5
 # 可选：单次 Agent 运行允许的最大轮数，默认 999
@@ -102,12 +115,22 @@ make build
 **核心配置项：**
 
 - `OPENAI_API_KEY`：你的 OpenAI API 密钥。
+- `LLM_PROVIDER`：（可选）显式指定对话 provider，支持 `openai` / `gemini`。未设置时会根据模型名和 Base URL 自动识别；`gemini-*` 会自动走 Gemini provider。
+- `GEMINI_BACKEND`：（Gemini 可选）显式指定 Gemini 后端，支持 `developer` / `vertex`。未设置时会根据环境变量和 Base URL 自动识别。
 - `MODEL`：默认使用的模型名称（未设置时默认为 `gpt-4o-mini`）。
 - `OPENAI_BASE_URL`：（可选）自定义的 OpenAI 兼容接口地址。
+- `GEMINI_API_KEY`：（Gemini Developer API 可选）Developer API 的 API Key；也兼容 `GOOGLE_API_KEY`。
+- `GEMINI_BASE_URL`：（Gemini Developer API 可选）Developer API 的基地址，默认 `https://generativelanguage.googleapis.com`。
+- `VERTEX_AI_ACCESS_TOKEN`：（Vertex AI 可选）Google OAuth Access Token；不设置时会尝试使用 ADC / 默认凭据。
+- `VERTEX_AI_PROJECT_ID`：（Gemini 可选）Vertex AI 所属 GCP Project ID。
+- `VERTEX_AI_LOCATION`：（Gemini 可选）Vertex AI 地域，默认 `global`。
+- `VERTEX_AI_BASE_URL`：（Vertex AI 可选）Vertex AI 基地址，默认由 SDK 推导；手动设置时可用 `https://aiplatform.googleapis.com`。
 - `OPENAI_RATE_LIMIT_RETRY_SECONDS`：（可选）遇到 `429 Too Many Requests` 时等待多少秒后重试，支持浮点数，例如 `2.5`。
 - `AGENT_MAX_TURNS`：（可选）单次 Agent 或 Teammate 运行允许的最大轮数，默认 `999`。
 - `AUTO_COMPACT_TRIGGER_CHARS`：（可选）当会话上下文序列化后的字符数超过该阈值时触发自动压缩，默认 `100000`。
 - `AUTO_COMPACT_SUMMARY_MAX_TOKENS`：（可选）自动压缩时用于生成摘要的最大 completion tokens，默认 `2000`。
+
+使用 Gemini 时，如果 `MODEL` 为 `gemini-2.5-flash`、`gemini-2.5-pro` 等 Gemini 模型名，程序会自动把 OpenAI 风格的对话历史和工具定义转换成 `google.golang.org/genai` SDK 所需的消息结构，并同时支持 Gemini Developer API 与 Vertex AI 的函数调用回填。
 
 > **💡 提示**：当前的技能目录和环境文件都是基于“可执行文件所在目录”进行解析的。因此，相比于直接使用 `go run .`，我们更推荐先 `make build` 编译后再运行二进制文件。
 

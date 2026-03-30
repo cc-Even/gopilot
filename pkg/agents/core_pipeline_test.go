@@ -707,17 +707,17 @@ func TestRecordTokenUsageLogsAndAppendsFile(t *testing.T) {
 		Model:    "gpt-4o-mini",
 		runStage: "executor",
 	}
-	usage := openai.CompletionUsage{
-		PromptTokens:     120,
-		CompletionTokens: 45,
-		TotalTokens:      165,
+	usage := tokenUsage{
+		PromptTokens:             120,
+		CompletionTokens:         45,
+		TotalTokens:              165,
+		ReasoningTokens:          9,
+		OutputAudioTokens:        2,
+		AcceptedPredictionTokens: 7,
+		RejectedPredictionTokens: 1,
+		CachedTokens:             30,
+		InputAudioTokens:         3,
 	}
-	usage.CompletionTokensDetails.ReasoningTokens = 9
-	usage.CompletionTokensDetails.AudioTokens = 2
-	usage.CompletionTokensDetails.AcceptedPredictionTokens = 7
-	usage.CompletionTokensDetails.RejectedPredictionTokens = 1
-	usage.PromptTokensDetails.CachedTokens = 30
-	usage.PromptTokensDetails.AudioTokens = 3
 
 	recordTokenUsage(agent, "", "stream_chat_completion", 2, "stop", usage)
 

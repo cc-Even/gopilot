@@ -870,7 +870,8 @@ func (m *TeammateManager) cloneAgent(name, role, prompt string) *Agent {
 		WorktreeManager: base.WorktreeManager,
 		Background:      NewBackgroundManager(),
 		TeamManager:     m,
-		client:          base.client,
+		Provider:        base.Provider,
+		provider:        base.provider,
 		tools:           clonedTools,
 		order:           clonedOrder,
 	}
@@ -948,6 +949,9 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 		return nil, false, ctx.Err()
 	default:
 	}
+	if agent == nil || agent.provider == nil {
+		return nil, false, fmt.Errorf("model provider unavailable")
+	}
 
 	var err error
 	messages, err = agent.maybeAutoCompact(ctx, messages)
@@ -963,12 +967,12 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 		return nil, false, fmt.Errorf("stage turn events failed (turn=%d): %w", turn, err)
 	}
 
-	resp, err := withOpenAIRateLimitRetry(ctx, "teammate_work_phase", func() (*openai.ChatCompletion, error) {
-		return agent.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+	resp, err := withOpenAIRateLimitRetry(ctx, "teammate_work_phase", func() (*modelResponse, error) {
+		return agent.provider.Generate(ctx, modelRequest{
 			Model:    agent.Model,
 			Messages: messages,
-			Tools:    agent.openAITools(),
-		})
+			Tools:    collectToolList(agent),
+		}, nil)
 	})
 	if err != nil {
 		_ = turnAcks.Rollback()
@@ -977,33 +981,28 @@ func (m *TeammateManager) runWorkPhase(ctx context.Context, agent *Agent, messag
 	if err := turnAcks.Commit(); err != nil {
 		return nil, false, fmt.Errorf("ack turn events failed (turn=%d): %w", turn, err)
 	}
-	if len(resp.Choices) == 0 {
-		return nil, false, fmt.Errorf("empty choices from model")
-	}
+	messages = append(messages, buildAssistantMessage(resp))
 
-	choice := resp.Choices[0]
-	messages = append(messages, choice.Message.ToParam())
-
-	switch choice.FinishReason {
+	switch resp.FinishReason {
 	case "stop":
 		return messages, true, nil
 	case "tool_calls":
 		idleRequested := false
-		for _, tc := range choice.Message.ToolCalls {
-			output, callErr := agent.executeTool(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+		for _, tc := range resp.ToolCalls {
+			output, callErr := agent.executeTool(ctx, tc.Name, json.RawMessage(tc.Arguments))
 			if callErr != nil {
 				output = "tool error: " + callErr.Error()
 			}
 			messages = append(messages, openai.ToolMessage(output, tc.ID))
-			if tc.Function.Name == "idle" {
+			if tc.Name == "idle" {
 				idleRequested = true
 			}
 		}
 		return messages, idleRequested, nil
 	case "network_error":
-		return nil, false, fmt.Errorf("model interrupted with finish reason: %s", choice.FinishReason)
+		return nil, false, fmt.Errorf("model interrupted with finish reason: %s", resp.FinishReason)
 	default:
-		return nil, false, fmt.Errorf("unsupported finish reason: %s", choice.FinishReason)
+		return nil, false, fmt.Errorf("unsupported finish reason: %s", resp.FinishReason)
 	}
 }
 

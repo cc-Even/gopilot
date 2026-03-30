@@ -120,7 +120,7 @@ func (l *SubAgentLoader) BuildAgents(baseModel string, toolList []ToolDefinition
 		if systemPrompt == "" {
 			systemPrompt = fmt.Sprintf("You are the %s sub-agent at %s.", spec.Name, WORKDIR)
 		}
-		agents[spec.Name] = NewOpenAIAgent(
+		agents[spec.Name] = NewAgent(
 			spec.Name,
 			systemPrompt,
 			model,

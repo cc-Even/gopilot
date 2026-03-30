@@ -814,7 +814,7 @@ func (s *cliSession) rebuildAgent() {
 	currentModel = getenvOrDefault("MODEL", "gpt-4o-mini")
 	s.systemPrompt = buildSystemPrompt(s.skillLoader, s.subAgentLoader)
 	subAgents := s.subAgentLoader.BuildAgents(currentModel, agents.DefaultToolDefinitions(), s.skillLoader)
-	s.agent = agents.NewOpenAIAgent(
+	s.agent = agents.NewAgent(
 		"supervisor",
 		s.systemPrompt,
 		currentModel,

@@ -18,9 +18,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"google.golang.org/genai"
+
 	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
-	"github.com/openai/openai-go/v3/shared"
 )
 
 type ToolDefinition struct {
@@ -80,9 +80,11 @@ type Agent struct {
 	Background      *BackgroundManager
 	TeamManager     *TeammateManager
 
-	client openai.Client
-	tools  map[string]ToolDefinition
-	order  []string
+	Provider providerKind
+
+	provider modelProvider
+	tools    map[string]ToolDefinition
+	order    []string
 
 	autoCompactSummarizer func(context.Context, string) (string, error)
 	runLoopOverride       func(*Agent, context.Context, []openai.ChatCompletionMessageParamUnion) (string, error)
@@ -308,6 +310,10 @@ func autoCompactSummaryMaxTokens() int {
 }
 
 func isOpenAIRateLimitError(err error) bool {
+	var geminiErr genai.APIError
+	if errors.As(err, &geminiErr) {
+		return geminiErr.Code == http.StatusTooManyRequests
+	}
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
 		return apiErr.StatusCode == http.StatusTooManyRequests
@@ -318,6 +324,11 @@ func isOpenAIRateLimitError(err error) bool {
 func isOpenAITransientError(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
+	}
+
+	var geminiErr genai.APIError
+	if errors.As(err, &geminiErr) {
+		return geminiErr.Code == http.StatusRequestTimeout || geminiErr.Code >= http.StatusInternalServerError
 	}
 
 	var apiErr *openai.Error
@@ -778,17 +789,11 @@ func registerHandoffToExecutorTool(toolMap map[string]ToolDefinition, order []st
 	return order
 }
 
-func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption) *Agent {
+func NewAgent(name, systemPrompt, model string, createOpts ...AgentOption) *Agent {
 	// 初始化选项
 	agentOpts := &AgentOptions{}
 	for _, opt := range createOpts {
 		opt(agentOpts)
-	}
-
-	// 处理 ApiKey 默认值
-	apiKey := agentOpts.ApiKey
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
 
 	// 处理 Model 默认值
@@ -799,16 +804,47 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		model = "gpt-4o-mini"
 	}
 
-	// 处理 BaseUrl 默认值
-	baseURL := agentOpts.BaseUrl
-	if baseURL == "" {
-		baseURL = os.Getenv("OPENAI_BASE_URL")
+	// 处理 Provider / BaseUrl / 凭据默认值
+	baseURL := strings.TrimSpace(agentOpts.BaseUrl)
+	detectedBaseURL := baseURL
+	if detectedBaseURL == "" {
+		detectedBaseURL = firstNonEmpty(
+			os.Getenv("OPENAI_BASE_URL"),
+			getenvFirst(geminiBaseURLEnv, vertexAIBaseURLEnv),
+		)
 	}
+	providerKind := resolveProviderKind(model, detectedBaseURL)
+	geminiBackend := geminiBackendKind("")
+	apiKey := strings.TrimSpace(agentOpts.ApiKey)
+	accessToken := ""
 
-	// 构建 OpenAI 客户端选项
-	opts := []option.RequestOption{option.WithAPIKey(apiKey)}
-	if baseURL != "" {
-		opts = append(opts, option.WithBaseURL(baseURL))
+	switch providerKind {
+	case providerGemini:
+		geminiBackend = resolveGeminiBackend(firstNonEmpty(baseURL, getenvFirst(vertexAIBaseURLEnv, geminiBaseURLEnv)))
+		if baseURL == "" {
+			switch geminiBackend {
+			case geminiBackendVertex:
+				baseURL = getenvFirst(vertexAIBaseURLEnv, geminiBaseURLEnv)
+			default:
+				baseURL = getenvFirst(geminiBaseURLEnv)
+			}
+		}
+		switch geminiBackend {
+		case geminiBackendVertex:
+			accessToken = firstNonEmpty(apiKey, getenvFirst(vertexAIAccessTokenEnv, geminiAccessTokenEnv))
+			apiKey = ""
+		default:
+			if apiKey == "" {
+				apiKey = getenvFirst(geminiAPIKeyEnv, googleAPIKeyEnv)
+			}
+		}
+	default:
+		if baseURL == "" {
+			baseURL = os.Getenv("OPENAI_BASE_URL")
+		}
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		}
 	}
 
 	// 处理工具列表
@@ -862,15 +898,27 @@ func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption)
 		TaskManager:     taskManager,
 		WorktreeManager: worktreeManager,
 		Background:      backgroundManager,
-		client:          openai.NewClient(opts...),
-		tools:           toolMap,
-		order:           order,
+		Provider:        providerKind,
+		provider: newModelProvider(providerKind, modelProviderConfig{
+			BaseURL:       baseURL,
+			APIKey:        apiKey,
+			AccessToken:   accessToken,
+			ProjectID:     getenvFirst(vertexAIProjectIDEnv, geminiProjectIDEnv, googleCloudProjectEnv),
+			Location:      firstNonEmpty(getenvFirst(vertexAILocationEnv, geminiLocationEnv, googleCloudLocationEnv, googleCloudRegionEnv), defaultVertexAILocation),
+			GeminiBackend: geminiBackend,
+		}),
+		tools: toolMap,
+		order: order,
 	}
 
 	agent.TeamManager = NewTeammateManager(TEAM_DIR, agent)
 	agent.order = registerTeamTools(agent.tools, agent.order)
 
 	return agent
+}
+
+func NewOpenAIAgent(name, systemPrompt, model string, createOpts ...AgentOption) *Agent {
+	return NewAgent(name, systemPrompt, model, createOpts...)
 }
 
 func (a *Agent) Run(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (string, error) {
@@ -1124,28 +1172,22 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 		if err := turnAcks.Commit(); err != nil {
 			return "", stableMessages, fmt.Errorf("ack turn events failed (turn=%d): %w", turn, err)
 		}
-		if len(resp.Choices) == 0 {
-			return "", stableMessages, fmt.Errorf("empty choices from model")
-		}
-
 		usedTodo := false
 
-		choice := resp.Choices[0]
-
-		switch choice.FinishReason {
+		switch resp.FinishReason {
 		case "stop":
-			messages = append(messages, choice.Message.ToParam())
-			return choice.Message.Content, nil, nil
+			messages = append(messages, buildAssistantMessage(resp))
+			return resp.Content, nil, nil
 
 		case "tool_calls":
-			messages = append(messages, choice.Message.ToParam())
+			messages = append(messages, buildAssistantMessage(resp))
 			manualCompacted := false
-			for _, tc := range choice.Message.ToolCalls {
-				toolName := tc.Function.Name
-				toolArgs := json.RawMessage(tc.Function.Arguments)
+			for _, tc := range resp.ToolCalls {
+				toolName := tc.Name
+				toolArgs := json.RawMessage(tc.Arguments)
 				a.reportStageOutput(
 					fmt.Sprintf("%s Tool %s", a.displayTitle(), toolName),
-					fmt.Sprintf("开始执行:\n%s", compactToolDisplay(tc.Function.Arguments, toolName)),
+					fmt.Sprintf("开始执行:\n%s", compactToolDisplay(tc.Arguments, toolName)),
 				)
 				output, callErr := a.executeTool(ctx, toolName, toolArgs)
 				if callErr != nil {
@@ -1191,10 +1233,10 @@ func (a *Agent) runLoopWithState(ctx context.Context, messages []openai.ChatComp
 			}
 
 		case "network_error":
-			return "", stableMessages, fmt.Errorf("model interrupted with finish reason: %s", choice.FinishReason)
+			return "", stableMessages, fmt.Errorf("model interrupted with finish reason: %s", resp.FinishReason)
 
 		default:
-			return "", stableMessages, fmt.Errorf("unsupported finish reason: %s", choice.FinishReason)
+			return "", stableMessages, fmt.Errorf("unsupported finish reason: %s", resp.FinishReason)
 		}
 
 		if usedTodo {
@@ -1338,7 +1380,7 @@ func (a *Agent) shouldRunPlanner(ctx context.Context, messages []openai.ChatComp
 	if latest == "" {
 		return true
 	}
-	return !isSimpleDirectExecutionRequest(ctx, a.client, a.Model, latest)
+	return !isSimpleDirectExecutionRequest(ctx, a.provider, a.Model, latest)
 }
 
 func (a *Agent) hasUnfinishedTasks() bool {
@@ -1368,18 +1410,21 @@ func lastUserMessageContent(messages []openai.ChatCompletionMessageParamUnion) s
 }
 
 // 判断是否需要运行计划器的判断逻辑现在改为使用大模型
-func isSimpleDirectExecutionRequest(ctx context.Context, client openai.Client, model, userInput string) bool {
+func isSimpleDirectExecutionRequest(ctx context.Context, provider modelProvider, model, userInput string) bool {
 	trimmed := strings.TrimSpace(userInput)
 	if trimmed == "" {
 		return false
 	}
 
 	// 调用大模型进行判断
-	return useModelToDetermineSimpleRequest(ctx, client, model, trimmed)
+	return useModelToDetermineSimpleRequest(ctx, provider, model, trimmed)
 }
 
 // useModelToDetermineSimpleRequest 使用大模型判断是否为简单请求
-func useModelToDetermineSimpleRequest(ctx context.Context, client openai.Client, model, userInput string) bool {
+func useModelToDetermineSimpleRequest(ctx context.Context, provider modelProvider, model, userInput string) bool {
+	if provider == nil {
+		return false
+	}
 	systemPrompt := `你是一个简单请求判断器。你的任务是根据用户输入判断该请求是否足够简单，可以直接执行而无需详细的计划。
 
 判断标准：
@@ -1390,27 +1435,24 @@ func useModelToDetermineSimpleRequest(ctx context.Context, client openai.Client,
 - "yes"：这是一个简单请求，可以直接执行
 - "no"：这不是一个简单请求，需要计划模式`
 
-	resp, err := withOpenAIRateLimitRetry(ctx, "simple_request_classifier", func() (*openai.ChatCompletion, error) {
-		return client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+	resp, err := withOpenAIRateLimitRetry(ctx, "simple_request_classifier", func() (*modelResponse, error) {
+		return provider.Generate(ctx, modelRequest{
 			Model: model,
 			Messages: []openai.ChatCompletionMessageParamUnion{
 				openai.SystemMessage(systemPrompt),
 				openai.UserMessage(fmt.Sprintf("用户输入：%s\n\n请回答 yes 或 no：", userInput)),
 			},
-			MaxCompletionTokens: openai.Int(10), // 设置非常短的 maxTokens
-		})
+			MaxCompletionTokens: 10,
+		}, nil)
 	})
 	if err != nil {
 		// 如果调用失败，默认返回 false（走计划模式）
 		log.Printf("[isSimpleDirectExecutionRequest] model call failed: %v, defaulting to false", err)
 		return false
 	}
-	if len(resp.Choices) == 0 {
-		return false
-	}
-	recordTokenUsage(nil, model, "simple_request_classifier", -1, resp.Choices[0].FinishReason, resp.Usage)
+	recordTokenUsage(nil, model, "simple_request_classifier", -1, resp.FinishReason, resp.Usage)
 
-	answer := strings.TrimSpace(strings.ToLower(resp.Choices[0].Message.Content))
+	answer := strings.TrimSpace(strings.ToLower(resp.Content))
 	log.Printf("[isSimpleDirectExecutionRequest] model response: %s for input: %s", answer, truncate(userInput, 50))
 
 	// 只在明确是 "yes" 时返回 true
@@ -1487,7 +1529,7 @@ func (a *Agent) reportLiveOutput(id, title, content string, done bool) {
 	a.liveOutputReporter(id, title, content, done)
 }
 
-func recordTokenUsage(agent *Agent, model, kind string, turn int, finishReason string, usage openai.CompletionUsage) {
+func recordTokenUsage(agent *Agent, model, kind string, turn int, finishReason string, usage tokenUsage) {
 	stage := ""
 	agentName := agentLogName(agent)
 	if agent != nil {
@@ -1517,12 +1559,12 @@ func recordTokenUsage(agent *Agent, model, kind string, turn int, finishReason s
 		usage.PromptTokens,
 		usage.CompletionTokens,
 		usage.TotalTokens,
-		usage.CompletionTokensDetails.ReasoningTokens,
-		usage.PromptTokensDetails.CachedTokens,
-		usage.PromptTokensDetails.AudioTokens,
-		usage.CompletionTokensDetails.AudioTokens,
-		usage.CompletionTokensDetails.AcceptedPredictionTokens,
-		usage.CompletionTokensDetails.RejectedPredictionTokens,
+		usage.ReasoningTokens,
+		usage.CachedTokens,
+		usage.InputAudioTokens,
+		usage.OutputAudioTokens,
+		usage.AcceptedPredictionTokens,
+		usage.RejectedPredictionTokens,
 	)
 	log.Print(line)
 	if err := appendTokenUsageLine(line); err != nil {
@@ -1587,17 +1629,11 @@ func (a *Agent) liveOutputIdentity() (string, string) {
 	return id, title
 }
 
-func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, turn int) (*openai.ChatCompletion, error) {
-	return withOpenAIRateLimitRetry(ctx, "stream_chat_completion", func() (*openai.ChatCompletion, error) {
-		stream := a.client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
-			Model:    a.Model,
-			Messages: messages,
-			Tools:    a.openAITools(),
-			StreamOptions: openai.ChatCompletionStreamOptionsParam{
-				IncludeUsage: openai.Bool(true),
-			},
-		})
-		acc := openai.ChatCompletionAccumulator{}
+func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, turn int) (*modelResponse, error) {
+	if a == nil || a.provider == nil {
+		return nil, fmt.Errorf("model provider unavailable")
+	}
+	return withOpenAIRateLimitRetry(ctx, "stream_chat_completion", func() (*modelResponse, error) {
 		liveID, liveTitle := a.liveOutputIdentity()
 		lastPreview := ""
 		if liveID != "" {
@@ -1605,69 +1641,31 @@ func (a *Agent) streamChatCompletion(ctx context.Context, messages []openai.Chat
 			a.reportLiveOutput(liveID, liveTitle, lastPreview, false)
 		}
 
-		for stream.Next() {
-			chunk := stream.Current()
-			if !acc.AddChunk(chunk) {
-				a.reportLiveOutput(liveID, liveTitle, "", true)
-				return nil, fmt.Errorf("chat completion stream accumulate failed (turn=%d)", turn)
-			}
-			preview := renderStreamingPreview(acc.ChatCompletion)
+		resp, err := a.provider.Generate(ctx, modelRequest{
+			Model:    a.Model,
+			Messages: messages,
+			Tools:    collectToolList(a),
+			Stream:   true,
+		}, func(update modelResponse) {
+			preview := renderStreamingPreview(update)
 			if preview != "" && preview != lastPreview {
 				lastPreview = preview
 				a.reportLiveOutput(liveID, liveTitle, preview, false)
 			}
-		}
-
-		if err := stream.Err(); err != nil {
+		})
+		if err != nil {
 			a.reportLiveOutput(liveID, liveTitle, "", true)
 			return nil, fmt.Errorf("chat completion failed (turn=%d): %w", turn, err)
 		}
-		a.reportLiveOutput(liveID, liveTitle, renderStreamingPreview(acc.ChatCompletion), true)
-
-		if len(acc.Choices) == 0 {
+		if resp == nil {
+			a.reportLiveOutput(liveID, liveTitle, "", true)
 			return nil, fmt.Errorf("empty choices from model")
 		}
-		resp := acc.ChatCompletion
-		recordTokenUsage(a, a.Model, "stream_chat_completion", turn, resp.Choices[0].FinishReason, resp.Usage)
-		return &resp, nil
+		resp.ToolCalls = normalizeModelToolCalls(resp.ToolCalls)
+		a.reportLiveOutput(liveID, liveTitle, renderStreamingPreview(*resp), true)
+		recordTokenUsage(a, a.Model, "stream_chat_completion", turn, resp.FinishReason, resp.Usage)
+		return resp, nil
 	})
-}
-
-func renderStreamingPreview(resp openai.ChatCompletion) string {
-	if len(resp.Choices) == 0 {
-		return ""
-	}
-	choice := resp.Choices[0]
-	parts := make([]string, 0, 2)
-	if strings.TrimSpace(choice.Message.Content) != "" {
-		parts = append(parts, choice.Message.Content)
-	} else if strings.TrimSpace(choice.Message.Refusal) != "" {
-		parts = append(parts, choice.Message.Refusal)
-	}
-	if len(choice.Message.ToolCalls) > 0 {
-		parts = append(parts, "调用工具:\n"+formatToolCallPreview(choice.Message.ToolCalls))
-	}
-	if len(parts) == 0 {
-		return "思考中..."
-	}
-	return strings.TrimSpace(strings.Join(parts, "\n\n"))
-}
-
-func formatToolCallPreview(toolCalls []openai.ChatCompletionMessageToolCallUnion) string {
-	lines := make([]string, 0, len(toolCalls))
-	for _, tc := range toolCalls {
-		name := strings.TrimSpace(tc.Function.Name)
-		if name == "" {
-			name = "(pending)"
-		}
-		args := compactToolDisplay(strings.TrimSpace(tc.Function.Arguments), name)
-		if args == "" {
-			lines = append(lines, fmt.Sprintf("- %s", name))
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("- %s %s", name, args))
-	}
-	return strings.Join(lines, "\n")
 }
 
 func compactToolDisplay(payload, toolName string) string {
@@ -2061,23 +2059,23 @@ func (a *Agent) summarizeForAutoCompact(ctx context.Context, prompt string) (str
 	if a.autoCompactSummarizer != nil {
 		return a.autoCompactSummarizer(ctx, prompt)
 	}
+	if a == nil || a.provider == nil {
+		return "", fmt.Errorf("model provider unavailable")
+	}
 
-	resp, err := withOpenAIRateLimitRetry(ctx, "auto_compact_summary", func() (*openai.ChatCompletion, error) {
-		return a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+	resp, err := withOpenAIRateLimitRetry(ctx, "auto_compact_summary", func() (*modelResponse, error) {
+		return a.provider.Generate(ctx, modelRequest{
 			Model:               a.Model,
 			Messages:            []openai.ChatCompletionMessageParamUnion{openai.UserMessage(prompt)},
-			MaxCompletionTokens: openai.Int(int64(autoCompactSummaryMaxTokens())),
-		})
+			MaxCompletionTokens: autoCompactSummaryMaxTokens(),
+		}, nil)
 	})
 	if err != nil {
 		return "", fmt.Errorf("summary generation failed: %w", err)
 	}
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("empty summary choices from model")
-	}
-	recordTokenUsage(a, a.Model, "auto_compact_summary", -1, resp.Choices[0].FinishReason, resp.Usage)
+	recordTokenUsage(a, a.Model, "auto_compact_summary", -1, resp.FinishReason, resp.Usage)
 
-	return resp.Choices[0].Message.Content, nil
+	return resp.Content, nil
 }
 
 func marshalConversation(messages []openai.ChatCompletionMessageParamUnion) (string, error) {
@@ -2178,26 +2176,6 @@ func (a *Agent) executeTool(ctx context.Context, name string, rawArgs json.RawMe
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
 	return t.Handler(ctx, rawArgs, a)
-}
-
-func (a *Agent) openAITools() []openai.ChatCompletionToolUnionParam {
-	if len(a.order) == 0 {
-		return nil
-	}
-	tools := make([]openai.ChatCompletionToolUnionParam, 0, len(a.order))
-	for _, name := range a.order {
-		t := a.tools[name]
-		tools = append(tools, openai.ChatCompletionToolUnionParam{
-			OfFunction: &openai.ChatCompletionFunctionToolParam{
-				Function: shared.FunctionDefinitionParam{
-					Name:        t.Name,
-					Description: openai.String(t.Description),
-					Parameters:  t.Parameters,
-				},
-			},
-		})
-	}
-	return tools
 }
 
 func (a *turnEventAcks) AddCommit(fn func() error) {
