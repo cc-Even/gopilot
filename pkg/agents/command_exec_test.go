@@ -2,6 +2,8 @@ package agents
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -21,7 +23,7 @@ func TestSplitCommandLineWindowsKeepsBackslashPaths(t *testing.T) {
 }
 
 func TestResolveCommandInvocationWindowsPathStaysDirectExec(t *testing.T) {
-	invocation, err := resolveCommandInvocation(`go build -o C:\build\app.exe`, "windows")
+	invocation, err := resolveCommandInvocation(`go build -o C:\build\app.exe`, "windows", t.TempDir())
 	if err != nil {
 		t.Fatalf("resolve command failed: %v", err)
 	}
@@ -123,7 +125,7 @@ func TestSplitCommandLinePreservesEmptyQuotedArgs(t *testing.T) {
 }
 
 func TestResolveCommandInvocationDirectExec(t *testing.T) {
-	invocation, err := resolveCommandInvocation(`go env "GOOS"`, runtime.GOOS)
+	invocation, err := resolveCommandInvocation(`go env "GOOS"`, runtime.GOOS, t.TempDir())
 	if err != nil {
 		t.Fatalf("resolve command failed: %v", err)
 	}
@@ -171,7 +173,7 @@ func TestResolveCommandInvocationFallsBackToPlatformShell(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			invocation, err := resolveCommandInvocation(tt.command, tt.goos)
+			invocation, err := resolveCommandInvocation(tt.command, tt.goos, t.TempDir())
 			if err != nil {
 				t.Fatalf("resolve command failed: %v", err)
 			}
@@ -185,6 +187,69 @@ func TestResolveCommandInvocationFallsBackToPlatformShell(t *testing.T) {
 				t.Fatalf("args = %#v, want %#v", invocation.args, tt.wantArgs)
 			}
 		})
+	}
+}
+
+func TestResolveCommandInvocationRewritesPipToWorkspacePython(t *testing.T) {
+	root := t.TempDir()
+	pythonPath := writeCommandExecFile(t, root, filepath.Join(".venv", platformBinDir(), platformPythonExecutable(runtime.GOOS)), "")
+
+	invocation, err := resolveCommandInvocation("pip install demo", runtime.GOOS, root)
+	if err != nil {
+		t.Fatalf("resolve command failed: %v", err)
+	}
+	if invocation.name != pythonPath {
+		t.Fatalf("name = %q, want %q", invocation.name, pythonPath)
+	}
+	wantArgs := []string{"-m", "pip", "install", "demo"}
+	if strings.Join(invocation.args, "\x00") != strings.Join(wantArgs, "\x00") {
+		t.Fatalf("args = %#v, want %#v", invocation.args, wantArgs)
+	}
+}
+
+func TestResolveCommandInvocationRewritesPipToPreferredPythonWithoutVirtualenv(t *testing.T) {
+	restore := stubCommandExecLookPath(t)
+	defer restore()
+
+	commandExecLookPath = func(file string) (string, error) {
+		switch file {
+		case "python":
+			return "/usr/bin/python", nil
+		case "python3":
+			return "/usr/bin/python3", nil
+		default:
+			return "", os.ErrNotExist
+		}
+	}
+
+	invocation, err := resolveCommandInvocation("pip install demo", "linux", t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve command failed: %v", err)
+	}
+	if invocation.name != "/usr/bin/python" {
+		t.Fatalf("name = %q, want %q", invocation.name, "/usr/bin/python")
+	}
+	wantArgs := []string{"-m", "pip", "install", "demo"}
+	if strings.Join(invocation.args, "\x00") != strings.Join(wantArgs, "\x00") {
+		t.Fatalf("args = %#v, want %#v", invocation.args, wantArgs)
+	}
+}
+
+func TestBuildCommandInjectsWorkspacePythonPath(t *testing.T) {
+	root := t.TempDir()
+
+	cmd, err := buildCommand("pytest tests", root)
+	if err != nil {
+		t.Fatalf("build command failed: %v", err)
+	}
+
+	got := envValue(cmd.Env, "PYTHONPATH")
+	if got == "" {
+		t.Fatal("expected PYTHONPATH to be set")
+	}
+	parts := strings.Split(got, string(os.PathListSeparator))
+	if len(parts) == 0 || parts[0] != root {
+		t.Fatalf("PYTHONPATH = %q, want first entry %q", got, root)
 	}
 }
 
@@ -231,4 +296,54 @@ func TestRunBashSupportsDirectExecAndShellFallback(t *testing.T) {
 			t.Fatalf("expected no output marker, got %q", output)
 		}
 	})
+
+	t.Run("shell fallback prefers workspace virtualenv", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("shell script assertion is for unix-like environments")
+		}
+
+		root := t.TempDir()
+		writeCommandExecFile(t, root, filepath.Join(".venv", "bin", "python"), "#!/bin/sh\necho workspace-python \"$@\"\n")
+		writeCommandExecFile(t, root, filepath.Join(".venv", "bin", "pip"), "#!/bin/sh\necho workspace-pip \"$@\"\n")
+
+		output := strings.TrimSpace(RunBash("python alpha && pip beta", root))
+		if !strings.Contains(output, "workspace-python alpha") {
+			t.Fatalf("expected virtualenv python in output, got %q", output)
+		}
+		if !strings.Contains(output, "workspace-pip beta") {
+			t.Fatalf("expected virtualenv pip in output, got %q", output)
+		}
+	})
+
+	t.Run("shell fallback exposes PYTHONPATH", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("shell quoting assertion is for unix-like environments")
+		}
+
+		root := t.TempDir()
+		output := strings.TrimSpace(RunBash(`python -c "import os; print(os.getenv('PYTHONPATH', ''))"`, root))
+		if output != root {
+			t.Fatalf("PYTHONPATH = %q, want %q", output, root)
+		}
+	})
+}
+
+func stubCommandExecLookPath(t *testing.T) func() {
+	t.Helper()
+	old := commandExecLookPath
+	return func() {
+		commandExecLookPath = old
+	}
+}
+
+func writeCommandExecFile(t *testing.T, root, relPath, content string) string {
+	t.Helper()
+	path := filepath.Join(root, relPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

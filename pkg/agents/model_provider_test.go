@@ -52,6 +52,46 @@ func TestBuildGeminiContentsMapsToolCallsAndResponses(t *testing.T) {
 	}
 }
 
+func TestBuildGeminiContentsRestoresThoughtSignatureForFunctionCall(t *testing.T) {
+	resp := &modelResponse{
+		ToolCalls: []modelToolCall{{
+			ID:               "call-1",
+			Name:             "task_get",
+			Arguments:        `{"id":1}`,
+			ThoughtSignature: []byte("sig-1"),
+		}},
+	}
+
+	assistant := buildAssistantMessage(resp)
+	systemInstruction, contents, err := buildGeminiContents([]openai.ChatCompletionMessageParamUnion{
+		assistant,
+		openai.ToolMessage(`{"subject":"demo"}`, assistant.OfAssistant.ToolCalls[0].OfFunction.ID),
+	})
+	if err != nil {
+		t.Fatalf("buildGeminiContents failed: %v", err)
+	}
+	if systemInstruction != nil {
+		t.Fatalf("unexpected system instruction: %#v", systemInstruction)
+	}
+	if len(contents) != 2 {
+		t.Fatalf("unexpected content count: %d", len(contents))
+	}
+	callPart := contents[0].Parts[0]
+	if callPart.FunctionCall == nil {
+		t.Fatalf("expected function call part, got %#v", callPart)
+	}
+	if callPart.FunctionCall.ID != "call-1" {
+		t.Fatalf("unexpected function call id: %#v", callPart.FunctionCall)
+	}
+	if string(callPart.ThoughtSignature) != "sig-1" {
+		t.Fatalf("unexpected thought signature: %q", string(callPart.ThoughtSignature))
+	}
+	response := contents[1].Parts[0].FunctionResponse
+	if response == nil || response.ID != "call-1" || response.Name != "task_get" {
+		t.Fatalf("unexpected function response: %#v", response)
+	}
+}
+
 func TestBuildGeminiContentsPreservesToolNameWhenToolCallIDIsMissing(t *testing.T) {
 	resp := mapGeminiResponse(&genai.GenerateContentResponse{
 		Candidates: []*genai.Candidate{{
@@ -90,6 +130,29 @@ func TestBuildGeminiContentsPreservesToolNameWhenToolCallIDIsMissing(t *testing.
 	response := contents[1].Parts[0].FunctionResponse
 	if response == nil || response.Name != "task_get" {
 		t.Fatalf("unexpected function response: %#v", response)
+	}
+}
+
+func TestMapGeminiResponseCapturesThoughtSignature(t *testing.T) {
+	resp := mapGeminiResponse(&genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{{
+			Content: &genai.Content{
+				Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{
+						ID:   "call-1",
+						Name: "task_get",
+						Args: map[string]any{"id": 1},
+					},
+					ThoughtSignature: []byte("sig-1"),
+				}},
+			},
+		}},
+	})
+	if resp == nil || len(resp.ToolCalls) != 1 {
+		t.Fatalf("unexpected model response: %#v", resp)
+	}
+	if string(resp.ToolCalls[0].ThoughtSignature) != "sig-1" {
+		t.Fatalf("unexpected thought signature: %q", string(resp.ToolCalls[0].ThoughtSignature))
 	}
 }
 
@@ -225,6 +288,30 @@ func TestBuildGeminiClientConfigVertexAccessToken(t *testing.T) {
 	}
 	if got := cfg.HTTPOptions.Headers.Get("Authorization"); got != "Bearer token-123" {
 		t.Fatalf("unexpected auth header: %q", got)
+	}
+}
+
+func TestMergeModelResponsePreservesToolCallsFinishReason(t *testing.T) {
+	current := &modelResponse{
+		FinishReason: "tool_calls",
+		ToolCalls: []modelToolCall{{
+			ID:        "tool-0",
+			Name:      "list_file",
+			Arguments: `{}`,
+		}},
+	}
+
+	merged := mergeModelResponse(current, &modelResponse{
+		FinishReason: "stop",
+		Usage: tokenUsage{
+			PromptTokens: 10,
+		},
+	})
+	if merged.FinishReason != "tool_calls" {
+		t.Fatalf("expected tool_calls finish reason, got %q", merged.FinishReason)
+	}
+	if len(merged.ToolCalls) != 1 || merged.ToolCalls[0].Name != "list_file" {
+		t.Fatalf("unexpected merged tool calls: %#v", merged.ToolCalls)
 	}
 }
 

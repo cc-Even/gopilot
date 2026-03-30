@@ -2,6 +2,7 @@ package agents
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -80,9 +81,10 @@ type modelResponse struct {
 }
 
 type modelToolCall struct {
-	ID        string
-	Name      string
-	Arguments string
+	ID               string
+	Name             string
+	Arguments        string
+	ThoughtSignature []byte
 }
 
 type tokenUsage struct {
@@ -493,26 +495,38 @@ func buildGeminiContents(messages []openai.ChatCompletionMessageParamUnion) (*ge
 				if function == nil {
 					continue
 				}
-				id := stringOrEmpty(tc.GetID())
+				rawID := stringOrEmpty(tc.GetID())
+				id, thoughtSignature := decodeGeminiToolCallCarrier(rawID)
 				name := strings.TrimSpace(function.Name)
+				if rawID != "" && name != "" {
+					toolNamesByID[rawID] = name
+				}
 				if id != "" && name != "" {
 					toolNamesByID[id] = name
 				}
-				parts = append(parts, &genai.Part{
+				part := &genai.Part{
 					FunctionCall: &genai.FunctionCall{
 						ID:   id,
 						Name: name,
 						Args: parseJSONArguments(function.Arguments),
 					},
-				})
+				}
+				if len(thoughtSignature) > 0 {
+					part.ThoughtSignature = append([]byte(nil), thoughtSignature...)
+				}
+				parts = append(parts, part)
 			}
 			if len(parts) == 0 {
 				continue
 			}
 			contents = append(contents, genai.NewContentFromParts(parts, genai.RoleModel))
 		case "tool":
-			toolCallID := stringOrEmpty(message.GetToolCallID())
-			toolName := strings.TrimSpace(toolNamesByID[toolCallID])
+			rawToolCallID := stringOrEmpty(message.GetToolCallID())
+			toolCallID, _ := decodeGeminiToolCallCarrier(rawToolCallID)
+			toolName := strings.TrimSpace(toolNamesByID[rawToolCallID])
+			if toolName == "" {
+				toolName = strings.TrimSpace(toolNamesByID[toolCallID])
+			}
 			if toolName == "" {
 				toolName = strings.TrimSpace(toolCallID)
 			}
@@ -643,7 +657,7 @@ func buildAssistantMessage(resp *modelResponse) openai.ChatCompletionMessagePara
 		for _, tc := range toolCalls {
 			message.OfAssistant.ToolCalls = append(message.OfAssistant.ToolCalls, openai.ChatCompletionMessageToolCallUnionParam{
 				OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
-					ID: tc.ID,
+					ID: encodeGeminiToolCallCarrier(tc.ID, tc.ThoughtSignature),
 					Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
 						Name:      tc.Name,
 						Arguments: tc.Arguments,
@@ -722,9 +736,10 @@ func mapGeminiResponse(resp *genai.GenerateContentResponse) *modelResponse {
 		if part.FunctionCall != nil {
 			args, _ := json.Marshal(part.FunctionCall.Args)
 			result.ToolCalls = append(result.ToolCalls, modelToolCall{
-				ID:        strings.TrimSpace(part.FunctionCall.ID),
-				Name:      strings.TrimSpace(part.FunctionCall.Name),
-				Arguments: string(args),
+				ID:               strings.TrimSpace(part.FunctionCall.ID),
+				Name:             strings.TrimSpace(part.FunctionCall.Name),
+				Arguments:        string(args),
+				ThoughtSignature: append([]byte(nil), part.ThoughtSignature...),
 			})
 		}
 	}
@@ -753,6 +768,33 @@ func normalizeToolCallID(id string, index int) string {
 		return id
 	}
 	return fmt.Sprintf("tool-%d", index)
+}
+
+const geminiThoughtSignatureDelimiter = "::ts:"
+
+func encodeGeminiToolCallCarrier(id string, thoughtSignature []byte) string {
+	id = strings.TrimSpace(id)
+	if len(thoughtSignature) == 0 {
+		return id
+	}
+	return id + geminiThoughtSignatureDelimiter + base64.RawURLEncoding.EncodeToString(thoughtSignature)
+}
+
+func decodeGeminiToolCallCarrier(value string) (string, []byte) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+
+	id, encoded, found := strings.Cut(value, geminiThoughtSignatureDelimiter)
+	if !found {
+		return value, nil
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return value, nil
+	}
+	return strings.TrimSpace(id), sig
 }
 
 func mergeModelResponse(current, next *modelResponse) *modelResponse {
@@ -785,6 +827,9 @@ func mergeModelResponse(current, next *modelResponse) *modelResponse {
 			continue
 		}
 		current.ToolCalls = append(current.ToolCalls, tc)
+	}
+	if len(current.ToolCalls) > 0 {
+		current.FinishReason = "tool_calls"
 	}
 	return current
 }
