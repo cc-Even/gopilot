@@ -14,6 +14,7 @@ import (
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/respjson"
 	"github.com/openai/openai-go/v3/shared"
 )
 
@@ -76,6 +77,7 @@ type modelResponse struct {
 	Content      string
 	Refusal      string
 	FinishReason string
+	Reasoning    json.RawMessage
 	ToolCalls    []modelToolCall
 	Usage        tokenUsage
 }
@@ -245,13 +247,16 @@ func (p *openAIProvider) Generate(ctx context.Context, req modelRequest, onUpdat
 	}
 	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
 	acc := openai.ChatCompletionAccumulator{}
+	reasoning := &openAIReasoningAccumulator{}
 	for stream.Next() {
 		chunk := stream.Current()
+		reasoning.AddChunk(chunk)
 		if !acc.AddChunk(chunk) {
 			return nil, fmt.Errorf("chat completion stream accumulate failed")
 		}
 		if onUpdate != nil {
 			if current := mapOpenAICompletion(acc.ChatCompletion); current != nil {
+				current.Reasoning = reasoning.Value()
 				onUpdate(*current)
 			}
 		}
@@ -259,7 +264,11 @@ func (p *openAIProvider) Generate(ctx context.Context, req modelRequest, onUpdat
 	if err := stream.Err(); err != nil {
 		return nil, err
 	}
-	return mapOpenAICompletion(acc.ChatCompletion), nil
+	result := mapOpenAICompletion(acc.ChatCompletion)
+	if result != nil {
+		result.Reasoning = reasoning.Value()
+	}
+	return result, nil
 }
 
 func (p *geminiProvider) Generate(ctx context.Context, req modelRequest, onUpdate func(modelResponse)) (*modelResponse, error) {
@@ -382,6 +391,7 @@ func mapOpenAICompletion(resp openai.ChatCompletion) *modelResponse {
 		Content:      choice.Message.Content,
 		Refusal:      choice.Message.Refusal,
 		FinishReason: strings.TrimSpace(choice.FinishReason),
+		Reasoning:    rawJSONExtraField(choice.Message.JSON.ExtraFields, "reasoning_content"),
 		Usage:        openAIUsageToTokenUsage(resp.Usage),
 	}
 	for _, tc := range choice.Message.ToolCalls {
@@ -666,6 +676,11 @@ func buildAssistantMessage(resp *modelResponse) openai.ChatCompletionMessagePara
 			})
 		}
 	}
+	if len(resp.Reasoning) > 0 {
+		message.OfAssistant.SetExtraFields(map[string]any{
+			"reasoning_content": json.RawMessage(resp.Reasoning),
+		})
+	}
 	return message
 }
 
@@ -803,6 +818,9 @@ func mergeModelResponse(current, next *modelResponse) *modelResponse {
 	}
 	if current == nil {
 		cloned := *next
+		if len(next.Reasoning) > 0 {
+			cloned.Reasoning = append(json.RawMessage(nil), next.Reasoning...)
+		}
 		if len(next.ToolCalls) > 0 {
 			cloned.ToolCalls = append([]modelToolCall(nil), next.ToolCalls...)
 		}
@@ -817,6 +835,9 @@ func mergeModelResponse(current, next *modelResponse) *modelResponse {
 	}
 	if strings.TrimSpace(next.FinishReason) != "" {
 		current.FinishReason = next.FinishReason
+	}
+	if len(next.Reasoning) > 0 {
+		current.Reasoning = append(current.Reasoning[:0], next.Reasoning...)
 	}
 	if hasTokenUsage(next.Usage) {
 		current.Usage = next.Usage
@@ -865,4 +886,52 @@ func normalizeGeminiFinishReason(reason string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(reason))
 	}
+}
+
+type openAIReasoningAccumulator struct {
+	text strings.Builder
+	raw  json.RawMessage
+}
+
+func (a *openAIReasoningAccumulator) AddChunk(chunk openai.ChatCompletionChunk) {
+	for _, choice := range chunk.Choices {
+		a.addRaw(rawJSONExtraField(choice.Delta.JSON.ExtraFields, "reasoning_content"))
+	}
+}
+
+func (a *openAIReasoningAccumulator) Value() json.RawMessage {
+	if a == nil {
+		return nil
+	}
+	if a.text.Len() > 0 {
+		raw, _ := json.Marshal(a.text.String())
+		return json.RawMessage(raw)
+	}
+	if len(a.raw) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), a.raw...)
+}
+
+func (a *openAIReasoningAccumulator) addRaw(raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var chunk string
+	if err := json.Unmarshal(raw, &chunk); err == nil {
+		a.text.WriteString(chunk)
+		return
+	}
+	a.raw = append(a.raw[:0], raw...)
+}
+
+func rawJSONExtraField(fields map[string]respjson.Field, key string) json.RawMessage {
+	if len(fields) == 0 {
+		return nil
+	}
+	raw := strings.TrimSpace(fields[key].Raw())
+	if raw == "" {
+		return nil
+	}
+	return json.RawMessage(raw)
 }

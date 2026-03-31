@@ -156,6 +156,112 @@ func TestMapGeminiResponseCapturesThoughtSignature(t *testing.T) {
 	}
 }
 
+func TestMapOpenAICompletionCapturesReasoningContent(t *testing.T) {
+	var resp openai.ChatCompletion
+	raw := `{
+		"id": "chatcmpl-1",
+		"object": "chat.completion",
+		"created": 1,
+		"model": "moonshot-v1",
+		"choices": [{
+			"index": 0,
+			"finish_reason": "tool_calls",
+			"message": {
+				"role": "assistant",
+				"content": "",
+				"reasoning_content": "inspect the repo first",
+				"tool_calls": [{
+					"id": "call-1",
+					"type": "function",
+					"function": {
+						"name": "task_get",
+						"arguments": "{\"id\":1}"
+					}
+				}]
+			}
+		}]
+	}`
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+
+	mapped := mapOpenAICompletion(resp)
+	if mapped == nil {
+		t.Fatalf("expected mapped response")
+	}
+	if string(mapped.Reasoning) != `"inspect the repo first"` {
+		t.Fatalf("unexpected reasoning content: %s", string(mapped.Reasoning))
+	}
+}
+
+func TestBuildAssistantMessagePreservesReasoningContent(t *testing.T) {
+	message := buildAssistantMessage(&modelResponse{
+		Reasoning: json.RawMessage(`"inspect the repo first"`),
+		ToolCalls: []modelToolCall{{
+			ID:        "call-1",
+			Name:      "task_get",
+			Arguments: `{"id":1}`,
+		}},
+	})
+
+	raw, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal assistant message failed: %v", err)
+	}
+	payload := string(raw)
+	if !strings.Contains(payload, `"reasoning_content":"inspect the repo first"`) {
+		t.Fatalf("assistant message missing reasoning content: %s", payload)
+	}
+	if !strings.Contains(payload, `"tool_calls"`) {
+		t.Fatalf("assistant message missing tool calls: %s", payload)
+	}
+}
+
+func TestOpenAIReasoningAccumulatorConcatenatesStreamedChunks(t *testing.T) {
+	var chunk1 openai.ChatCompletionChunk
+	var chunk2 openai.ChatCompletionChunk
+	raw1 := `{
+		"id": "chatcmpl-1",
+		"object": "chat.completion.chunk",
+		"created": 1,
+		"model": "moonshot-v1",
+		"choices": [{
+			"index": 0,
+			"delta": {
+				"role": "assistant",
+				"reasoning_content": "inspect "
+			},
+			"finish_reason": ""
+		}]
+	}`
+	raw2 := `{
+		"id": "chatcmpl-1",
+		"object": "chat.completion.chunk",
+		"created": 1,
+		"model": "moonshot-v1",
+		"choices": [{
+			"index": 0,
+			"delta": {
+				"reasoning_content": "the repo first"
+			},
+			"finish_reason": "tool_calls"
+		}]
+	}`
+	if err := json.Unmarshal([]byte(raw1), &chunk1); err != nil {
+		t.Fatalf("unmarshal chunk1 failed: %v", err)
+	}
+	if err := json.Unmarshal([]byte(raw2), &chunk2); err != nil {
+		t.Fatalf("unmarshal chunk2 failed: %v", err)
+	}
+
+	acc := &openAIReasoningAccumulator{}
+	acc.AddChunk(chunk1)
+	acc.AddChunk(chunk2)
+	if string(acc.Value()) != `"inspect the repo first"` {
+		t.Fatalf("unexpected accumulated reasoning: %s", string(acc.Value()))
+	}
+}
+
 func TestConvertSchemaForGeminiPreservesJSONSchema(t *testing.T) {
 	converted := convertSchemaForGemini(map[string]any{
 		"type": "object",
