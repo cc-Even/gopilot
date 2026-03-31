@@ -231,6 +231,133 @@ func TestAutoCompactPromptDoesNotCharTruncate(t *testing.T) {
 	}
 }
 
+func TestMarshalConversationForAutoCompact_CompactsHistoricalToolPayloads(t *testing.T) {
+	writeTailMarker := "WRITE_TAIL_MARKER_SHOULD_BE_REMOVED"
+	toolTailMarker := "TOOL_TAIL_MARKER_SHOULD_BE_REMOVED"
+
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage("older-user"),
+		buildAssistantMessage(&modelResponse{
+			ToolCalls: []modelToolCall{{
+				ID:        "call-1",
+				Name:      "write_file",
+				Arguments: `{"path":"notes.txt","content":"` + strings.Repeat("x", 600) + writeTailMarker + `"}`,
+			}},
+		}),
+		openai.ToolMessage("created file\n"+strings.Repeat("y", 900)+toolTailMarker, "call-1"),
+	}
+
+	conversationText, err := marshalConversationForAutoCompact(messages)
+	if err != nil {
+		t.Fatalf("marshalConversationForAutoCompact failed: %v", err)
+	}
+
+	var payload []map[string]any
+	if err := json.Unmarshal([]byte(conversationText), &payload); err != nil {
+		t.Fatalf("unmarshal compacted conversation failed: %v", err)
+	}
+	if len(payload) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(payload))
+	}
+
+	assistantToolCalls, ok := payload[1]["tool_calls"].([]any)
+	if !ok || len(assistantToolCalls) != 1 {
+		t.Fatalf("expected 1 compacted tool call, got %#v", payload[1]["tool_calls"])
+	}
+	toolCall, ok := assistantToolCalls[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected tool call payload: %#v", assistantToolCalls[0])
+	}
+	function, ok := toolCall["function"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected function payload: %#v", toolCall["function"])
+	}
+	arguments, _ := function["arguments"].(string)
+	if !strings.Contains(arguments, "compact_tool_arguments") {
+		t.Fatalf("expected compacted tool arguments marker, got %q", arguments)
+	}
+	if !strings.Contains(arguments, `"tool":"write_file"`) {
+		t.Fatalf("expected tool name in compacted arguments, got %q", arguments)
+	}
+	if !strings.Contains(arguments, "notes.txt") {
+		t.Fatalf("expected path to survive argument compaction, got %q", arguments)
+	}
+	if strings.Contains(arguments, writeTailMarker) {
+		t.Fatalf("expected tail marker to be removed from compacted arguments, got %q", arguments)
+	}
+
+	toolContent, _ := payload[2]["content"].(string)
+	if !strings.Contains(toolContent, "compact_tool_message") {
+		t.Fatalf("expected compacted tool message marker, got %q", toolContent)
+	}
+	if !strings.Contains(toolContent, `"tool":"write_file"`) {
+		t.Fatalf("expected tool name in compacted tool message, got %q", toolContent)
+	}
+	if !strings.Contains(toolContent, `"tool_call_id":"call-1"`) {
+		t.Fatalf("expected tool_call_id in compacted tool message, got %q", toolContent)
+	}
+	if strings.Contains(toolContent, toolTailMarker) {
+		t.Fatalf("expected tail marker to be removed from compacted tool output, got %q", toolContent)
+	}
+}
+
+func TestMaybeAutoCompact_PromptCompactsHistoricalToolPayloads(t *testing.T) {
+	t.Setenv(autoCompactTriggerCharsEnv, "10")
+
+	tmp := t.TempDir()
+	originalTranscriptDir := TRANSCRIPT_DIR
+	TRANSCRIPT_DIR = filepath.Join(tmp, "transcripts")
+	t.Cleanup(func() {
+		TRANSCRIPT_DIR = originalTranscriptDir
+	})
+
+	writeTailMarker := "WRITE_TAIL_MARKER_SHOULD_BE_REMOVED"
+	toolTailMarker := "TOOL_TAIL_MARKER_SHOULD_BE_REMOVED"
+	var summarizePrompt string
+
+	agent := &Agent{
+		Model: "gpt-4o-mini",
+		autoCompactSummarizer: func(ctx context.Context, prompt string) (string, error) {
+			summarizePrompt = prompt
+			return "summary", nil
+		},
+	}
+
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.SystemMessage("system"),
+		openai.UserMessage("older-user"),
+		buildAssistantMessage(&modelResponse{
+			ToolCalls: []modelToolCall{{
+				ID:        "call-1",
+				Name:      "write_file",
+				Arguments: `{"path":"notes.txt","content":"` + strings.Repeat("x", 600) + writeTailMarker + `"}`,
+			}},
+		}),
+		openai.ToolMessage("created file\n"+strings.Repeat("y", 900)+toolTailMarker, "call-1"),
+		openai.UserMessage("recent-user"),
+		openai.AssistantMessage("recent-assistant"),
+	}
+
+	if _, err := agent.maybeAutoCompact(context.Background(), messages); err != nil {
+		t.Fatalf("maybeAutoCompact failed: %v", err)
+	}
+	if !strings.Contains(summarizePrompt, "compact_tool_arguments") {
+		t.Fatalf("expected summarize prompt to include compacted tool arguments, got %q", summarizePrompt)
+	}
+	if !strings.Contains(summarizePrompt, "compact_tool_message") {
+		t.Fatalf("expected summarize prompt to include compacted tool output, got %q", summarizePrompt)
+	}
+	if !strings.Contains(summarizePrompt, "notes.txt") {
+		t.Fatalf("expected summarize prompt to preserve path metadata, got %q", summarizePrompt)
+	}
+	if strings.Contains(summarizePrompt, writeTailMarker) {
+		t.Fatalf("expected summarize prompt to drop raw tool argument tail marker, got %q", summarizePrompt)
+	}
+	if strings.Contains(summarizePrompt, toolTailMarker) {
+		t.Fatalf("expected summarize prompt to drop raw tool output tail marker, got %q", summarizePrompt)
+	}
+}
+
 func mustRoleAndContent(t *testing.T, msg openai.ChatCompletionMessageParamUnion) (string, string) {
 	t.Helper()
 	raw, err := json.Marshal(msg)

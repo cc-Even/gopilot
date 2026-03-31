@@ -646,7 +646,7 @@ func (a *Agent) autoCompact(ctx context.Context, messages []openai.ChatCompletio
 		return messages, nil
 	}
 
-	conversationText, err := marshalConversation(summarizeMessages)
+	conversationText, err := marshalConversationForAutoCompact(summarizeMessages)
 	if err != nil {
 		return nil, err
 	}
